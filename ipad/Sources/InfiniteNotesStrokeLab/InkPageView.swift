@@ -85,12 +85,6 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        guard window != nil else { return }
-        enclosingScrollView()?.panGestureRecognizer.require(toFail: fingerGeometryPan)
-    }
-
     override func layoutSubviews() {
         super.layoutSubviews()
         liveLayerHost.frame = bounds
@@ -480,7 +474,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         finishContact()
     }
 
-    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === fingerGeometryPan || gestureRecognizer === fingerGeometryTap,
               activeTouch == nil,
               let model,
@@ -1040,15 +1034,6 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         let xScale = CGFloat(page.width) / bounds.width
         let yScale = CGFloat(page.height) / bounds.height
         return localPoints * (xScale + yScale) / 2
-    }
-
-    private func enclosingScrollView() -> UIScrollView? {
-        var candidate = superview
-        while let view = candidate {
-            if let scrollView = view as? UIScrollView { return scrollView }
-            candidate = view.superview
-        }
-        return nil
     }
 
     private func performHaptic() {

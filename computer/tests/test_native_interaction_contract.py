@@ -27,6 +27,11 @@ def test_tool_switching_does_not_force_default_widths():
     assert "model.inkWidth = 3" not in CONTENT
 
 
+def test_page_geometry_recognizers_do_not_block_document_scrolling():
+    assert "panGestureRecognizer.require(toFail: fingerGeometryPan)" not in INK_VIEW
+    assert "enclosingScrollView" not in INK_VIEW
+
+
 def test_pencil_drawing_does_not_grab_geometry_but_finger_can():
     pencil_start = INK_VIEW.index("override func touchesBegan")
     pencil_end = INK_VIEW.index("override func touchesMoved", pencil_start)
