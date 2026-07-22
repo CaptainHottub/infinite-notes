@@ -24,6 +24,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSock
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
+from starlette.middleware.gzip import GZipMiddleware
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
@@ -46,6 +47,7 @@ RENDER_SCALE = 2.0
 PAGE_GAP = 0.0
 
 app = FastAPI(title="Infinite Notes Prototype")
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/pdf-pages", StaticFiles(directory=PDF_PAGES_DIR), name="pdf-pages")
 
@@ -203,6 +205,7 @@ state: dict[str, Any] = load_state()
 state_lock = asyncio.Lock()
 clients: set[WebSocket] = set()
 client_roles: dict[WebSocket, str] = {}
+client_kinds: dict[WebSocket, str] = {}
 history: list[dict[str, Any]] = []
 redo_history: list[dict[str, Any]] = []
 pending_stroke_history: set[str] = set()
@@ -216,13 +219,20 @@ def save_state_atomic() -> None:
     write_state_atomic(state)
 
 
-async def broadcast(message: dict[str, Any], *, exclude: WebSocket | None = None) -> None:
+async def broadcast(
+    message: dict[str, Any],
+    *,
+    exclude: WebSocket | None = None,
+    exclude_kinds: set[str] | None = None,
+) -> None:
     if not clients:
         return
     encoded = json.dumps(message, separators=(",", ":"))
     dead: list[WebSocket] = []
     for ws in list(clients):
         if ws is exclude:
+            continue
+        if exclude_kinds and client_kinds.get(ws) in exclude_kinds:
             continue
         try:
             await ws.send_text(encoded)
@@ -231,6 +241,7 @@ async def broadcast(message: dict[str, Any], *, exclude: WebSocket | None = None
     for ws in dead:
         clients.discard(ws)
         client_roles.pop(ws, None)
+        client_kinds.pop(ws, None)
 
 
 async def send_to_role(role: str, message: dict[str, Any]) -> int:
@@ -248,6 +259,26 @@ async def send_to_role(role: str, message: dict[str, Any]) -> int:
     for ws in dead:
         clients.discard(ws)
         client_roles.pop(ws, None)
+        client_kinds.pop(ws, None)
+    return delivered
+
+
+async def send_to_kind(kind: str, message: dict[str, Any]) -> int:
+    encoded = json.dumps(message, separators=(",", ":"))
+    delivered = 0
+    dead: list[WebSocket] = []
+    for ws, client_kind in list(client_kinds.items()):
+        if client_kind != kind:
+            continue
+        try:
+            await ws.send_text(encoded)
+            delivered += 1
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        clients.discard(ws)
+        client_roles.pop(ws, None)
+        client_kinds.pop(ws, None)
     return delivered
 
 
@@ -266,6 +297,15 @@ def snapshot_message(*, reason: str = "sync") -> dict[str, Any]:
         "type": "snapshot",
         "state": copy.deepcopy(state),
         "liveStrokeIds": sorted(pending_stroke_history),
+        "reason": reason,
+        "serverTime": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def state_refresh_message(*, reason: str = "sync") -> dict[str, Any]:
+    """Small WebSocket notification telling native clients to fetch /api/state."""
+    return {
+        "type": "state_refresh",
         "reason": reason,
         "serverTime": datetime.now(timezone.utc).isoformat(),
     }
@@ -1351,13 +1391,18 @@ async def import_project(file: UploadFile = File(...)) -> JSONResponse:
         if temp_root is not None:
             shutil.rmtree(temp_root, ignore_errors=True)
 
-    await broadcast({
+    imported_snapshot_message = {
         "type": "snapshot",
         "state": snapshot,
         "liveStrokeIds": [],
         "reason": "project_import",
         "serverTime": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    # Browser clients still understand the legacy snapshot message. Native clients
+    # fetch the same state over compressed HTTP so a large notebook is never sent
+    # as one WebSocket frame.
+    await broadcast(imported_snapshot_message, exclude_kinds={"native"})
+    await send_to_kind("native", state_refresh_message(reason="project_import"))
     await broadcast(history_status_message())
     return JSONResponse({"ok": True, "state": snapshot})
 
@@ -1381,14 +1426,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     role = str(websocket.query_params.get("role", "desktop")).lower()
     if role not in {"ipad", "desktop"}:
         role = "desktop"
+    client_id = str(websocket.query_params.get("clientId", ""))[:256]
+    client_kind = "native" if role == "ipad" and client_id.startswith("native-") else "browser"
     clients.add(websocket)
     client_roles[websocket] = role
+    client_kinds[websocket] = client_kind
     try:
         async with state_lock:
-            initial_snapshot = snapshot_message(reason="initial")
             initial_history = history_status_message()
-        initial_snapshot["clientRole"] = role
-        await websocket.send_json(initial_snapshot)
+            initial_message = (
+                state_refresh_message(reason="initial")
+                if client_kind == "native"
+                else snapshot_message(reason="initial")
+            )
+        initial_message["clientRole"] = role
+        await websocket.send_json(initial_message)
         await websocket.send_json(initial_history)
 
         while True:
@@ -1557,9 +1609,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
                 elif message_type == "sync_request":
                     async with state_lock:
-                        requested_snapshot = snapshot_message(reason="manual_sync")
                         requested_history = history_status_message()
-                    await websocket.send_json(requested_snapshot)
+                        requested_message = (
+                            state_refresh_message(reason="manual_sync")
+                            if client_kind == "native"
+                            else snapshot_message(reason="manual_sync")
+                        )
+                    await websocket.send_json(requested_message)
                     await websocket.send_json(requested_history)
 
                 elif message_type == "clear_strokes":
@@ -1602,6 +1658,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     finally:
         clients.discard(websocket)
         client_roles.pop(websocket, None)
+        client_kinds.pop(websocket, None)
 
 
 def local_ipv4_addresses() -> list[str]:

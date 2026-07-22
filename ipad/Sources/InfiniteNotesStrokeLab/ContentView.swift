@@ -385,7 +385,7 @@ struct ContentView: View {
                 Text("•")
                 Text(filename).lineLimit(1)
             }
-            Text("• Native 0.5.1 • Vector PDF • style presets")
+            Text("• Native 0.5.2 • Vector PDF • large-state sync")
                 .foregroundStyle(.secondary)
             Spacer()
             if !model.mountedPageIndices.isEmpty {
