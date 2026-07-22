@@ -379,8 +379,18 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        let pencilTouches = Set(touches.filter { $0.type == .pencil })
+        let passthroughTouches = touches.subtracting(pencilTouches)
+        if !passthroughTouches.isEmpty {
+            // InkPageView covers the entire rendered PDF page. Forward every
+            // non-Pencil touch through the responder chain so the enclosing
+            // UIScrollView receives finger pan and pinch gestures exactly as it
+            // does in the black border around the page.
+            super.touchesBegan(passthroughTouches, with: event)
+        }
+
         guard activeTouch == nil,
-              let pencil = touches.first(where: { $0.type == .pencil }),
+              let pencil = pencilTouches.first,
               let model,
               let page = model.pageInfo(at: pageIndex) else { return }
 
@@ -414,7 +424,15 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         guard let touch = activeTouch,
               touches.contains(touch),
               let model,
-              let page = model.pageInfo(at: pageIndex) else { return }
+              let page = model.pageInfo(at: pageIndex) else {
+            super.touchesMoved(touches, with: event)
+            return
+        }
+
+        let passthroughTouches = touches.subtracting(Set([touch]))
+        if !passthroughTouches.isEmpty {
+            super.touchesMoved(passthroughTouches, with: event)
+        }
 
         switch contactTool {
         case .eraser:
@@ -437,7 +455,15 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         guard let touch = activeTouch,
               touches.contains(touch),
               let model,
-              let page = model.pageInfo(at: pageIndex) else { return }
+              let page = model.pageInfo(at: pageIndex) else {
+            super.touchesEnded(touches, with: event)
+            return
+        }
+
+        let passthroughTouches = touches.subtracting(Set([touch]))
+        if !passthroughTouches.isEmpty {
+            super.touchesEnded(passthroughTouches, with: event)
+        }
 
         switch contactTool {
         case .eraser:
@@ -458,7 +484,16 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = activeTouch, touches.contains(touch), let model else { return }
+        guard let touch = activeTouch, touches.contains(touch), let model else {
+            super.touchesCancelled(touches, with: event)
+            return
+        }
+
+        let passthroughTouches = touches.subtracting(Set([touch]))
+        if !passthroughTouches.isEmpty {
+            super.touchesCancelled(passthroughTouches, with: event)
+        }
+
         switch contactTool {
         case .eraser:
             if let operation = eraseOperationID { model.finishEraseOperation(operation) }
