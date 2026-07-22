@@ -1,7 +1,7 @@
 import UIKit
 
 @MainActor
-final class InkPageView: UIView {
+final class InkPageView: UIView, UIGestureRecognizerDelegate {
     private struct ShapeGesture {
         var startWorld: CGPoint
         var preview: NoteStroke
@@ -29,6 +29,7 @@ final class InkPageView: UIView {
     private var committedRebuildScheduled = false
     private var pendingPDFScale: CGFloat = 1
     private var committedExclusions: Set<String> = []
+    private var pendingCommitOverlayIDs: Set<String> = []
 
     // Pencil ink, geometry previews, selection handles and lasso paths all use
     // reusable vector-backed CAShapeLayers. Only completed content is flattened
@@ -37,6 +38,29 @@ final class InkPageView: UIView {
     private var liveShapeLayers: [CAShapeLayer] = []
     private var liveDisplayScale: CGFloat = UIScreen.main.scale
     private var liveRefreshScheduled = false
+
+    private var interactionZoomScale: CGFloat {
+        max(0.05, pendingPDFScale)
+    }
+
+    private lazy var fingerGeometryPan: UIPanGestureRecognizer = {
+        let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleFingerGeometryPan(_:)))
+        gesture.minimumNumberOfTouches = 1
+        gesture.maximumNumberOfTouches = 1
+        gesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        gesture.cancelsTouchesInView = true
+        gesture.delegate = self
+        return gesture
+    }()
+
+    private lazy var fingerGeometryTap: UITapGestureRecognizer = {
+        let gesture = UITapGestureRecognizer(target: self, action: #selector(handleFingerGeometryTap(_:)))
+        gesture.numberOfTouchesRequired = 1
+        gesture.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        gesture.cancelsTouchesInView = false
+        gesture.delegate = self
+        return gesture
+    }()
 
     init(pageIndex: Int, model: AppModel) {
         self.pageIndex = pageIndex
@@ -51,11 +75,20 @@ final class InkPageView: UIView {
         layer.minificationFilter = .linear
         liveLayerHost.masksToBounds = true
         layer.addSublayer(liveLayerHost)
+        addGestureRecognizer(fingerGeometryPan)
+        addGestureRecognizer(fingerGeometryTap)
+        fingerGeometryTap.require(toFail: fingerGeometryPan)
         model.register(pageView: self, pageIndex: pageIndex)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        guard window != nil else { return }
+        enclosingScrollView()?.panGestureRecognizer.require(toFail: fingerGeometryPan)
     }
 
     override func layoutSubviews() {
@@ -73,6 +106,11 @@ final class InkPageView: UIView {
     func invalidateCommittedContent() {
         committedContentDirty = true
         scheduleCommittedRebuild()
+    }
+
+    func beginCommitTransition(strokeID: String) {
+        pendingCommitOverlayIDs.insert(strokeID)
+        scheduleLiveRefresh()
     }
 
     private func setCommittedExclusions(_ ids: Set<String>) {
@@ -142,6 +180,28 @@ final class InkPageView: UIView {
             ))
         }
 
+        // Keep a just-finished stroke visible as a vector until the new
+        // committed page image has actually been installed. Without this
+        // hand-off the live layer disappears one run-loop turn before the
+        // raster cache is ready, producing a visible flash.
+        for id in pendingCommitOverlayIDs.sorted() {
+            guard let stroke = model.stroke(withID: id) else { continue }
+            if GeometryEngine.isGeometry(stroke) {
+                descriptors.append(contentsOf: InteractionOverlayRenderer.shapePreview(
+                    stroke: stroke,
+                    page: page,
+                    bounds: bounds
+                ))
+            } else if stroke.isInk {
+                descriptors.append(contentsOf: StrokeRenderer.liveLayerDescriptors(
+                    stroke: stroke,
+                    page: page,
+                    viewBounds: bounds,
+                    configuration: strokeConfiguration
+                ))
+            }
+        }
+
         if let shapeGesture {
             descriptors.append(contentsOf: InteractionOverlayRenderer.shapePreview(
                 stroke: shapeGesture.preview,
@@ -155,7 +215,8 @@ final class InkPageView: UIView {
                 descriptors.append(contentsOf: InteractionOverlayRenderer.lasso(
                     points: selectionGesture.lassoPoints,
                     page: page,
-                    bounds: bounds
+                    bounds: bounds,
+                    zoomScale: interactionZoomScale
                 ))
             } else {
                 // During transforms, selected originals are excluded from the
@@ -185,11 +246,17 @@ final class InkPageView: UIView {
             strokes: model.selectedStrokesForPage(pageIndex),
             page: page,
             bounds: bounds,
-            settings: appConfiguration
+            settings: appConfiguration,
+            zoomScale: interactionZoomScale
         ))
 
         if let snap = model.snapGuide, appConfiguration.showSnapGuides {
-            descriptors.append(contentsOf: InteractionOverlayRenderer.snapGuide(snap, page: page, bounds: bounds))
+            descriptors.append(contentsOf: InteractionOverlayRenderer.snapGuide(
+                snap,
+                page: page,
+                bounds: bounds,
+                zoomScale: interactionZoomScale
+            ))
         }
 
         if let eraserCursorWorld, contactTool == .eraser {
@@ -197,7 +264,8 @@ final class InkPageView: UIView {
                 center: eraserCursorWorld,
                 diameter: model.eraserSize,
                 page: page,
-                bounds: bounds
+                bounds: bounds,
+                zoomScale: interactionZoomScale
             ))
         }
 
@@ -244,12 +312,16 @@ final class InkPageView: UIView {
     }
 
     func updateDisplayScale(_ pdfScale: CGFloat) {
+        let previousScale = pendingPDFScale
         pendingPDFScale = max(0.05, pdfScale)
         liveDisplayScale = UIScreen.main.scale * min(max(1, pendingPDFScale), 4)
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for shapeLayer in liveShapeLayers { shapeLayer.contentsScale = liveDisplayScale }
         CATransaction.commit()
+        if abs(previousScale - pendingPDFScale) > 0.001 {
+            scheduleLiveRefresh()
+        }
     }
 
     func settleDisplayScale() {
@@ -303,6 +375,13 @@ final class InkPageView: UIView {
         layer.contents = committedImage?.cgImage
         layer.contentsScale = committedRenderScale
         CATransaction.commit()
+
+        if !pendingCommitOverlayIDs.isEmpty {
+            pendingCommitOverlayIDs.removeAll(keepingCapacity: true)
+            // The committed image is already installed, so removing the live
+            // duplicate here cannot expose an empty frame.
+            refreshLiveContent()
+        }
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
@@ -328,18 +407,10 @@ final class InkPageView: UIView {
         case .shape:
             beginShape(at: pencil.location(in: self), page: page)
         case .pressurePen, .fixedPen, .highlighter:
-            let world = worldPoint(from: pencil.location(in: self))
-            let hitRadius = CGFloat(model.appSettings.configuration.selectorHitRadius)
-            if let geometryID = model.directHitStroke(pageIndex: pageIndex, worldPoint: world, threshold: hitRadius),
-               let geometry = model.stroke(withID: geometryID),
-               GeometryEngine.isGeometry(geometry), !geometry.isLocked {
-                contactTool = .selector
-                model.setSelection([geometryID])
-                beginSelection(at: pencil.location(in: self), page: page)
-            } else {
-                model.clearSelection()
-                beginInk(with: pencil, page: page)
-            }
+            // Pencil ink tools never grab existing geometry. Geometry can be
+            // manipulated with a finger, the eraser, or the explicit lasso tool.
+            model.clearSelection()
+            beginInk(with: pencil, page: page)
         case .none:
             break
         }
@@ -407,6 +478,101 @@ final class InkPageView: UIView {
             break
         }
         finishContact()
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+        guard gestureRecognizer === fingerGeometryPan || gestureRecognizer === fingerGeometryTap,
+              activeTouch == nil,
+              let model,
+              let page = model.pageInfo(at: pageIndex) else { return false }
+
+        let viewPoint = gestureRecognizer.location(in: self)
+        let selected = model.selectedStrokesForPage(pageIndex)
+        if !selected.isEmpty,
+           selected.allSatisfy({ !$0.isLocked }),
+           selectionHandleHit(
+                at: viewPoint,
+                strokes: selected,
+                page: page,
+                settings: model.appSettings.configuration
+           ) != nil {
+            return true
+        }
+
+        let world = worldPoint(from: viewPoint)
+        let threshold = screenPointsToWorld(
+            CGFloat(model.appSettings.configuration.selectorHitRadius),
+            page: page
+        )
+        return model.directHitGeometry(
+            pageIndex: pageIndex,
+            worldPoint: world,
+            threshold: threshold
+        ) != nil
+    }
+
+    @objc private func handleFingerGeometryTap(_ gesture: UITapGestureRecognizer) {
+        guard gesture.state == .ended,
+              let model,
+              let page = model.pageInfo(at: pageIndex) else { return }
+        let viewPoint = gesture.location(in: self)
+        let world = worldPoint(from: viewPoint)
+        let threshold = screenPointsToWorld(
+            CGFloat(model.appSettings.configuration.selectorHitRadius),
+            page: page
+        )
+        guard let id = model.directHitGeometry(
+            pageIndex: pageIndex,
+            worldPoint: world,
+            threshold: threshold
+        ), let stroke = model.stroke(withID: id), !stroke.isLocked else { return }
+        model.setSelection([id])
+        performHaptic()
+    }
+
+    @objc private func handleFingerGeometryPan(_ gesture: UIPanGestureRecognizer) {
+        guard let model, let page = model.pageInfo(at: pageIndex) else { return }
+        let viewPoint = gesture.location(in: self)
+        switch gesture.state {
+        case .began:
+            let world = worldPoint(from: viewPoint)
+            let selected = model.selectedStrokesForPage(pageIndex)
+            if !selected.isEmpty,
+               selected.allSatisfy({ !$0.isLocked }),
+               let mode = selectionHandleHit(
+                    at: viewPoint,
+                    strokes: selected,
+                    page: page,
+                    settings: model.appSettings.configuration
+               ) {
+                beginSelectionTransform(mode: mode, startWorld: world, originals: selected, page: page)
+                return
+            }
+
+            let threshold = screenPointsToWorld(
+                CGFloat(model.appSettings.configuration.selectorHitRadius),
+                page: page
+            )
+            guard let id = model.directHitGeometry(
+                pageIndex: pageIndex,
+                worldPoint: world,
+                threshold: threshold
+            ), let stroke = model.stroke(withID: id), !stroke.isLocked else {
+                gesture.isEnabled = false
+                gesture.isEnabled = true
+                return
+            }
+            model.setSelection([id])
+            beginSelectionTransform(mode: .move, startWorld: world, originals: [stroke], page: page)
+        case .changed:
+            updateSelection(at: viewPoint, page: page)
+        case .ended:
+            finishSelection(at: viewPoint, page: page, cancelled: false)
+        case .cancelled, .failed:
+            finishSelection(at: viewPoint, page: page, cancelled: true)
+        default:
+            break
+        }
     }
 
     func prepareForEviction() {
@@ -577,7 +743,7 @@ final class InkPageView: UIView {
         if let directID = model.directHitStroke(
             pageIndex: pageIndex,
             worldPoint: world,
-            threshold: CGFloat(settings.selectorHitRadius),
+            threshold: screenPointsToWorld(CGFloat(settings.selectorHitRadius), page: page),
             includeLocked: !settings.selectLockedItemsOnlyByLasso
         ), let stroke = model.stroke(withID: directID), !stroke.isLocked {
             if !model.selectedStrokeIDs.contains(directID) || model.selectedStrokes.contains(where: { $0.isLocked }) {
@@ -642,7 +808,7 @@ final class InkPageView: UIView {
         switch gesture.mode {
         case .lasso:
             let lastView = gesture.lassoPoints.last.map { self.viewPoint(from: $0, page: page) }
-            if lastView == nil || hypot(viewPoint.x - lastView!.x, viewPoint.y - lastView!.y) >= CGFloat(settings.lassoSampleSpacing) {
+            if lastView == nil || hypot(viewPoint.x - lastView!.x, viewPoint.y - lastView!.y) >= screenPointsToLocal(CGFloat(settings.lassoSampleSpacing)) {
                 gesture.lassoPoints.append(world)
                 gesture.changed = true
             }
@@ -698,10 +864,14 @@ final class InkPageView: UIView {
         if gesture.mode == .lasso {
             guard !cancelled else { return }
             let moved = hypot(viewPoint.x - gesture.startViewPoint.x, viewPoint.y - gesture.startViewPoint.y)
-            if gesture.lassoPoints.count >= 3, moved >= 8 {
+            if gesture.lassoPoints.count >= 3, moved >= screenPointsToLocal(8) {
                 model.selectByLasso(pageIndex: pageIndex, polygon: gesture.lassoPoints)
             } else {
-                let threshold = CGFloat(model.appSettings.configuration.selectorHitRadius)
+                guard let currentPage = page ?? model.pageInfo(at: pageIndex) else { return }
+                let threshold = screenPointsToWorld(
+                    CGFloat(model.appSettings.configuration.selectorHitRadius),
+                    page: currentPage
+                )
                 let hit = model.directHitStroke(pageIndex: pageIndex, worldPoint: gesture.startWorld, threshold: threshold)
                 model.setSelection(hit.map { Set([$0]) } ?? [])
             }
@@ -728,8 +898,13 @@ final class InkPageView: UIView {
         page: PageInfo,
         settings: NativeAppConfiguration
     ) -> SelectionTransformMode? {
-        guard let geometry = InteractionOverlayRenderer.selectionScreenGeometry(strokes: strokes, page: page, bounds: bounds) else { return nil }
-        let radius = CGFloat(max(12, settings.selectionHandleSize + 4))
+        guard let geometry = InteractionOverlayRenderer.selectionScreenGeometry(
+            strokes: strokes,
+            page: page,
+            bounds: bounds,
+            zoomScale: interactionZoomScale
+        ) else { return nil }
+        let radius = screenPointsToLocal(CGFloat(max(12, settings.selectionHandleSize + 4)))
 
         if strokes.count == 1, let stroke = strokes.first,
            GeometryEngine.isGeometry(stroke),
@@ -743,7 +918,8 @@ final class InkPageView: UIView {
         for (name, handle) in geometry.handles where hypot(viewPoint.x - handle.x, viewPoint.y - handle.y) <= radius {
             return .scale(handle: name)
         }
-        if geometry.view.insetBy(dx: -4, dy: -4).contains(viewPoint) { return .move }
+        let moveInset = screenPointsToLocal(4)
+        if geometry.view.insetBy(dx: -moveInset, dy: -moveInset).contains(viewPoint) { return .move }
         return nil
     }
 
@@ -852,6 +1028,27 @@ final class InkPageView: UIView {
             x: (world.x - CGFloat(page.x)) / max(0.001, CGFloat(page.width)) * bounds.width,
             y: (world.y - CGFloat(page.y)) / max(0.001, CGFloat(page.height)) * bounds.height
         )
+    }
+
+    private func screenPointsToLocal(_ points: CGFloat) -> CGFloat {
+        points / interactionZoomScale
+    }
+
+    private func screenPointsToWorld(_ points: CGFloat, page: PageInfo) -> CGFloat {
+        guard bounds.width > 0, bounds.height > 0 else { return points }
+        let localPoints = screenPointsToLocal(points)
+        let xScale = CGFloat(page.width) / bounds.width
+        let yScale = CGFloat(page.height) / bounds.height
+        return localPoints * (xScale + yScale) / 2
+    }
+
+    private func enclosingScrollView() -> UIScrollView? {
+        var candidate = superview
+        while let view = candidate {
+            if let scrollView = view as? UIScrollView { return scrollView }
+            candidate = view.superview
+        }
+        return nil
     }
 
     private func performHaptic() {

@@ -15,6 +15,14 @@ def test_sync_is_incremental_and_forceful_ipad_state_push_is_removed():
     assert '<option value="0" selected>Off</option>' in INDEX_HTML
 
 
+def test_project_import_fetches_restored_state_separately():
+    import_start = APP_JS.index('projectImportInput?.addEventListener')
+    import_end = APP_JS.index('window.addEventListener("resize"', import_start)
+    block = APP_JS[import_start:import_end]
+    assert 'fetch(`/api/state?import=${Date.now()}`' in block
+    assert 'state: data.state' not in block
+
+
 def test_rapid_erasures_use_persisted_acknowledged_operations():
     assert 'pendingDeleteOperations: loadPendingDeleteOperations()' in APP_JS
     assert 'operationId: operation.id' in APP_JS

@@ -62,8 +62,6 @@ struct ContentView: View {
                         ToolButton(tool: tool, selected: model.selectedTool == tool) {
                             model.selectedTool = tool
                             if tool != .selector { model.clearSelection() }
-                            if tool == .highlighter, model.inkWidth < 8 { model.inkWidth = 18 }
-                            if tool == .pressurePen, model.inkWidth > 12 { model.inkWidth = 3 }
                         }
                     }
 
@@ -143,6 +141,10 @@ struct ContentView: View {
             .padding(.trailing, 12)
         }
         .background(.regularMaterial)
+        .contentShape(Rectangle())
+        // Consume taps in empty toolbar space instead of allowing them to be
+        // interpreted by the document scroll view underneath.
+        .onTapGesture { }
     }
 
     @ViewBuilder
@@ -385,12 +387,23 @@ struct ContentView: View {
                 Text("•")
                 Text(filename).lineLimit(1)
             }
-            Text("• Native 0.5.2 • Vector PDF • large-state sync")
+            Text("• Native 0.5.3 • Vector PDF • stable ink hand-off")
                 .foregroundStyle(.secondary)
             Spacer()
             if !model.mountedPageIndices.isEmpty {
-                Text("Pages: \(model.mountedPageIndices.map { String($0 + 1) }.sorted().joined(separator: ", "))")
-                    .foregroundStyle(.secondary)
+                let sortedPages = model.mountedPageIndices.sorted()
+                HStack(spacing: 0) {
+                    Text("Pages: ")
+                    ForEach(sortedPages.indices, id: \.self) { offset in
+                        let index = sortedPages[offset]
+                        Text("\(index + 1)")
+                            .fontWeight(index + 1 == model.currentPageNumber ? .bold : .regular)
+                        if offset < sortedPages.count - 1 {
+                            Text(", ")
+                        }
+                    }
+                }
+                .foregroundStyle(.secondary)
             }
         }
         .font(.caption)

@@ -40,6 +40,7 @@ MAX_PROJECT_UNCOMPRESSED_BYTES = 320 * 1024 * 1024
 MAX_PROJECT_STATE_BYTES = 128 * 1024 * 1024
 MAX_PROJECT_STROKES = 50_000
 MAX_PROJECT_POINTS = 2_000_000
+MAX_NATIVE_WS_MESSAGE_BYTES = 2 * 1024 * 1024
 PROJECT_FORMAT = "infinite-notes-project"
 PROJECT_FORMAT_VERSION = 1
 APP_VERSION = 24
@@ -228,6 +229,11 @@ async def broadcast(
     if not clients:
         return
     encoded = json.dumps(message, separators=(",", ":"))
+    encoded_size = len(encoded.encode("utf-8"))
+    native_refresh = json.dumps(
+        state_refresh_message(reason=f"oversized_{message.get('type', 'update')}"),
+        separators=(",", ":"),
+    )
     dead: list[WebSocket] = []
     for ws in list(clients):
         if ws is exclude:
@@ -235,7 +241,10 @@ async def broadcast(
         if exclude_kinds and client_kinds.get(ws) in exclude_kinds:
             continue
         try:
-            await ws.send_text(encoded)
+            if client_kinds.get(ws) == "native" and encoded_size > MAX_NATIVE_WS_MESSAGE_BYTES:
+                await ws.send_text(native_refresh)
+            else:
+                await ws.send_text(encoded)
         except Exception:
             dead.append(ws)
     for ws in dead:
@@ -1404,7 +1413,12 @@ async def import_project(file: UploadFile = File(...)) -> JSONResponse:
     await broadcast(imported_snapshot_message, exclude_kinds={"native"})
     await send_to_kind("native", state_refresh_message(reason="project_import"))
     await broadcast(history_status_message())
-    return JSONResponse({"ok": True, "state": snapshot})
+    return JSONResponse({
+        "ok": True,
+        "reason": "project_import",
+        "strokeCount": len(snapshot.get("strokes", {})),
+        "document": snapshot.get("document", {}),
+    })
 
 
 @app.post("/api/reset")

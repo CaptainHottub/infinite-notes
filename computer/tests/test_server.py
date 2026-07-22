@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import server
-from server import app, client_kinds, client_roles, history, pending_delete_operations, pending_stroke_history, redo_history, state
+from server import app, client_kinds, client_roles, clients, history, pending_delete_operations, pending_stroke_history, redo_history, state
 
 
 @pytest.fixture(autouse=True)
@@ -19,6 +19,7 @@ def isolated_state(monkeypatch):
     pending_backup = set(pending_stroke_history)
     client_roles.clear()
     client_kinds.clear()
+    clients.clear()
     pending_delete_operations.clear()
     monkeypatch.setattr(server, "save_state_atomic", lambda: None)
     state["strokes"] = {}
@@ -34,6 +35,7 @@ def isolated_state(monkeypatch):
     pending_stroke_history.update(pending_backup)
     client_roles.clear()
     client_kinds.clear()
+    clients.clear()
     pending_delete_operations.clear()
 
 
@@ -155,6 +157,32 @@ def test_state_endpoint_supports_compressed_large_notebook():
     assert response.status_code == 200
     assert response.headers.get("content-encoding") == "gzip"
     assert len(response.json()["strokes"]["large"]["points"]) == 20_000
+
+
+@pytest.mark.asyncio
+async def test_oversized_native_broadcast_falls_back_to_state_refresh():
+    class FakeWebSocket:
+        def __init__(self):
+            self.messages = []
+
+        async def send_text(self, text):
+            self.messages.append(__import__("json").loads(text))
+
+    websocket = FakeWebSocket()
+    clients.add(websocket)
+    client_roles[websocket] = "ipad"
+    client_kinds[websocket] = "native"
+
+    await server.broadcast({
+        "type": "replace_strokes",
+        "strokes": [{"id": "huge", "payload": "x" * (server.MAX_NATIVE_WS_MESSAGE_BYTES + 100)}],
+    })
+
+    assert websocket.messages == [{
+        "type": "state_refresh",
+        "reason": "oversized_replace_strokes",
+        "serverTime": websocket.messages[0]["serverTime"],
+    }]
 
 def test_undo_and_redo_stroke():
     client = TestClient(app)
@@ -325,8 +353,9 @@ def test_project_import_restores_blank_canvas_strokes(monkeypatch, tmp_path):
     )
     assert response.status_code == 200
     payload = response.json()
-    assert payload["state"]["document"] == {"filename": None, "pages": []}
-    assert payload["state"]["strokes"]["restored"]["tool"] == "fixed-pen"
+    assert payload["strokeCount"] == 1
+    assert payload["document"] == {"filename": None, "pages": []}
+    assert state["strokes"]["restored"]["tool"] == "fixed-pen"
     assert state["strokes"]["restored"]["lineStyle"] == "dashed"
 
 
@@ -353,7 +382,7 @@ def test_project_import_renders_embedded_pdf(monkeypatch, tmp_path):
         files={"file": ("restored.inotes", archive, "application/zip")},
     )
     assert response.status_code == 200
-    restored = response.json()["state"]
+    restored = client.get("/api/state").json()
     assert restored["document"]["filename"] == "restored.pdf"
     assert len(restored["document"]["pages"]) == 1
     assert server.CURRENT_PDF.read_bytes() == pdf_content
@@ -520,7 +549,7 @@ def test_import_v12_gap_layout_reflows_strokes(monkeypatch, tmp_path):
         files={"file": ("v12.inotes", archive, "application/zip")},
     )
     assert response.status_code == 200
-    restored = response.json()["state"]
+    restored = client.get("/api/state").json()
     assert restored["document"]["pages"][1]["y"] == 400
     assert restored["strokes"]["page-two-ink"]["points"][0]["y"] == 450
 

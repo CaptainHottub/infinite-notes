@@ -57,7 +57,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         // Defensive compatibility with older servers that still send a full
         // notebook snapshot through one WebSocket message. New servers use HTTP
         // for full-state transfers, but this prevents an immediate reconnect loop.
-        task.maximumMessageSize = 64 * 1024 * 1024
+        task.maximumMessageSize = 256 * 1024 * 1024
         self.task = task
         task.resume()
         receiveNext(from: task)

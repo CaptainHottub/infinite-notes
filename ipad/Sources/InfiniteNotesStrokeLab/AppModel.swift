@@ -351,6 +351,20 @@ final class AppModel: ObservableObject {
         return bestID
     }
 
+    func directHitGeometry(pageIndex: Int, worldPoint: CGPoint, threshold: CGFloat, includeLocked: Bool = false) -> String? {
+        var bestID: String?
+        var bestDistance = CGFloat.greatestFiniteMagnitude
+        for stroke in strokesForPage(pageIndex).reversed() where GeometryEngine.isGeometry(stroke) {
+            if stroke.isLocked && !includeLocked { continue }
+            guard let distance = GeometryEngine.hitTest(stroke, point: worldPoint, threshold: threshold) else { continue }
+            if distance < bestDistance {
+                bestDistance = distance
+                bestID = stroke.id
+            }
+        }
+        return bestID
+    }
+
     func selectionWorldBounds(pageIndex: Int) -> CGRect? {
         GeometryEngine.selectionBounds(selectedStrokesForPage(pageIndex))
     }
@@ -802,6 +816,8 @@ final class AppModel: ObservableObject {
 
     func endStroke(strokeID: String) {
         flushPendingPoints(strokeID: strokeID)
+        let pages = strokeMembership[strokeID] ?? []
+        beginCommitTransition(strokeID: strokeID, pages: pages)
         liveStrokeIDs.remove(strokeID)
         let finalStroke = strokes[strokeID]
         if let finalStroke { insertOrReplace(finalStroke) }
@@ -811,7 +827,6 @@ final class AppModel: ObservableObject {
         } else {
             client.sendJSONObject(["type": "stroke_end", "id": strokeID])
         }
-        invalidatePages(strokeMembership[strokeID] ?? [])
     }
 
     func beginEraseOperation() -> String {
@@ -931,6 +946,8 @@ final class AppModel: ObservableObject {
             }
         case "stroke_end":
             if let id = message.id {
+                let pages = strokeMembership[id] ?? []
+                beginCommitTransition(strokeID: id, pages: pages)
                 liveStrokeIDs.remove(id)
                 if let stroke = strokes[id] { insertOrReplace(stroke) }
                 else { invalidatePages(strokeMembership[id] ?? []) }
@@ -1168,6 +1185,15 @@ final class AppModel: ObservableObject {
                 // Live Pencil updates only rebuild reusable vector paths. They
                 // no longer repaint the page-sized high-resolution ink cache.
                 weakView.value?.scheduleLiveRefresh()
+            }
+        }
+    }
+
+    private func beginCommitTransition(strokeID: String, pages: Set<Int>) {
+        for page in pages {
+            cleanupWeakViews(pageIndex: page)
+            for weakView in weakPageViews[page] ?? [] {
+                weakView.value?.beginCommitTransition(strokeID: strokeID)
             }
         }
     }

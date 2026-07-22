@@ -100,6 +100,9 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         decelerationRate = .fast
         showsVerticalScrollIndicator = true
         showsHorizontalScrollIndicator = true
+        // Prevent taps in the app's top chrome/status area from invoking
+        // UIKit's automatic "scroll to top" behaviour on this document view.
+        scrollsToTop = false
         maximumZoomScale = CGFloat(model.appSettings.configuration.maximumZoom)
         applyBackgroundStyle()
 

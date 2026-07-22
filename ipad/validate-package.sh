@@ -21,4 +21,4 @@ grep -q 'eraserCursor' Sources/InfiniteNotesStrokeLab/InteractionOverlayRenderer
 grep -q 'ProcessInfo.processInfo.systemUptime' Sources/InfiniteNotesStrokeLab/GeometryEngine.swift
 grep -q 'PenWidthPresetPreview' Sources/InfiniteNotesStrokeLab/ContentView.swift
 
-echo "Infinite Notes 0.5.2 package validation passed."
+echo "Infinite Notes 0.5.3 package validation passed."

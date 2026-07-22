@@ -1,6 +1,6 @@
 Infinite Notes laptop server
 Base: v24
-Native client compatibility: 0.5.2
+Native client compatibility: 0.5.3
 
 Added:
 - GET /api/pdf/source for the unchanged source PDF

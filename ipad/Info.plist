@@ -5,9 +5,9 @@
     <key>CFBundleDisplayName</key>
     <string>Infinite Notes</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.5.2</string>
+    <string>0.5.3</string>
     <key>CFBundleVersion</key>
-    <string>52</string>
+    <string>53</string>
 
     <key>UIDeviceFamily</key>
     <array>

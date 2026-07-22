@@ -5112,7 +5112,10 @@
       const response = await fetch("/api/project/import", { method: "POST", body: formData });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Import failed");
-      handleServerMessage({ type: "snapshot", state: data.state, reason: "project_import" });
+      const stateResponse = await fetch(`/api/state?import=${Date.now()}`, { cache: "no-store" });
+      if (!stateResponse.ok) throw new Error("Project imported, but the restored notebook could not be downloaded");
+      const restoredState = await stateResponse.json();
+      handleServerMessage({ type: "snapshot", state: restoredState, reason: "project_import" });
       fitPages();
       showToast("Project imported");
     } catch (error) {

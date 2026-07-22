@@ -17,4 +17,6 @@ def test_native_full_state_uses_http_not_websocket():
 
 
 def test_websocket_has_defensive_legacy_size_limit():
-    assert 'task.maximumMessageSize = 64 * 1024 * 1024' in SERVER_CLIENT
+    assert 'task.maximumMessageSize = 256 * 1024 * 1024' in SERVER_CLIENT
+    assert 'MAX_NATIVE_WS_MESSAGE_BYTES' in SERVER
+    assert 'oversized_' in SERVER
