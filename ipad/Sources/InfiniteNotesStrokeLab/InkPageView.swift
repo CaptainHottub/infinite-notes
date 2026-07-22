@@ -1,6 +1,65 @@
 import UIKit
 
 @MainActor
+private final class PencilInputGestureRecognizer: UIGestureRecognizer {
+    var onBegan: ((Set<UITouch>, UIEvent?) -> Void)?
+    var onMoved: ((Set<UITouch>, UIEvent?) -> Void)?
+    var onEnded: ((Set<UITouch>, UIEvent?) -> Void)?
+    var onCancelled: ((Set<UITouch>, UIEvent?) -> Void)?
+
+    override init(target: Any?, action: Selector?) {
+        super.init(target: target, action: action)
+        allowedTouchTypes = [NSNumber(value: UITouch.TouchType.pencil.rawValue)]
+        cancelsTouchesInView = false
+        delaysTouchesBegan = false
+        delaysTouchesEnded = false
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        let pencilTouches = Set(touches.filter { $0.type == .pencil })
+        guard !pencilTouches.isEmpty else {
+            state = .failed
+            return
+        }
+        onBegan?(pencilTouches, event)
+        state = .began
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+        let pencilTouches = Set(touches.filter { $0.type == .pencil })
+        guard !pencilTouches.isEmpty else { return }
+        onMoved?(pencilTouches, event)
+        if state == .began || state == .changed {
+            state = .changed
+        }
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        let pencilTouches = Set(touches.filter { $0.type == .pencil })
+        guard !pencilTouches.isEmpty else { return }
+        onEnded?(pencilTouches, event)
+        if state == .began || state == .changed {
+            state = .ended
+        }
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+        let pencilTouches = Set(touches.filter { $0.type == .pencil })
+        guard !pencilTouches.isEmpty else { return }
+        onCancelled?(pencilTouches, event)
+        state = .cancelled
+    }
+
+    override func canPrevent(_ preventedGestureRecognizer: UIGestureRecognizer) -> Bool {
+        false
+    }
+
+    override func canBePrevented(by preventingGestureRecognizer: UIGestureRecognizer) -> Bool {
+        false
+    }
+}
+
+@MainActor
 final class InkPageView: UIView, UIGestureRecognizerDelegate {
     private struct ShapeGesture {
         var startWorld: CGPoint
@@ -43,6 +102,25 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         max(0.05, pendingPDFScale)
     }
 
+    private weak var interactionHost: UIView?
+
+    private lazy var pencilInputRecognizer: PencilInputGestureRecognizer = {
+        let gesture = PencilInputGestureRecognizer(target: nil, action: nil)
+        gesture.onBegan = { [weak self] touches, event in
+            self?.touchesBegan(touches, with: event)
+        }
+        gesture.onMoved = { [weak self] touches, event in
+            self?.touchesMoved(touches, with: event)
+        }
+        gesture.onEnded = { [weak self] touches, event in
+            self?.touchesEnded(touches, with: event)
+        }
+        gesture.onCancelled = { [weak self] touches, event in
+            self?.touchesCancelled(touches, with: event)
+        }
+        return gesture
+    }()
+
     private lazy var fingerGeometryPan: UIPanGestureRecognizer = {
         let gesture = UIPanGestureRecognizer(target: self, action: #selector(handleFingerGeometryPan(_:)))
         gesture.minimumNumberOfTouches = 1
@@ -68,6 +146,11 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         super.init(frame: .zero)
         backgroundColor = .clear
         isOpaque = false
+        // This full-page view is rendering-only. If it participates in
+        // hit-testing, finger touches land here instead of in the PDF scroll
+        // view. Pencil and geometry recognizers are installed on the page
+        // container in didMoveToSuperview().
+        isUserInteractionEnabled = false
         isMultipleTouchEnabled = true
         contentMode = .redraw
         layer.contentsGravity = .resize
@@ -75,14 +158,35 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         layer.minificationFilter = .linear
         liveLayerHost.masksToBounds = true
         layer.addSublayer(liveLayerHost)
-        addGestureRecognizer(fingerGeometryPan)
-        addGestureRecognizer(fingerGeometryTap)
         fingerGeometryTap.require(toFail: fingerGeometryPan)
         model.register(pageView: self, pageIndex: pageIndex)
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
+    }
+
+    override func didMoveToSuperview() {
+        super.didMoveToSuperview()
+        installInteractionRecognizers(on: superview)
+    }
+
+    private func installInteractionRecognizers(on host: UIView?) {
+        guard interactionHost !== host else { return }
+
+        if let oldHost = interactionHost {
+            oldHost.removeGestureRecognizer(pencilInputRecognizer)
+            oldHost.removeGestureRecognizer(fingerGeometryPan)
+            oldHost.removeGestureRecognizer(fingerGeometryTap)
+        }
+
+        interactionHost = host
+
+        if let host {
+            host.addGestureRecognizer(pencilInputRecognizer)
+            host.addGestureRecognizer(fingerGeometryPan)
+            host.addGestureRecognizer(fingerGeometryTap)
+        }
     }
 
     override func layoutSubviews() {
@@ -379,18 +483,8 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        let pencilTouches = Set(touches.filter { $0.type == .pencil })
-        let passthroughTouches = touches.subtracting(pencilTouches)
-        if !passthroughTouches.isEmpty {
-            // InkPageView covers the entire rendered PDF page. Forward every
-            // non-Pencil touch through the responder chain so the enclosing
-            // UIScrollView receives finger pan and pinch gestures exactly as it
-            // does in the black border around the page.
-            super.touchesBegan(passthroughTouches, with: event)
-        }
-
         guard activeTouch == nil,
-              let pencil = pencilTouches.first,
+              let pencil = touches.first(where: { $0.type == .pencil }),
               let model,
               let page = model.pageInfo(at: pageIndex) else { return }
 
@@ -424,15 +518,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         guard let touch = activeTouch,
               touches.contains(touch),
               let model,
-              let page = model.pageInfo(at: pageIndex) else {
-            super.touchesMoved(touches, with: event)
-            return
-        }
-
-        let passthroughTouches = touches.subtracting(Set([touch]))
-        if !passthroughTouches.isEmpty {
-            super.touchesMoved(passthroughTouches, with: event)
-        }
+              let page = model.pageInfo(at: pageIndex) else { return }
 
         switch contactTool {
         case .eraser:
@@ -455,15 +541,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         guard let touch = activeTouch,
               touches.contains(touch),
               let model,
-              let page = model.pageInfo(at: pageIndex) else {
-            super.touchesEnded(touches, with: event)
-            return
-        }
-
-        let passthroughTouches = touches.subtracting(Set([touch]))
-        if !passthroughTouches.isEmpty {
-            super.touchesEnded(passthroughTouches, with: event)
-        }
+              let page = model.pageInfo(at: pageIndex) else { return }
 
         switch contactTool {
         case .eraser:
@@ -484,16 +562,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = activeTouch, touches.contains(touch), let model else {
-            super.touchesCancelled(touches, with: event)
-            return
-        }
-
-        let passthroughTouches = touches.subtracting(Set([touch]))
-        if !passthroughTouches.isEmpty {
-            super.touchesCancelled(passthroughTouches, with: event)
-        }
-
+        guard let touch = activeTouch, touches.contains(touch), let model else { return }
         switch contactTool {
         case .eraser:
             if let operation = eraseOperationID { model.finishEraseOperation(operation) }
@@ -509,47 +578,13 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         finishContact()
     }
 
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldReceive touch: UITouch
-    ) -> Bool {
-        guard gestureRecognizer === fingerGeometryPan || gestureRecognizer === fingerGeometryTap else {
-            return true
-        }
-        guard touch.type == .direct,
-              activeTouch == nil,
-              let model,
-              let page = model.pageInfo(at: pageIndex) else { return false }
-
-        // Reject blank-page finger touches before the page recognizers start
-        // tracking them. This leaves those touches exclusively available to the
-        // enclosing PDF scroll view instead of making its pan wait for our
-        // geometry recognizer to fail after movement has already begun.
-        return shouldAcceptFingerGeometryGesture(
-            at: touch.location(in: self),
-            model: model,
-            page: page
-        )
-    }
-
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === fingerGeometryPan || gestureRecognizer === fingerGeometryTap,
               activeTouch == nil,
               let model,
               let page = model.pageInfo(at: pageIndex) else { return false }
 
-        return shouldAcceptFingerGeometryGesture(
-            at: gestureRecognizer.location(in: self),
-            model: model,
-            page: page
-        )
-    }
-
-    private func shouldAcceptFingerGeometryGesture(
-        at viewPoint: CGPoint,
-        model: AppModel,
-        page: PageInfo
-    ) -> Bool {
+        let viewPoint = gestureRecognizer.location(in: self)
         let selected = model.selectedStrokesForPage(pageIndex)
         if !selected.isEmpty,
            selected.allSatisfy({ !$0.isLocked }),
@@ -567,12 +602,11 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
             CGFloat(model.appSettings.configuration.selectorHitRadius),
             page: page
         )
-        guard let id = model.directHitGeometry(
+        return model.directHitGeometry(
             pageIndex: pageIndex,
             worldPoint: world,
             threshold: threshold
-        ), let stroke = model.stroke(withID: id) else { return false }
-        return !stroke.isLocked
+        ) != nil
     }
 
     @objc private func handleFingerGeometryTap(_ gesture: UITapGestureRecognizer) {
@@ -640,6 +674,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     }
 
     func prepareForEviction() {
+        installInteractionRecognizers(on: nil)
         guard let model else { return }
         if let operation = eraseOperationID {
             model.finishEraseOperation(operation)

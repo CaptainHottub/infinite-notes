@@ -28,19 +28,32 @@ def test_tool_switching_does_not_force_default_widths():
 
 
 def test_page_geometry_recognizers_do_not_block_document_scrolling():
+    # The full-page ink overlay must not participate in finger hit-testing.
+    assert "isUserInteractionEnabled = false" in INK_VIEW
+
+    # Input recognizers are attached to the page container instead.
+    assert "installInteractionRecognizers(on: superview)" in INK_VIEW
+    assert "host.addGestureRecognizer(pencilInputRecognizer)" in INK_VIEW
+    assert "host.addGestureRecognizer(fingerGeometryPan)" in INK_VIEW
+    assert "host.addGestureRecognizer(fingerGeometryTap)" in INK_VIEW
+
+    # Geometry recognition must not force the scroll view to wait.
     assert "panGestureRecognizer.require(toFail: fingerGeometryPan)" not in INK_VIEW
     assert "enclosingScrollView" not in INK_VIEW
-    assert "shouldReceive touch: UITouch" in INK_VIEW
-    assert "Reject blank-page finger touches" in INK_VIEW
-    assert "shouldAcceptFingerGeometryGesture" in INK_VIEW
-
-
 def test_pencil_drawing_does_not_grab_geometry_but_finger_can():
-    pencil_start = INK_VIEW.index("override func touchesBegan")
-    pencil_end = INK_VIEW.index("override func touchesMoved", pencil_start)
+    ink_view_start = INK_VIEW.index("final class InkPageView")
+    pencil_start = INK_VIEW.index(
+        "override func touchesBegan",
+        ink_view_start,
+    )
+    pencil_end = INK_VIEW.index(
+        "override func touchesMoved",
+        pencil_start,
+    )
     pencil_block = INK_VIEW[pencil_start:pencil_end]
     assert "directHitStroke" not in pencil_block
-    assert "Pencil ink tools never grab existing geometry" in pencil_block
+    assert "allowedTouchTypes" in INK_VIEW
+    assert "UITouch.TouchType.pencil" in INK_VIEW
     assert "fingerGeometryPan" in INK_VIEW
     assert "fingerGeometryTap" in INK_VIEW
     assert "directHitGeometry" in APP_MODEL
