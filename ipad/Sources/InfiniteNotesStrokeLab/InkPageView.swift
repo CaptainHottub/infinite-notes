@@ -474,13 +474,47 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         finishContact()
     }
 
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldReceive touch: UITouch
+    ) -> Bool {
+        guard gestureRecognizer === fingerGeometryPan || gestureRecognizer === fingerGeometryTap else {
+            return true
+        }
+        guard touch.type == .direct,
+              activeTouch == nil,
+              let model,
+              let page = model.pageInfo(at: pageIndex) else { return false }
+
+        // Reject blank-page finger touches before the page recognizers start
+        // tracking them. This leaves those touches exclusively available to the
+        // enclosing PDF scroll view instead of making its pan wait for our
+        // geometry recognizer to fail after movement has already begun.
+        return shouldAcceptFingerGeometryGesture(
+            at: touch.location(in: self),
+            model: model,
+            page: page
+        )
+    }
+
     override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
         guard gestureRecognizer === fingerGeometryPan || gestureRecognizer === fingerGeometryTap,
               activeTouch == nil,
               let model,
               let page = model.pageInfo(at: pageIndex) else { return false }
 
-        let viewPoint = gestureRecognizer.location(in: self)
+        return shouldAcceptFingerGeometryGesture(
+            at: gestureRecognizer.location(in: self),
+            model: model,
+            page: page
+        )
+    }
+
+    private func shouldAcceptFingerGeometryGesture(
+        at viewPoint: CGPoint,
+        model: AppModel,
+        page: PageInfo
+    ) -> Bool {
         let selected = model.selectedStrokesForPage(pageIndex)
         if !selected.isEmpty,
            selected.allSatisfy({ !$0.isLocked }),
@@ -498,11 +532,12 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
             CGFloat(model.appSettings.configuration.selectorHitRadius),
             page: page
         )
-        return model.directHitGeometry(
+        guard let id = model.directHitGeometry(
             pageIndex: pageIndex,
             worldPoint: world,
             threshold: threshold
-        ) != nil
+        ), let stroke = model.stroke(withID: id) else { return false }
+        return !stroke.isLocked
     }
 
     @objc private func handleFingerGeometryTap(_ gesture: UITapGestureRecognizer) {

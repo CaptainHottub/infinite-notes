@@ -30,6 +30,9 @@ def test_tool_switching_does_not_force_default_widths():
 def test_page_geometry_recognizers_do_not_block_document_scrolling():
     assert "panGestureRecognizer.require(toFail: fingerGeometryPan)" not in INK_VIEW
     assert "enclosingScrollView" not in INK_VIEW
+    assert "shouldReceive touch: UITouch" in INK_VIEW
+    assert "Reject blank-page finger touches" in INK_VIEW
+    assert "shouldAcceptFingerGeometryGesture" in INK_VIEW
 
 
 def test_pencil_drawing_does_not_grab_geometry_but_finger_can():
