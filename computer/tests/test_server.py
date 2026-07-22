@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import server
-from server import app, client_roles, history, pending_delete_operations, pending_stroke_history, redo_history, state
+from server import app, client_kinds, client_roles, history, pending_delete_operations, pending_stroke_history, redo_history, state
 
 
 @pytest.fixture(autouse=True)
@@ -18,6 +18,7 @@ def isolated_state(monkeypatch):
     redo_backup = copy.deepcopy(redo_history)
     pending_backup = set(pending_stroke_history)
     client_roles.clear()
+    client_kinds.clear()
     pending_delete_operations.clear()
     monkeypatch.setattr(server, "save_state_atomic", lambda: None)
     state["strokes"] = {}
@@ -32,6 +33,7 @@ def isolated_state(monkeypatch):
     pending_stroke_history.clear()
     pending_stroke_history.update(pending_backup)
     client_roles.clear()
+    client_kinds.clear()
     pending_delete_operations.clear()
 
 
@@ -53,6 +55,106 @@ def test_websocket_snapshot():
         history_state = websocket.receive_json()
         assert history_state == {"type": "history_state", "canUndo": False, "canRedo": False}
 
+
+
+def test_native_websocket_uses_small_http_refresh_message():
+    # A native client must never receive the full notebook as one WebSocket frame.
+    state["strokes"] = {
+        "large": {
+            "id": "large",
+            "owner": "test",
+            "tool": "pen",
+            "color": "#111111",
+            "width": 3,
+            "opacity": 1,
+            "smoothing": 35,
+            "points": [
+                {"x": index, "y": index, "p": 0.5, "t": index}
+                for index in range(20_000)
+            ],
+        }
+    }
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws?role=ipad&clientId=native-test") as websocket:
+        message = websocket.receive_json()
+        assert message["type"] == "state_refresh"
+        assert message["reason"] == "initial"
+        assert "state" not in message
+        assert len(str(message)) < 1_000
+        assert websocket.receive_json()["type"] == "history_state"
+
+
+def test_native_manual_sync_uses_http_refresh_message():
+    client = TestClient(app)
+    with client.websocket_connect("/ws?role=ipad&clientId=native-test") as websocket:
+        websocket.receive_json()
+        websocket.receive_json()
+        websocket.send_json({"type": "sync_request"})
+        message = websocket.receive_json()
+        assert message["type"] == "state_refresh"
+        assert message["reason"] == "manual_sync"
+        assert "state" not in message
+        assert websocket.receive_json()["type"] == "history_state"
+
+
+
+def test_project_import_notifies_native_client_with_small_refresh(monkeypatch, tmp_path):
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    project_state = {
+        "version": 1,
+        "document": {"filename": None, "pages": []},
+        "strokes": {
+            "restored": {
+                "id": "restored",
+                "owner": "backup",
+                "tool": "pen",
+                "color": "#111111",
+                "width": 3,
+                "opacity": 1,
+                "smoothing": 35,
+                "points": [{"x": 1, "y": 2, "p": 0.5, "t": 1}],
+            }
+        },
+    }
+    archive = build_project_archive(project_state)
+    client = TestClient(app)
+
+    with client.websocket_connect("/ws?role=ipad&clientId=native-import-test") as websocket:
+        websocket.receive_json()
+        websocket.receive_json()
+        response = client.post(
+            "/api/project/import",
+            files={"file": ("lecture.inotes", archive, "application/zip")},
+        )
+        assert response.status_code == 200
+        message = websocket.receive_json()
+        assert message["type"] == "state_refresh"
+        assert message["reason"] == "project_import"
+        assert "state" not in message
+        assert websocket.receive_json()["type"] == "history_state"
+
+def test_state_endpoint_supports_compressed_large_notebook():
+    state["strokes"] = {
+        "large": {
+            "id": "large",
+            "owner": "test",
+            "tool": "pen",
+            "color": "#111111",
+            "width": 3,
+            "opacity": 1,
+            "smoothing": 35,
+            "points": [
+                {"x": index, "y": index, "p": 0.5, "t": index}
+                for index in range(20_000)
+            ],
+        }
+    }
+    client = TestClient(app)
+    response = client.get("/api/state", headers={"Accept-Encoding": "gzip"})
+    assert response.status_code == 200
+    assert response.headers.get("content-encoding") == "gzip"
+    assert len(response.json()["strokes"]["large"]["points"]) == 20_000
 
 def test_undo_and_redo_stroke():
     client = TestClient(app)

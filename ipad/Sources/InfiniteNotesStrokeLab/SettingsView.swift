@@ -326,7 +326,7 @@ struct SettingsView: View {
             }
 
             Section("Runtime") {
-                LabeledContent("Build", value: "0.5.1")
+                LabeledContent("Build", value: "0.5.2")
                 LabeledContent("PDF", value: model.pdfDocument == nil ? "Not loaded" : "Loaded")
                 LabeledContent("Connection", value: model.connectionLabel)
                 LabeledContent("Mounted pages", value: "\(model.mountedPageIndices.count)")

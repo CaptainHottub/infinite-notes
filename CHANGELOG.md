@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.2 — Large notebook synchronization fix
+
+- Native clients no longer receive the complete notebook as one WebSocket frame.
+- Initial connection, manual sync, and `.inotes` import now trigger a compressed HTTP state download.
+- Added a defensive 64 MB WebSocket receive limit for compatibility with older computer servers.
+- Prevented large projects from causing a “Message too long” reconnect loop.
+- Added regression tests for large notebooks and native import notifications.
+
 ## 0.5.1 — Git baseline
 
 - Fixed geometry timestamps rejected as `Invalid point field: t`.

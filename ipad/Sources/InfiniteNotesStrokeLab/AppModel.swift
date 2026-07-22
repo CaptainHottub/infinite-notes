@@ -62,6 +62,8 @@ final class AppModel: ObservableObject {
     private var baseURL: URL?
     private var shouldReconnect = false
     private var reconnectWorkItem: DispatchWorkItem?
+    private var stateFetchTask: URLSessionDataTask?
+    private var stateFetchGeneration = 0
     private var strokes: [String: NoteStroke] = [:]
     private var pageStrokeIDs: [Int: Set<String>] = [:]
     private var strokeMembership: [String: Set<Int>] = [:]
@@ -260,6 +262,9 @@ final class AppModel: ObservableObject {
     func connect(address: String) {
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
+        stateFetchTask?.cancel()
+        stateFetchTask = nil
+        stateFetchGeneration &+= 1
         guard let normalized = Self.normalizedBaseURL(address) else {
             lastError = "Enter a server address such as http://10.42.0.1:8000"
             return
@@ -273,11 +278,19 @@ final class AppModel: ObservableObject {
         shouldReconnect = false
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
+        stateFetchTask?.cancel()
+        stateFetchTask = nil
+        stateFetchGeneration &+= 1
         client.disconnect()
     }
 
     func syncNow() {
-        client.sendJSONObject(["type": "sync_request", "clientTime": Date().timeIntervalSince1970 * 1000])
+        guard isConnected else {
+            lastError = "Connect to the computer before synchronizing"
+            return
+        }
+        notice = "Synchronizing notebook…"
+        fetchNotebookState(reason: "manual_sync")
     }
 
     func undo() {
@@ -877,11 +890,15 @@ final class AppModel: ObservableObject {
     private func handle(_ message: ServerEnvelope) {
         switch message.type {
         case "snapshot":
+            // Compatibility with older computer servers. New servers only send
+            // small state_refresh messages to native clients.
             guard let snapshot = message.state else { return }
             applySnapshot(snapshot, liveIDs: Set(message.liveStrokeIds ?? []))
             if !snapshot.document.pages.isEmpty {
                 fetchSourcePDF()
             }
+        case "state_refresh":
+            fetchNotebookState(reason: message.reason ?? "sync")
         case "history_state":
             canUndo = message.canUndo ?? false
             canRedo = message.canRedo ?? false
@@ -939,6 +956,63 @@ final class AppModel: ObservableObject {
         default:
             break
         }
+    }
+
+    private func fetchNotebookState(reason: String) {
+        guard let stateURL = endpoint(path: "/api/state") else {
+            lastError = "The computer server address is invalid"
+            return
+        }
+
+        stateFetchTask?.cancel()
+        stateFetchGeneration &+= 1
+        let generation = stateFetchGeneration
+
+        var request = URLRequest(url: stateURL)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.timeoutInterval = 120
+        request.setValue("gzip", forHTTPHeaderField: "Accept-Encoding")
+
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            if let error {
+                if (error as NSError).code == NSURLErrorCancelled { return }
+                Task { @MainActor in
+                    guard generation == self.stateFetchGeneration else { return }
+                    self.lastError = "Notebook sync failed: \(error.localizedDescription)"
+                }
+                return
+            }
+            guard let http = response as? HTTPURLResponse,
+                  (200..<300).contains(http.statusCode),
+                  let data else {
+                Task { @MainActor in
+                    guard generation == self.stateFetchGeneration else { return }
+                    self.lastError = "The computer did not return the notebook state"
+                }
+                return
+            }
+
+            do {
+                let snapshot = try JSONDecoder().decode(NotebookState.self, from: data)
+                Task { @MainActor in
+                    guard generation == self.stateFetchGeneration else { return }
+                    self.applySnapshot(snapshot, liveIDs: [])
+                    self.notice = reason == "project_import" ? "Project loaded" : "Notebook synchronized"
+                    self.lastError = nil
+                    if !snapshot.document.pages.isEmpty {
+                        self.fetchSourcePDF()
+                    }
+                }
+            } catch {
+                Task { @MainActor in
+                    guard generation == self.stateFetchGeneration else { return }
+                    self.lastError = "Could not decode the notebook state: \(error.localizedDescription)"
+                }
+            }
+        }
+        stateFetchTask = task
+        task.resume()
     }
 
     private func applySnapshot(_ snapshot: NotebookState, liveIDs: Set<String>) {
