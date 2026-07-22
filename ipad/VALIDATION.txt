@@ -1,0 +1,2 @@
+Info.plist: OK
+Infinite Notes 0.5.1 package validation passed.

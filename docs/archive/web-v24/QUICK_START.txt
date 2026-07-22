@@ -1,0 +1,40 @@
+INFINITE NOTES V24 — QUICK START
+
+ONE-TIME SETUP
+
+  chmod +x run.sh setup.sh diagnose.sh install-desktop-shortcut.sh
+  ./setup.sh --test
+
+NORMAL START
+
+  ./run.sh
+
+This starts NotesHotspot, starts Infinite Notes, opens the desktop interface,
+prints the iPad address, and shuts down both when you press Ctrl+C.
+
+GEOMETRY
+
+  1. Select the Shapes icon.
+  2. Pick a shape and drag to create it.
+  3. Tap and release unlocked geometry with one finger to select it temporarily.
+  4. Use Apple Pencil in the selector to tap/drag geometry directly.
+  5. Tap empty space after a finger selection to return to the previous tool.
+  6. Use selector handles to scale/rotate; line and curve points have handles.
+  7. Lasso-select any ink, text, or geometry and press lock to protect it.
+  8. Locked x-y planes remain directly above the PDF background.
+
+HOLD RECOGNITION
+
+  Draw with the pen, keep the Pencil down, and pause. A sufficiently straight
+  stroke becomes a line; a sufficiently smooth bend becomes a quadratic curve.
+  Thresholds and snapping controls are in Settings.
+
+SERVER WITHOUT THE HOTSPOT
+
+  ./run.sh --no-hotspot
+
+DIAGNOSTICS
+
+  ./diagnose.sh
+
+Your current PDF, pages, ink, text, and geometry are stored under data/.

@@ -1,0 +1,23 @@
+Infinite Notes v21 upgrade
+
+1. Export a .inotes backup.
+2. Stop Infinite Notes with Ctrl+C.
+3. Put infinite_notes_v21_patch.zip in the existing project folder.
+4. Run:
+
+   unzip -o infinite_notes_v21_patch.zip
+   ./setup.sh --test
+   ./run.sh
+
+5. Fully close and reopen the iPad Safari tab or Home Screen app so Safari loads v21 assets.
+
+v21 changes
+-----------
+- A selected x-y plane can be locked or unlocked from the selector toolbar.
+- Locked planes render directly above the PDF and below all ink, text, and geometry.
+- Locked planes ignore direct Pencil/finger taps; surround one with the lasso to select it.
+- Straight-line threshold maximum increased from 25% to 60%.
+- Hold-to-recognize minimum reduced from 400 ms to 150 ms.
+- Newly recognized lines and curves remain geometry while the Pencil continues moving.
+
+The patch does not contain data/, so saved PDFs, strokes, text, shapes, and settings remain in place.

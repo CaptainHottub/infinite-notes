@@ -1,0 +1,9 @@
+Infinite Notes laptop server
+Base: v24
+Native client compatibility: 0.5.1
+
+Added:
+- GET /api/pdf/source for the unchanged source PDF
+- Preservation and validation of raw/local Pencil coordinates
+- Preservation and validation of stroke-pipeline snapshots
+- Native metadata updates during browser move/rotate/scale/copy operations

@@ -1,0 +1,27 @@
+Infinite Notes v23 upgrade
+==========================
+
+1. Export a .inotes backup.
+2. Stop the running application with Ctrl+C.
+3. Put infinite_notes_v23_patch.zip in the existing project folder.
+4. Run:
+
+   unzip -o infinite_notes_v23_patch.zip
+   ./setup.sh --test
+   ./run.sh
+
+5. Fully close and reopen the iPad Safari tab or Home Screen app so Safari loads app.js?v=23.
+
+v23 changes
+-----------
+
+- Pen and highlighter tools no longer select or move nearby geometry.
+- Apple Pencil directly edits geometry only while the lasso selector is active.
+- One-finger taps temporarily select unlocked geometry from any tool.
+- Tapping empty space after temporary selection restores the previous tool.
+- The lock button now works on every geometry type.
+- Locked geometry ignores direct taps and the eraser and can only be recovered by lassoing around it.
+- Locked x-y planes remain directly above the PDF background.
+- Tangent and normal snapping now takes priority over endpoint/axis snapping and uses the correct ellipse normal.
+
+The patch does not contain data/ and does not overwrite the current PDF, saved ink, text, geometry, or hotspot settings.

@@ -1,0 +1,22 @@
+Infinite Notes v22 upgrade
+
+1. Export a .inotes backup.
+2. Stop Infinite Notes with Ctrl+C.
+3. Put infinite_notes_v22_patch.zip in the project folder.
+4. Run:
+
+   unzip -o infinite_notes_v22_patch.zip
+   ./setup.sh --test
+   ./run.sh
+
+5. Fully close and reopen the iPad app so Safari loads the v22 assets.
+
+v22 fix
+-------
+
+Locked x-y planes are now ignored by the eraser. They remain visible behind all
+ink and geometry and can only be selected again by surrounding them with the
+lasso, then unlocked or edited.
+
+The patch contains application code and documentation only. It does not include
+or replace the data directory.

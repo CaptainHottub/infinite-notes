@@ -1,0 +1,27 @@
+Infinite Notes v24 upgrade
+
+1. Export a .inotes backup.
+2. Stop Infinite Notes with Ctrl+C.
+3. Put infinite_notes_v24_patch.zip in the existing project folder.
+4. Extract it:
+
+   unzip -o infinite_notes_v24_patch.zip
+
+5. Run:
+
+   ./setup.sh --test
+   ./run.sh
+
+6. Fully close and reopen the iPad Safari tab or Home Screen app so it loads app.js?v=24.
+
+v24 fixes
+---------
+- Rebuilt Pencil, finger, and selector routing at the pointer-event layer.
+- Pen/highlighter input never hit-tests geometry unless the selector is active.
+- One-finger geometry selection happens only after a stationary tap; finger motion pans instead.
+- Tapping empty space after temporary selection restores the previous tool.
+- Locking now applies to ink, text, and every geometry object.
+- Locked items ignore direct taps and the eraser and remain lasso-recoverable.
+- Tangent and normal snaps use a robust ellipse-boundary search.
+
+The patch does not contain data/ and does not overwrite the active PDF or notes.

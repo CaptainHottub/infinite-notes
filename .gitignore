@@ -1,0 +1,36 @@
+# Python
+computer/.venv/
+computer/**/__pycache__/
+computer/.pytest_cache/
+computer/**/*.py[cod]
+
+# Infinite Notes user data (never commit notebooks)
+computer/data/*
+!computer/data/.gitkeep
+!computer/data/pdf_pages/
+computer/data/pdf_pages/*
+!computer/data/pdf_pages/.gitkeep
+*.inotes
+
+# Swift / xtool
+ipad/.build/
+ipad/.swiftpm/
+ipad/xtool/
+ipad/DerivedData/
+
+# Editors and OS
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs, archives and local backups
+*.log
+*.bak
+*.backup
+backups/
+exports/
+transfer/
