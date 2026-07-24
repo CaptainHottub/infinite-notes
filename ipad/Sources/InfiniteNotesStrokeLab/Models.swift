@@ -14,7 +14,7 @@ enum NoteTool: String, CaseIterable, Identifiable, Codable {
     case shape = "shape"
 
     static var allCases: [NoteTool] {
-        [.pressurePen, .highlighter, .eraser, .selector, .shape]
+        [.pressurePen, .eraser, .highlighter, .selector, .shape]
     }
 
     var id: String { rawValue }
