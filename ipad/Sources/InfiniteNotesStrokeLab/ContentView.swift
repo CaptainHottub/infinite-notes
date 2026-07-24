@@ -168,14 +168,14 @@ struct ContentView: View {
                     .accessibilityLabel("Eraser width preset \(index + 1), \(Int(model.eraserWidthPresets[index]))")
                 }
 
-                Button {
-                    showingToolSettings = true
-                } label: {
-                    Image(systemName: "slider.horizontal.3")
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.bordered)
-                .accessibilityLabel("Eraser settings")
+                // Button {
+                //     showingToolSettings = true
+                // } label: {
+                //     Image(systemName: "slider.horizontal.3")
+                //         .frame(width: 28, height: 28)
+                // }
+                // .buttonStyle(.bordered)
+                // .accessibilityLabel("Eraser settings")
             }
             .popover(
                 isPresented: $showingToolSettings,
@@ -205,15 +205,15 @@ struct ContentView: View {
                     .buttonStyle(.plain)
                     .accessibilityLabel("Line width preset \(index + 1), \(model.penWidthPresets[index], specifier: "%.1f")")
                 }
-
-                Button {
-                    showingToolSettings = true
-                } label: {
-                    Image(systemName: "slider.horizontal.3")
-                        .frame(width: 28, height: 28)
-                }
-                .buttonStyle(.bordered)
-                .accessibilityLabel("\(toolSettingsTitle) settings")
+                // Setting button for Pen and highligter width
+                // Button {
+                //     showingToolSettings = false
+                // } label: {
+                //     Image(systemName: "slider.horizontal.3")
+                //         .frame(width: 28, height: 28)
+                // }
+                // .buttonStyle(.bordered)
+                // .accessibilityLabel("\(toolSettingsTitle) settings")
             }
             .popover(
                 isPresented: $showingToolSettings,

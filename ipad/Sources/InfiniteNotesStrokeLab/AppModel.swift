@@ -95,10 +95,14 @@ final class AppModel: ObservableObject {
         }
 
         let savedTool = NoteTool(rawValue: defaults.string(forKey: "native.selectedTool") ?? "pen") ?? .pressurePen
+        let initialInkColorHex = defaults.string(forKey: "native.inkColorHex") ?? "#111111"
+        let initialInkWidth = defaults.object(forKey: "native.inkWidth") as? Double ?? 3.0
+        let initialEraserSize = defaults.object(forKey: "native.eraserSize") as? Double ?? 30.0
+
         selectedTool = savedTool == .fixedPen ? .pressurePen : savedTool
-        inkColorHex = defaults.string(forKey: "native.inkColorHex") ?? "#111111"
-        inkWidth = defaults.object(forKey: "native.inkWidth") as? Double ?? 3.0
-        eraserSize = defaults.object(forKey: "native.eraserSize") as? Double ?? 30.0
+        inkColorHex = initialInkColorHex
+        inkWidth = initialInkWidth
+        eraserSize = initialEraserSize
         selectedShapeType = GeometryShapeType(rawValue: defaults.string(forKey: "native.selectedShapeType") ?? "line") ?? .line
         penPressureEnabled = defaults.object(forKey: "native.penPressureEnabled") as? Bool ?? true
         inkLineStyle = GeometryLineStyle(rawValue: defaults.string(forKey: "native.inkLineStyle") ?? "solid") ?? .solid
@@ -118,9 +122,21 @@ final class AppModel: ObservableObject {
             range: 0.5...30
         )
         penWidthPresets = savedPenWidths
+
+        let storedPenPresetIndex =
+            defaults.object(forKey: "native.activePenWidthPresetIndex") as? Int
+
+        let fallbackPenPresetIndex = Self.nearestPresetIndex(
+            to: initialInkWidth,
+            in: savedPenWidths
+        )
+
         activePenWidthPresetIndex = max(
             0,
-            min(savedPenWidths.count - 1, defaults.object(forKey: "native.activePenWidthPresetIndex") as? Int ?? Self.nearestPresetIndex(to: inkWidth, in: savedPenWidths))
+            min(
+                savedPenWidths.count - 1,
+                storedPenPresetIndex ?? fallbackPenPresetIndex
+            )
         )
 
         let savedEraserWidths = Self.loadWidthPresets(
@@ -129,9 +145,21 @@ final class AppModel: ObservableObject {
             range: 8...120
         )
         eraserWidthPresets = savedEraserWidths
+
+        let storedEraserPresetIndex =
+            defaults.object(forKey: "native.activeEraserWidthPresetIndex") as? Int
+
+        let fallbackEraserPresetIndex = Self.nearestPresetIndex(
+            to: initialEraserSize,
+            in: savedEraserWidths
+        )
+
         activeEraserWidthPresetIndex = max(
             0,
-            min(savedEraserWidths.count - 1, defaults.object(forKey: "native.activeEraserWidthPresetIndex") as? Int ?? Self.nearestPresetIndex(to: eraserSize, in: savedEraserWidths))
+            min(
+                savedEraserWidths.count - 1,
+                storedEraserPresetIndex ?? fallbackEraserPresetIndex
+            )
         )
 
         strokeSettings.$configuration
