@@ -50,8 +50,14 @@ final class AppModel: ObservableObject {
     @Published var penWidthPresets: [Double] {
         didSet { UserDefaults.standard.set(penWidthPresets, forKey: "native.penWidthPresets") }
     }
+    @Published var activePenWidthPresetIndex: Int {
+        didSet { UserDefaults.standard.set(activePenWidthPresetIndex, forKey: "native.activePenWidthPresetIndex") }
+    }
     @Published var eraserWidthPresets: [Double] {
         didSet { UserDefaults.standard.set(eraserWidthPresets, forKey: "native.eraserWidthPresets") }
+    }
+    @Published var activeEraserWidthPresetIndex: Int {
+        didSet { UserDefaults.standard.set(activeEraserWidthPresetIndex, forKey: "native.activeEraserWidthPresetIndex") }
     }
 
     let clientID: String
@@ -89,27 +95,71 @@ final class AppModel: ObservableObject {
         }
 
         let savedTool = NoteTool(rawValue: defaults.string(forKey: "native.selectedTool") ?? "pen") ?? .pressurePen
+        let initialInkColorHex = defaults.string(forKey: "native.inkColorHex") ?? "#111111"
+        let initialInkWidth = defaults.object(forKey: "native.inkWidth") as? Double ?? 3.0
+        let initialEraserSize = defaults.object(forKey: "native.eraserSize") as? Double ?? 30.0
+
         selectedTool = savedTool == .fixedPen ? .pressurePen : savedTool
-        inkColorHex = defaults.string(forKey: "native.inkColorHex") ?? "#111111"
-        inkWidth = defaults.object(forKey: "native.inkWidth") as? Double ?? 3.0
-        eraserSize = defaults.object(forKey: "native.eraserSize") as? Double ?? 30.0
+        inkColorHex = initialInkColorHex
+        inkWidth = initialInkWidth
+        eraserSize = initialEraserSize
         selectedShapeType = GeometryShapeType(rawValue: defaults.string(forKey: "native.selectedShapeType") ?? "line") ?? .line
         penPressureEnabled = defaults.object(forKey: "native.penPressureEnabled") as? Bool ?? true
         inkLineStyle = GeometryLineStyle(rawValue: defaults.string(forKey: "native.inkLineStyle") ?? "solid") ?? .solid
-        inkColorPresets = Self.loadStringPresets(
+        let savedColorPresets = Self.loadStringPresets(
             defaults.array(forKey: "native.inkColorPresets") as? [String],
             fallback: ["#111111", "#2457D6", "#D52B2B", "#16834A", "#E2871B"]
         )
-        activeColorPresetIndex = max(0, min(4, defaults.object(forKey: "native.activeColorPresetIndex") as? Int ?? 0))
-        penWidthPresets = Self.loadWidthPresets(
+        inkColorPresets = savedColorPresets
+        activeColorPresetIndex = max(
+            0,
+            min(savedColorPresets.count - 1, defaults.object(forKey: "native.activeColorPresetIndex") as? Int ?? 0)
+        )
+
+        let savedPenWidths = Self.loadWidthPresets(
             defaults.array(forKey: "native.penWidthPresets") as? [Double],
             fallback: [1.5, 3.0, 6.0],
             range: 0.5...30
         )
-        eraserWidthPresets = Self.loadWidthPresets(
+        penWidthPresets = savedPenWidths
+
+        let storedPenPresetIndex =
+            defaults.object(forKey: "native.activePenWidthPresetIndex") as? Int
+
+        let fallbackPenPresetIndex = Self.nearestPresetIndex(
+            to: initialInkWidth,
+            in: savedPenWidths
+        )
+
+        activePenWidthPresetIndex = max(
+            0,
+            min(
+                savedPenWidths.count - 1,
+                storedPenPresetIndex ?? fallbackPenPresetIndex
+            )
+        )
+
+        let savedEraserWidths = Self.loadWidthPresets(
             defaults.array(forKey: "native.eraserWidthPresets") as? [Double],
             fallback: [18, 32, 56],
             range: 8...120
+        )
+        eraserWidthPresets = savedEraserWidths
+
+        let storedEraserPresetIndex =
+            defaults.object(forKey: "native.activeEraserWidthPresetIndex") as? Int
+
+        let fallbackEraserPresetIndex = Self.nearestPresetIndex(
+            to: initialEraserSize,
+            in: savedEraserWidths
+        )
+
+        activeEraserWidthPresetIndex = max(
+            0,
+            min(
+                savedEraserWidths.count - 1,
+                storedEraserPresetIndex ?? fallbackEraserPresetIndex
+            )
         )
 
         strokeSettings.$configuration
@@ -186,6 +236,37 @@ final class AppModel: ObservableObject {
         applyInkColor(updated[index])
     }
 
+    @discardableResult
+    func addColorPreset() -> Int {
+        let suggestedColors = ["#7B2CBF", "#00A6A6", "#E83E8C", "#6B7280", "#8B5CF6", "#14B8A6"]
+        let newHex = suggestedColors.first { !inkColorPresets.contains($0) } ?? inkColorHex
+        var updated = inkColorPresets
+        updated.append(newHex)
+        inkColorPresets = updated
+        activeColorPresetIndex = updated.count - 1
+        applyInkColor(newHex)
+        return activeColorPresetIndex
+    }
+
+    func removeColorPreset(_ index: Int) {
+        guard inkColorPresets.count > 1, inkColorPresets.indices.contains(index) else { return }
+        let previousActive = activeColorPresetIndex
+        var updated = inkColorPresets
+        updated.remove(at: index)
+        inkColorPresets = updated
+
+        let nextActive: Int
+        if previousActive > index {
+            nextActive = previousActive - 1
+        } else if previousActive == index {
+            nextActive = min(index, updated.count - 1)
+        } else {
+            nextActive = previousActive
+        }
+        activeColorPresetIndex = max(0, min(updated.count - 1, nextActive))
+        applyInkColor(updated[activeColorPresetIndex])
+    }
+
     func applyInkColor(_ hex: String) {
         let normalized = Self.normalizedHex(hex)
         inkColorHex = normalized
@@ -198,6 +279,7 @@ final class AppModel: ObservableObject {
 
     func selectPenWidthPreset(_ index: Int) {
         guard penWidthPresets.indices.contains(index) else { return }
+        activePenWidthPresetIndex = index
         applyInkWidth(penWidthPresets[index])
     }
 
@@ -206,11 +288,17 @@ final class AppModel: ObservableObject {
         var updated = penWidthPresets
         updated[index] = max(0.5, min(30, value))
         penWidthPresets = updated
+        activePenWidthPresetIndex = index
         applyInkWidth(updated[index])
+    }
+
+    func updateActivePenWidth(_ value: Double) {
+        updatePenWidthPreset(activePenWidthPresetIndex, value: value)
     }
 
     func selectEraserWidthPreset(_ index: Int) {
         guard eraserWidthPresets.indices.contains(index) else { return }
+        activeEraserWidthPresetIndex = index
         eraserSize = eraserWidthPresets[index]
     }
 
@@ -219,7 +307,12 @@ final class AppModel: ObservableObject {
         var updated = eraserWidthPresets
         updated[index] = max(8, min(120, value))
         eraserWidthPresets = updated
+        activeEraserWidthPresetIndex = index
         eraserSize = updated[index]
+    }
+
+    func updateActiveEraserWidth(_ value: Double) {
+        updateEraserWidthPreset(activeEraserWidthPresetIndex, value: value)
     }
 
     func applyInkWidth(_ width: Double) {
@@ -1213,8 +1306,15 @@ final class AppModel: ObservableObject {
     }
 
     private static func loadStringPresets(_ stored: [String]?, fallback: [String]) -> [String] {
-        let source = stored?.count == fallback.count ? stored! : fallback
+        let source = stored?.isEmpty == false ? stored! : fallback
         return source.map(normalizedHex)
+    }
+
+    private static func nearestPresetIndex(to value: Double, in presets: [Double]) -> Int {
+        guard let best = presets.indices.min(by: {
+            abs(presets[$0] - value) < abs(presets[$1] - value)
+        }) else { return 0 }
+        return best
     }
 
     private static func loadWidthPresets(

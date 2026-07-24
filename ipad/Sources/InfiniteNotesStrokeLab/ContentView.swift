@@ -6,7 +6,8 @@ struct ContentView: View {
     @AppStorage("native.serverAddress") private var serverAddress = "http://10.42.0.1:8000"
     @State private var showingSettings = false
     @State private var didAutoConnect = false
-    @State private var editingPreset: PresetEditorTarget?
+    @State private var editingColorIndex: Int?
+    @State private var showingToolSettings = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -29,9 +30,6 @@ struct ContentView: View {
                 appSettings: model.appSettings,
                 serverAddress: $serverAddress
             )
-        }
-        .popover(item: $editingPreset) { target in
-            presetEditor(for: target)
         }
         .alert("Infinite Notes", isPresented: errorIsPresented) {
             Button("OK", role: .cancel) { model.lastError = nil }
@@ -61,6 +59,8 @@ struct ContentView: View {
                     ForEach(NoteTool.allCases) { tool in
                         ToolButton(tool: tool, selected: model.selectedTool == tool) {
                             model.selectedTool = tool
+                            showingToolSettings = false
+                            editingColorIndex = nil
                             if tool != .selector { model.clearSelection() }
                         }
                     }
@@ -153,39 +153,85 @@ struct ContentView: View {
             HStack(spacing: 5) {
                 ForEach(model.eraserWidthPresets.indices, id: \.self) { index in
                     Button {
-                        if abs(model.eraserSize - model.eraserWidthPresets[index]) < 0.1 {
-                            editingPreset = PresetEditorTarget(kind: .eraserWidth, index: index)
+                        if model.activeEraserWidthPresetIndex == index {
+                            showingToolSettings = true
                         } else {
                             model.selectEraserWidthPreset(index)
                         }
                     } label: {
                         EraserPresetPreview(
                             value: model.eraserWidthPresets[index],
-                            selected: abs(model.eraserSize - model.eraserWidthPresets[index]) < 0.1
+                            selected: model.activeEraserWidthPresetIndex == index
                         )
                     }
                     .buttonStyle(.plain)
-                    .contextMenu {
-                        Button("Edit eraser preset") {
-                            editingPreset = PresetEditorTarget(kind: .eraserWidth, index: index)
-                        }
-                    }
                     .accessibilityLabel("Eraser width preset \(index + 1), \(Int(model.eraserWidthPresets[index]))")
                 }
+
+                // Button {
+                //     showingToolSettings = true
+                // } label: {
+                //     Image(systemName: "slider.horizontal.3")
+                //         .frame(width: 28, height: 28)
+                // }
+                // .buttonStyle(.bordered)
+                // .accessibilityLabel("Eraser settings")
+            }
+            .popover(
+                isPresented: $showingToolSettings,
+                attachmentAnchor: .rect(.bounds),
+                arrowEdge: .top
+            ) {
+                EraserToolSettingsPopover(model: model)
+            }
+        } else if model.selectedTool != .selector {
+            // Width presets come first. All detailed width, pressure and pattern
+            // controls live in the popover anchored directly below this group.
+            HStack(spacing: 5) {
+                ForEach(model.penWidthPresets.indices, id: \.self) { index in
+                    Button {
+                        if model.activePenWidthPresetIndex == index {
+                            showingToolSettings = true
+                        } else {
+                            model.selectPenWidthPreset(index)
+                        }
+                    } label: {
+                        PenWidthPresetPreview(
+                            value: model.penWidthPresets[index],
+                            selected: model.activePenWidthPresetIndex == index,
+                            color: Color(hex: model.inkColorHex)
+                        )
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Line width preset \(index + 1), \(model.penWidthPresets[index], specifier: "%.1f")")
+                }
+                // Setting button for Pen and highligter width
+                // Button {
+                //     showingToolSettings = false
+                // } label: {
+                //     Image(systemName: "slider.horizontal.3")
+                //         .frame(width: 28, height: 28)
+                // }
+                // .buttonStyle(.bordered)
+                // .accessibilityLabel("\(toolSettingsTitle) settings")
+            }
+            .popover(
+                isPresented: $showingToolSettings,
+                attachmentAnchor: .rect(.bounds),
+                arrowEdge: .top
+            ) {
+                InkToolSettingsPopover(model: model, tool: model.selectedTool)
             }
 
-            Text("\(Int(model.eraserSize))")
-                .monospacedDigit()
-                .frame(width: 34, alignment: .trailing)
-            Slider(value: $model.eraserSize, in: 8...120, step: 2)
-                .frame(width: 135)
-                .accessibilityLabel("Eraser diameter")
-        } else if model.selectedTool != .selector {
+            Divider().frame(height: 28)
+
+            // Colours follow line settings. Selecting a colour applies it
+            // immediately; opening its popover edits and auto-saves it.
             HStack(spacing: 5) {
                 ForEach(model.inkColorPresets.indices, id: \.self) { index in
                     Button {
                         if !model.hasSelection, model.activeColorPresetIndex == index {
-                            editingPreset = PresetEditorTarget(kind: .color, index: index)
+                            editingColorIndex = index
                         } else {
                             model.selectColorPreset(index)
                         }
@@ -202,92 +248,68 @@ struct ContentView: View {
                     }
                     .buttonStyle(.plain)
                     .contextMenu {
-                        Button("Edit colour") {
-                            editingPreset = PresetEditorTarget(kind: .color, index: index)
+                        Button("Edit colour") { editingColorIndex = index }
+                        if model.inkColorPresets.count > 1 {
+                            Button("Remove colour", role: .destructive) {
+                                model.removeColorPreset(index)
+                                editingColorIndex = nil
+                            }
                         }
+                    }
+                    .popover(
+                        isPresented: colorEditorBinding(for: index),
+                        attachmentAnchor: .rect(.bounds),
+                        arrowEdge: .top
+                    ) {
+                        ColorPresetEditor(
+                            initialHex: model.inkColorPresets[index],
+                            canRemove: model.inkColorPresets.count > 1,
+                            onChange: { model.updateColorPreset(index, hex: $0) },
+                            onRemove: {
+                                model.removeColorPreset(index)
+                                editingColorIndex = nil
+                            }
+                        )
                     }
                     .accessibilityLabel("Ink colour preset \(index + 1)")
                 }
-            }
 
-            HStack(spacing: 5) {
-                ForEach(model.penWidthPresets.indices, id: \.self) { index in
-                    Button {
-                        if !model.hasSelection, abs(model.inkWidth - model.penWidthPresets[index]) < 0.05 {
-                            editingPreset = PresetEditorTarget(kind: .penWidth, index: index)
-                        } else {
-                            model.selectPenWidthPreset(index)
-                        }
-                    } label: {
-                        PenWidthPresetPreview(
-                            value: model.penWidthPresets[index],
-                            selected: abs(model.inkWidth - model.penWidthPresets[index]) < 0.05,
-                            color: Color(hex: model.inkColorHex)
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button("Edit width preset") {
-                            editingPreset = PresetEditorTarget(kind: .penWidth, index: index)
-                        }
-                    }
-                    .accessibilityLabel("Line width preset \(index + 1), \(model.penWidthPresets[index], specifier: "%.1f")")
-                }
-            }
-
-            Text(String(format: "%.1f", model.inkWidth))
-                .monospacedDigit()
-                .frame(width: 38, alignment: .trailing)
-            Slider(
-                value: $model.inkWidth,
-                in: 0.5...30,
-                step: 0.5,
-                onEditingChanged: { editing in
-                    if !editing { model.applyCurrentWidthToSelection() }
-                }
-            )
-            .frame(width: 125)
-            .accessibilityLabel("Ink width")
-
-            Menu {
-                ForEach(GeometryLineStyle.allCases) { style in
-                    Button {
-                        model.applyLineStyle(style)
-                    } label: {
-                        if model.activeLineStyle == style {
-                            Label(style.title, systemImage: "checkmark")
-                        } else {
-                            Text(style.title)
-                        }
-                    }
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    LineStylePreview(style: model.activeLineStyle)
-                        .frame(width: 34, height: 16)
-                    Image(systemName: "chevron.down")
-                        .font(.caption2)
-                }
-                .frame(height: 29)
-            }
-            .buttonStyle(.bordered)
-            .accessibilityLabel("Line style: \(model.activeLineStyle.title)")
-
-            if model.selectedTool == .pressurePen {
                 Button {
-                    model.penPressureEnabled.toggle()
+                    editingColorIndex = model.addColorPreset()
                 } label: {
-                    Image(systemName: model.penPressureEnabled ? "waveform.path.ecg" : "minus")
-                        .frame(width: 28, height: 28)
-                        .background(
-                            model.penPressureEnabled ? Color.accentColor.opacity(0.18) : Color.clear,
-                            in: RoundedRectangle(cornerRadius: 7)
-                        )
+                    Image(systemName: "plus")
+                        .font(.callout.weight(.semibold))
+                        .frame(width: 24, height: 24)
+                        .background(Color.secondary.opacity(0.08), in: Circle())
+                        .overlay(Circle().stroke(Color.secondary.opacity(0.3), lineWidth: 1))
                 }
-                .buttonStyle(.bordered)
-                .accessibilityLabel(model.penPressureEnabled ? "Pressure sensitivity on" : "Pressure sensitivity off")
+                .buttonStyle(.plain)
+                .accessibilityLabel("Add ink colour")
             }
         }
+    }
+
+    private var toolSettingsTitle: String {
+        switch model.selectedTool {
+        case .pressurePen, .fixedPen: return "Pen"
+        case .highlighter: return "Highlighter"
+        case .shape: return "Geometry"
+        case .eraser: return "Eraser"
+        case .selector: return "Tool"
+        }
+    }
+
+    private func colorEditorBinding(for index: Int) -> Binding<Bool> {
+        Binding(
+            get: { editingColorIndex == index },
+            set: { isPresented in
+                if isPresented {
+                    editingColorIndex = index
+                } else if editingColorIndex == index {
+                    editingColorIndex = nil
+                }
+            }
+        )
     }
 
     private var selectionControls: some View {
@@ -317,45 +339,6 @@ struct ContentView: View {
                 .accessibilityLabel("Clear selection")
         }
         .buttonStyle(.bordered)
-    }
-
-    @ViewBuilder
-    private func presetEditor(for target: PresetEditorTarget) -> some View {
-        switch target.kind {
-        case .color:
-            ColorPresetEditor(initialHex: model.inkColorPresets[target.index]) { hex in
-                model.updateColorPreset(target.index, hex: hex)
-                editingPreset = nil
-            } onCancel: {
-                editingPreset = nil
-            }
-        case .penWidth:
-            WidthPresetEditor(
-                title: "Pen width \(target.index + 1)",
-                initialValue: model.penWidthPresets[target.index],
-                range: 0.5...30,
-                step: 0.5,
-                suffix: "pt"
-            ) { value in
-                model.updatePenWidthPreset(target.index, value: value)
-                editingPreset = nil
-            } onCancel: {
-                editingPreset = nil
-            }
-        case .eraserWidth:
-            WidthPresetEditor(
-                title: "Eraser width \(target.index + 1)",
-                initialValue: model.eraserWidthPresets[target.index],
-                range: 8...120,
-                step: 2,
-                suffix: "pt"
-            ) { value in
-                model.updateEraserWidthPreset(target.index, value: value)
-                editingPreset = nil
-            } onCancel: {
-                editingPreset = nil
-            }
-        }
     }
 
     private var emptyState: some View {
@@ -420,38 +403,39 @@ struct ContentView: View {
     }
 }
 
-private enum PresetEditorKind {
-    case color
-    case penWidth
-    case eraserWidth
-}
-
-private struct PresetEditorTarget: Identifiable {
-    let id = UUID()
-    let kind: PresetEditorKind
-    let index: Int
-}
-
 private struct ColorPresetEditor: View {
     @State private var color: Color
-    let onSave: (String) -> Void
-    let onCancel: () -> Void
+    let canRemove: Bool
+    let onChange: (String) -> Void
+    let onRemove: () -> Void
 
-    init(initialHex: String, onSave: @escaping (String) -> Void, onCancel: @escaping () -> Void) {
+    init(
+        initialHex: String,
+        canRemove: Bool,
+        onChange: @escaping (String) -> Void,
+        onRemove: @escaping () -> Void
+    ) {
         _color = State(initialValue: Color(hex: initialHex))
-        self.onSave = onSave
-        self.onCancel = onCancel
+        self.canRemove = canRemove
+        self.onChange = onChange
+        self.onRemove = onRemove
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("Edit ink colour").font(.headline)
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Ink colour").font(.headline)
             ColorPicker("Colour", selection: $color, supportsOpacity: false)
-            HStack {
-                Button("Cancel", action: onCancel)
-                Spacer()
-                Button("Save") { onSave(color.noteHex ?? "#111111") }
-                    .buttonStyle(.borderedProminent)
+                .onChange(of: color) { newColor in
+                    onChange(newColor.noteHex ?? "#111111")
+                }
+
+            Label("Changes save automatically", systemImage: "checkmark.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if canRemove {
+                Divider()
+                Button("Remove colour", role: .destructive, action: onRemove)
             }
         }
         .padding(18)
@@ -459,48 +443,145 @@ private struct ColorPresetEditor: View {
     }
 }
 
-private struct WidthPresetEditor: View {
-    let title: String
-    @State private var value: Double
-    let range: ClosedRange<Double>
-    let step: Double
-    let suffix: String
-    let onSave: (Double) -> Void
-    let onCancel: () -> Void
-
-    init(
-        title: String,
-        initialValue: Double,
-        range: ClosedRange<Double>,
-        step: Double,
-        suffix: String,
-        onSave: @escaping (Double) -> Void,
-        onCancel: @escaping () -> Void
-    ) {
-        self.title = title
-        _value = State(initialValue: initialValue)
-        self.range = range
-        self.step = step
-        self.suffix = suffix
-        self.onSave = onSave
-        self.onCancel = onCancel
-    }
+private struct InkToolSettingsPopover: View {
+    @ObservedObject var model: AppModel
+    let tool: NoteTool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 16) {
             Text(title).font(.headline)
-            Text("\(value, specifier: "%.1f") \(suffix)")
-                .font(.title3.monospacedDigit())
-            Slider(value: $value, in: range, step: step)
-            HStack {
-                Button("Cancel", action: onCancel)
-                Spacer()
-                Button("Save") { onSave(value) }
-                    .buttonStyle(.borderedProminent)
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Text("Line width")
+                    Spacer()
+                    Text("\(model.inkWidth, specifier: "%.1f") pt")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                Slider(value: widthBinding, in: 0.5...30, step: 0.5)
             }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Saved widths")
+                    .font(.subheadline.weight(.semibold))
+                HStack(spacing: 8) {
+                    ForEach(model.penWidthPresets.indices, id: \.self) { index in
+                        Button {
+                            model.selectPenWidthPreset(index)
+                        } label: {
+                            VStack(spacing: 5) {
+                                PenWidthPresetPreview(
+                                    value: model.penWidthPresets[index],
+                                    selected: model.activePenWidthPresetIndex == index,
+                                    color: Color(hex: model.inkColorHex)
+                                )
+                                Text(model.penWidthPresets[index], format: .number.precision(.fractionLength(1)))
+                                    .font(.caption2.monospacedDigit())
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Line pattern")
+                    .font(.subheadline.weight(.semibold))
+                Picker("Line pattern", selection: lineStyleBinding) {
+                    ForEach(GeometryLineStyle.allCases) { style in
+                        Text(style.title).tag(style)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
+
+            if tool == .pressurePen || tool == .fixedPen {
+                Toggle("Pressure-sensitive width", isOn: $model.penPressureEnabled)
+            }
+
+            Label("Changes save automatically", systemImage: "checkmark.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .padding(18)
-        .frame(width: 320)
+        .frame(width: 360)
+    }
+
+    private var title: String {
+        switch tool {
+        case .pressurePen, .fixedPen: return "Pen settings"
+        case .highlighter: return "Highlighter settings"
+        case .shape: return "Geometry line settings"
+        case .eraser: return "Eraser settings"
+        case .selector: return "Tool settings"
+        }
+    }
+
+    private var widthBinding: Binding<Double> {
+        Binding(
+            get: { model.inkWidth },
+            set: { model.updateActivePenWidth($0) }
+        )
+    }
+
+    private var lineStyleBinding: Binding<GeometryLineStyle> {
+        Binding(
+            get: { model.activeLineStyle },
+            set: { model.applyLineStyle($0) }
+        )
+    }
+}
+
+private struct EraserToolSettingsPopover: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("Eraser settings").font(.headline)
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Text("Diameter")
+                    Spacer()
+                    Text("\(Int(model.eraserSize)) pt")
+                        .monospacedDigit()
+                        .foregroundStyle(.secondary)
+                }
+                Slider(value: diameterBinding, in: 8...120, step: 2)
+            }
+
+            HStack(spacing: 8) {
+                ForEach(model.eraserWidthPresets.indices, id: \.self) { index in
+                    Button {
+                        model.selectEraserWidthPreset(index)
+                    } label: {
+                        VStack(spacing: 5) {
+                            EraserPresetPreview(
+                                value: model.eraserWidthPresets[index],
+                                selected: model.activeEraserWidthPresetIndex == index
+                            )
+                            Text("\(Int(model.eraserWidthPresets[index]))")
+                                .font(.caption2.monospacedDigit())
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            Label("Changes save automatically", systemImage: "checkmark.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(18)
+        .frame(width: 340)
+    }
+
+    private var diameterBinding: Binding<Double> {
+        Binding(
+            get: { model.eraserSize },
+            set: { model.updateActiveEraserWidth($0) }
+        )
     }
 }
 
