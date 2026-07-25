@@ -48,7 +48,7 @@ struct PDFKitNotebookView: UIViewRepresentable {
         if viewer.sourceURL != model.pdfFileURL || viewer.pdfDocument !== model.pdfDocument {
             viewer.setDocument(model.pdfDocument, sourceURL: model.pdfFileURL)
         }
-        viewer.applySettings(revision: model.settingsRevision)
+        viewer.applySettings(settingsRevision: model.settingsRevision, workspaceRevision: model.workspaceRevision)
         if navigator.viewer !== viewer {
             navigator.viewer = viewer
         }
@@ -72,12 +72,14 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
 
     private let documentView = UIView(frame: .zero)
     private var coreDocument: CGPDFDocument?
-    private var pageFrames: [CGRect] = []
+    private var workspaceFrames: [CGRect] = []
+    private var pdfFrames: [CGRect] = []
     private var mountedPages: [Int: VectorPDFPageContainer] = [:]
     private var currentPageIndex = -1
     private var needsInitialFit = false
     private var lastViewportSize: CGSize = .zero
     private var lastSettingsRevision = -1
+    private var lastWorkspaceRevision = -1
     private var appliedPageGap: CGFloat = 18
 
     private let horizontalMargin: CGFloat = 18
@@ -139,23 +141,56 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         updateWorkingSet()
     }
 
-    func applySettings(revision: Int) {
-        guard revision != lastSettingsRevision else { return }
-        lastSettingsRevision = revision
+    func applySettings(settingsRevision: Int, workspaceRevision: Int) {
+        let settingsChanged = settingsRevision != lastSettingsRevision
+        let workspaceChanged = workspaceRevision != lastWorkspaceRevision
+        guard settingsChanged || workspaceChanged else { return }
+        lastSettingsRevision = settingsRevision
+        lastWorkspaceRevision = workspaceRevision
+
         applyBackgroundStyle()
         maximumZoomScale = max(minimumZoomScale, CGFloat(model.appSettings.configuration.maximumZoom))
         let gapChanged = abs(appliedPageGap - pageGap) > 0.01
         appliedPageGap = pageGap
         for page in mountedPages.values { page.applyAppearance() }
-        if gapChanged, let document = pdfDocument, let coreDocument, document.pageCount > 0, coreDocument.numberOfPages > 0 {
-            let target = max(0, currentPageIndex)
-            unmountAllPages()
-            buildPageLayout(pageCount: min(document.pageCount, coreDocument.numberOfPages))
-            goToPage(index: min(target, pageFrames.count - 1), animated: false)
-        } else {
+
+        guard (gapChanged || workspaceChanged),
+              let document = pdfDocument, let coreDocument,
+              document.pageCount > 0, coreDocument.numberOfPages > 0 else {
             mountWorkingSet(around: max(0, currentPageIndex))
+            return
+        }
+
+        let target = min(max(0, currentPageIndex), max(0, pdfFrames.count - 1))
+        let sourceAnchor: CGPoint?
+        if pdfFrames.indices.contains(target), zoomScale > 0 {
+            let oldPDF = pdfFrames[target]
+            let viewportCenter = CGPoint(
+                x: (contentOffset.x + contentInset.left + bounds.width / 2) / zoomScale,
+                y: (contentOffset.y + contentInset.top + bounds.height / 2) / zoomScale
+            )
+            sourceAnchor = CGPoint(x: viewportCenter.x - oldPDF.minX, y: viewportCenter.y - oldPDF.minY)
+        } else {
+            sourceAnchor = nil
+        }
+
+        unmountAllPages()
+        buildPageLayout(pageCount: min(document.pageCount, coreDocument.numberOfPages))
+        currentPageIndex = min(target, max(0, workspaceFrames.count - 1))
+        model.setCurrentPage(index: currentPageIndex)
+        mountWorkingSet(around: currentPageIndex)
+
+        if let sourceAnchor, pdfFrames.indices.contains(currentPageIndex) {
+            let newPDF = pdfFrames[currentPageIndex]
+            restoreViewportCenter(
+                CGPoint(x: newPDF.minX + sourceAnchor.x, y: newPDF.minY + sourceAnchor.y),
+                animated: false
+            )
+        } else {
+            goToPage(index: currentPageIndex, animated: false)
         }
     }
+
 
     private func applyBackgroundStyle() {
         switch model.appSettings.configuration.backgroundStyle {
@@ -171,7 +206,8 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         pdfDocument = document
         self.sourceURL = sourceURL
         coreDocument = sourceURL.flatMap { CGPDFDocument($0 as CFURL) }
-        pageFrames.removeAll(keepingCapacity: false)
+        workspaceFrames.removeAll(keepingCapacity: false)
+        pdfFrames.removeAll(keepingCapacity: false)
         currentPageIndex = -1
 
         guard let document, let coreDocument, document.pageCount > 0, coreDocument.numberOfPages > 0 else {
@@ -182,8 +218,13 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         }
 
         buildPageLayout(pageCount: min(document.pageCount, coreDocument.numberOfPages))
-        currentPageIndex = 0
-        model.setCurrentPage(index: 0)
+        let requestedPage = min(
+            max(0, model.currentPageNumber - 1),
+            max(0, workspaceFrames.count - 1)
+        )
+        currentPageIndex = requestedPage
+        model.setCurrentPage(index: requestedPage)
+        mountWorkingSet(around: requestedPage)
         needsInitialFit = true
         setNeedsLayout()
     }
@@ -219,19 +260,19 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
     }
 
     func goToRelativePage(_ delta: Int) {
-        guard !pageFrames.isEmpty else { return }
+        guard !workspaceFrames.isEmpty else { return }
         let base = currentPageIndex >= 0 ? currentPageIndex : 0
-        goToPage(index: min(max(base + delta, 0), pageFrames.count - 1), animated: true)
+        goToPage(index: min(max(base + delta, 0), workspaceFrames.count - 1), animated: true)
     }
 
     func goToPage(index: Int, animated: Bool) {
-        guard pageFrames.indices.contains(index) else { return }
+        guard workspaceFrames.indices.contains(index) else { return }
         currentPageIndex = index
         model.setCurrentPage(index: index)
         mountWorkingSet(around: index)
         updateMountedInkScales(settle: true)
 
-        let pageFrame = pageFrames[index]
+        let pageFrame = workspaceFrames[index]
         let targetY = pageFrame.minY * zoomScale - contentInset.top - 8
         let minY = -contentInset.top
         let maxY = max(minY, contentSize.height - bounds.height + contentInset.bottom)
@@ -242,9 +283,9 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
     }
 
     func fitCurrentPage(animated: Bool) {
-        guard pageFrames.indices.contains(max(0, currentPageIndex)), bounds.width > 0, bounds.height > 0 else { return }
+        guard pdfFrames.indices.contains(max(0, currentPageIndex)), bounds.width > 0, bounds.height > 0 else { return }
         let index = max(0, currentPageIndex)
-        let page = pageFrames[index]
+        let page = pdfFrames[index]
         let usableWidth = max(1, bounds.width - 24)
         let usableHeight = max(1, bounds.height - 24)
         let scale = min(usableWidth / page.width, usableHeight / page.height)
@@ -282,29 +323,48 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
             }
         }
 
-        let maximumWidth = max(1, pageSizes.map(\.width).max() ?? 612)
+        let workspaceWidths = pageSizes.enumerated().map { index, size in
+            let state = model.workspaceState(at: index)
+            return CGFloat(state.leftPageWidths + 1 + state.rightPageWidths) * max(1, size.width)
+        }
+        let maximumWorkspaceWidth = max(1, workspaceWidths.max() ?? 1836)
         var y = verticalMargin
-        pageFrames = pageSizes.map { size in
-            let x = horizontalMargin + (maximumWidth - size.width) / 2
-            let frame = CGRect(x: x, y: y, width: max(1, size.width), height: max(1, size.height))
-            y = frame.maxY + pageGap
-            return frame
+        workspaceFrames.removeAll(keepingCapacity: true)
+        pdfFrames.removeAll(keepingCapacity: true)
+
+        for (index, size) in pageSizes.enumerated() {
+            let state = model.workspaceState(at: index)
+            let pageWidth = max(1, size.width)
+            let workspaceWidth = workspaceWidths[index]
+            let workspaceX = horizontalMargin + (maximumWorkspaceWidth - workspaceWidth) / 2
+            let workspace = CGRect(x: workspaceX, y: y, width: workspaceWidth, height: max(1, size.height))
+            let pdf = CGRect(
+                x: workspace.minX + CGFloat(state.leftPageWidths) * pageWidth,
+                y: workspace.minY,
+                width: pageWidth,
+                height: max(1, size.height)
+            )
+            workspaceFrames.append(workspace)
+            pdfFrames.append(pdf)
+            y = workspace.maxY + pageGap
         }
 
-        let width = maximumWidth + horizontalMargin * 2
+        let width = maximumWorkspaceWidth + horizontalMargin * 2
         let height = max(1, y - pageGap + verticalMargin)
         documentView.frame = CGRect(x: 0, y: 0, width: width, height: height)
         contentSize = documentView.bounds.size
         updateZoomLimits()
-        mountWorkingSet(around: 0)
+        mountWorkingSet(around: min(max(0, currentPageIndex), max(0, workspaceFrames.count - 1)))
     }
+
 
     private func updateZoomLimits() {
         guard documentView.bounds.width > 0, bounds.width > 0 else {
             minimumZoomScale = 0.1
             return
         }
-        let widthFit = max(0.05, (bounds.width - 24) / documentView.bounds.width)
+        let widestPDF = max(1, pdfFrames.map(\.width).max() ?? documentView.bounds.width)
+        let widthFit = max(0.05, (bounds.width - 24) / widestPDF)
         minimumZoomScale = min(1, widthFit)
         maximumZoomScale = max(CGFloat(model.appSettings.configuration.maximumZoom), minimumZoomScale)
         if zoomScale < minimumZoomScale {
@@ -321,8 +381,21 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         contentInset = UIEdgeInsets(top: vertical, left: horizontal, bottom: vertical, right: horizontal)
     }
 
+    private func restoreViewportCenter(_ documentPoint: CGPoint, animated: Bool) {
+        let targetX = documentPoint.x * zoomScale - bounds.width / 2 - contentInset.left
+        let targetY = documentPoint.y * zoomScale - bounds.height / 2 - contentInset.top
+        let minX = -contentInset.left
+        let minY = -contentInset.top
+        let maxX = max(minX, contentSize.width - bounds.width + contentInset.right)
+        let maxY = max(minY, contentSize.height - bounds.height + contentInset.bottom)
+        setContentOffset(
+            CGPoint(x: min(max(targetX, minX), maxX), y: min(max(targetY, minY), maxY)),
+            animated: animated
+        )
+    }
+
     private func updateWorkingSet() {
-        guard !pageFrames.isEmpty, zoomScale > 0 else { return }
+        guard !workspaceFrames.isEmpty, zoomScale > 0 else { return }
         let visibleMidY = (contentOffset.y + contentInset.top + bounds.height / 2) / zoomScale
         let index = nearestPage(toDocumentY: visibleMidY)
         if index != currentPageIndex {
@@ -335,10 +408,10 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
 
     private func nearestPage(toDocumentY y: CGFloat) -> Int {
         var low = 0
-        var high = pageFrames.count - 1
+        var high = workspaceFrames.count - 1
         while low <= high {
             let mid = (low + high) / 2
-            let frame = pageFrames[mid]
+            let frame = workspaceFrames[mid]
             if y < frame.minY {
                 high = mid - 1
             } else if y > frame.maxY {
@@ -347,17 +420,17 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
                 return mid
             }
         }
-        if low >= pageFrames.count { return pageFrames.count - 1 }
+        if low >= workspaceFrames.count { return workspaceFrames.count - 1 }
         if high < 0 { return 0 }
-        let lowDistance = abs(pageFrames[low].midY - y)
-        let highDistance = abs(pageFrames[high].midY - y)
+        let lowDistance = abs(workspaceFrames[low].midY - y)
+        let highDistance = abs(workspaceFrames[high].midY - y)
         return lowDistance < highDistance ? low : high
     }
 
     private func mountWorkingSet(around current: Int) {
-        guard !pageFrames.isEmpty else { return }
+        guard !workspaceFrames.isEmpty else { return }
         let lower = max(0, current - workingRadius)
-        let upper = min(pageFrames.count - 1, current + workingRadius)
+        let upper = min(workspaceFrames.count - 1, current + workingRadius)
         let desired = Set(lower...upper)
 
         for index in Array(mountedPages.keys) where !desired.contains(index) {
@@ -372,9 +445,10 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
             let page = VectorPDFPageContainer(
                 pageIndex: index,
                 pdfPage: corePage,
+                sourcePDFFrame: pdfFrames[index].offsetBy(dx: -workspaceFrames[index].minX, dy: -workspaceFrames[index].minY),
                 model: model
             )
-            page.frame = pageFrames[index]
+            page.frame = workspaceFrames[index]
             let scale = (!model.appSettings.configuration.reduceNeighbourInkQuality || index == currentPageIndex) ? zoomScale : 1
             page.updateZoomScale(scale)
             documentView.addSubview(page)
@@ -407,20 +481,30 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
 /// overlay. The PDF layer never stores a whole-page bitmap.
 @MainActor
 private final class VectorPDFPageContainer: UIView {
+    private let pageIndex: Int
+    private let sourcePDFFrame: CGRect
+    private let gridView = OffPageGridView(frame: .zero)
+    private let pdfSurface = UIView(frame: .zero)
     private let pdfBackground: TiledPDFPageView
     private let inkOverlay: InkPageView
     private weak var model: AppModel?
 
-    init(pageIndex: Int, pdfPage: CGPDFPage, model: AppModel) {
+    init(pageIndex: Int, pdfPage: CGPDFPage, sourcePDFFrame: CGRect, model: AppModel) {
+        self.pageIndex = pageIndex
+        self.sourcePDFFrame = sourcePDFFrame
         self.model = model
         pdfBackground = TiledPDFPageView(page: pdfPage)
         inkOverlay = InkPageView(pageIndex: pageIndex, model: model)
         super.init(frame: .zero)
 
-        backgroundColor = .white
-        layer.borderColor = UIColor.separator.cgColor
-        layer.borderWidth = 0.5
-        addSubview(pdfBackground)
+        backgroundColor = .clear
+        clipsToBounds = false
+        pdfSurface.backgroundColor = .white
+        pdfSurface.layer.borderColor = UIColor.separator.cgColor
+        pdfSurface.layer.borderWidth = 0.5
+        pdfSurface.addSubview(pdfBackground)
+        addSubview(gridView)
+        addSubview(pdfSurface)
         addSubview(inkOverlay)
         applyAppearance()
     }
@@ -430,19 +514,29 @@ private final class VectorPDFPageContainer: UIView {
     }
 
     func applyAppearance() {
-        let showShadow = model?.appSettings.configuration.showPageShadow ?? true
-        layer.shadowColor = UIColor.black.cgColor
-        layer.shadowOpacity = showShadow ? 0.16 : 0
-        layer.shadowRadius = showShadow ? 3 : 0
-        layer.shadowOffset = CGSize(width: 0, height: 1)
+        guard let model else { return }
+        let settings = model.appSettings.configuration
+        let state = model.workspaceState(at: pageIndex)
+        gridView.sourcePDFFrame = sourcePDFFrame
+        gridView.isGridActive = state.hasOffPageContent
+        gridView.gridStyle = settings.resolvedOffPageGridStyle
+        gridView.gridSpacing = CGFloat(settings.resolvedOffPageGridSpacing)
+
+        pdfSurface.layer.shadowColor = UIColor.black.cgColor
+        pdfSurface.layer.shadowOpacity = settings.showPageShadow ? 0.16 : 0
+        pdfSurface.layer.shadowRadius = settings.showPageShadow ? 3 : 0
+        pdfSurface.layer.shadowOffset = CGSize(width: 0, height: 1)
+        setNeedsLayout()
     }
 
     override func layoutSubviews() {
         super.layoutSubviews()
-        pdfBackground.frame = bounds
+        gridView.frame = bounds
+        pdfSurface.frame = sourcePDFFrame
+        pdfBackground.frame = pdfSurface.bounds
         inkOverlay.frame = bounds
         inkOverlay.settleDisplayScale()
-        layer.shadowPath = UIBezierPath(rect: bounds).cgPath
+        pdfSurface.layer.shadowPath = UIBezierPath(rect: pdfSurface.bounds).cgPath
     }
 
     func updateZoomScale(_ scale: CGFloat) {

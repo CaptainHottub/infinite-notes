@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct ContentView: View {
     @StateObject private var model = AppModel()
@@ -30,6 +31,14 @@ struct ContentView: View {
                 appSettings: model.appSettings,
                 serverAddress: $serverAddress
             )
+        }
+        .sheet(isPresented: Binding(
+            get: { model.exportedPDFURL != nil },
+            set: { presented in if !presented { model.exportedPDFURL = nil } }
+        )) {
+            if let url = model.exportedPDFURL {
+                ExportActivityView(url: url)
+            }
         }
         .alert("Infinite Notes", isPresented: errorIsPresented) {
             Button("OK", role: .cancel) { model.lastError = nil }
@@ -115,6 +124,28 @@ struct ContentView: View {
                         Image(systemName: "arrow.up.left.and.arrow.down.right")
                     }
                     .accessibilityLabel("Fit page")
+
+                    Menu {
+                        Button(action: model.addPageBelowCurrent) {
+                            Label("Add page below current", systemImage: "rectangle.badge.plus")
+                        }
+                        .disabled(!model.isConnected || model.currentPageNumber == 0)
+
+                        Button(action: model.addPageAtEnd) {
+                            Label("Add page at end", systemImage: "doc.badge.plus")
+                        }
+                        .disabled(!model.isConnected || model.pageCount == 0)
+
+                        Divider()
+
+                        Button(action: model.exportFlattenedPDF) {
+                            Label("Export PDF", systemImage: "square.and.arrow.up")
+                        }
+                        .disabled(!model.isConnected || model.pageCount == 0)
+                    } label: {
+                        Image(systemName: "doc.badge.plus")
+                    }
+                    .accessibilityLabel("Page and export actions")
 
                     Divider().frame(height: 30)
 
@@ -672,4 +703,14 @@ private struct ToolButton: View {
         .buttonStyle(.plain)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
+}
+
+private struct ExportActivityView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }

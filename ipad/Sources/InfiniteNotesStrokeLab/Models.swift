@@ -91,6 +91,26 @@ enum GeometryLineStyle: String, CaseIterable, Identifiable, Codable {
     var title: String { rawValue.capitalized }
 }
 
+enum OffPageGridStyle: String, CaseIterable, Identifiable, Codable {
+    case system
+    case white
+    case lightGray = "light-gray"
+    case darkGray = "dark-gray"
+    case black
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .system: return "System"
+        case .white: return "White"
+        case .lightGray: return "Light gray"
+        case .darkGray: return "Dark gray"
+        case .black: return "Black"
+        }
+    }
+}
+
 enum NotebookBackgroundStyle: String, CaseIterable, Identifiable, Codable {
     case system, lightGray = "light-gray", darkGray = "dark-gray", black
     var id: String { rawValue }
@@ -107,6 +127,9 @@ enum NotebookBackgroundStyle: String, CaseIterable, Identifiable, Codable {
 struct NativeAppConfiguration: Codable, Equatable {
     // Display and page engine
     var backgroundStyle: NotebookBackgroundStyle = .system
+    /// Optional so existing saved configurations continue decoding after this experimental feature is added.
+    var offPageGridStyle: OffPageGridStyle?
+    var offPageGridSpacing: Double?
     var showPageShadow = true
     var pageGap = 18.0
     var pageWorkingRadius = 2
@@ -141,6 +164,14 @@ struct NativeAppConfiguration: Codable, Equatable {
     // Interaction and performance
     var hapticsEnabled = true
     var reduceNeighbourInkQuality = true
+
+    var resolvedOffPageGridStyle: OffPageGridStyle {
+        offPageGridStyle ?? .system
+    }
+
+    var resolvedOffPageGridSpacing: Double {
+        max(4, min(200, offPageGridSpacing ?? 20))
+    }
 
     static let `default` = NativeAppConfiguration()
 }

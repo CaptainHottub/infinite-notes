@@ -77,6 +77,33 @@ struct SettingsView: View {
                 Toggle("Lower-quality neighbouring ink", isOn: $appSettings.configuration.reduceNeighbourInkQuality)
             }
 
+            Section("Outer workspace") {
+                Picker(
+                    "Grid style",
+                    selection: Binding(
+                        get: { appSettings.configuration.resolvedOffPageGridStyle },
+                        set: { appSettings.configuration.offPageGridStyle = $0 }
+                    )
+                ) {
+                    ForEach(OffPageGridStyle.allCases) { style in
+                        Text(style.title).tag(style)
+                    }
+                }
+                valueSlider(
+                    "Grid spacing",
+                    value: Binding(
+                        get: { appSettings.configuration.resolvedOffPageGridSpacing },
+                        set: { appSettings.configuration.offPageGridSpacing = $0 }
+                    ),
+                    range: 8...80,
+                    step: 2,
+                    format: "%.0f pt"
+                )
+                Text("Each page starts with one PDF width of writing space on both sides. The grid appears only after an item crosses a PDF edge.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Committed ink cache") {
                 valueSlider("Maximum backing scale", value: $strokeSettings.configuration.maximumInkCacheScale,
                             range: 2...12, step: 0.5, format: "%.1f×")

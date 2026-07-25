@@ -232,21 +232,17 @@ struct StrokeGeometrySample: Equatable {
 }
 
 enum StrokeCoordinates {
+    /// World coordinates are authoritative. Page-local coordinates from older
+    /// notebooks are relative to the source PDF, while the experimental native
+    /// workspace can be several page widths wide. Using world coordinates keeps
+    /// both legacy and off-page strokes aligned as the workspace grows.
     static func filteredViewPoint(
         _ point: NotePoint,
         stroke: NoteStroke,
         page: PageInfo,
         bounds: CGRect
     ) -> CGPoint {
-        if stroke.pageIndex == page.pageNumber - 1,
-           let localX = point.xLocal,
-           let localY = point.yLocal {
-            return CGPoint(
-                x: CGFloat(localX / page.width) * bounds.width,
-                y: CGFloat(localY / page.height) * bounds.height
-            )
-        }
-        return CGPoint(
+        CGPoint(
             x: CGFloat((point.x - page.x) / page.width) * bounds.width,
             y: CGFloat((point.y - page.y) / page.height) * bounds.height
         )
@@ -258,15 +254,7 @@ enum StrokeCoordinates {
         page: PageInfo,
         bounds: CGRect
     ) -> CGPoint {
-        if stroke.pageIndex == page.pageNumber - 1,
-           let localX = point.xRawLocal,
-           let localY = point.yRawLocal {
-            return CGPoint(
-                x: CGFloat(localX / page.width) * bounds.width,
-                y: CGFloat(localY / page.height) * bounds.height
-            )
-        }
-        return CGPoint(
+        CGPoint(
             x: CGFloat((point.xRaw - page.x) / page.width) * bounds.width,
             y: CGFloat((point.yRaw - page.y) / page.height) * bounds.height
         )

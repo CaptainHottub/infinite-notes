@@ -754,10 +754,37 @@ def page_distance_squared(x: float, y: float, page: dict[str, Any]) -> float:
     return dx * dx + dy * dy
 
 
-def build_pdf_export_layout(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+def stroke_page_index(
+    stroke: dict[str, Any],
+    pages: list[dict[str, Any]],
+    bounds: tuple[float, float, float, float] | None = None,
+) -> int | None:
+    if not pages:
+        return None
+    raw_index = stroke.get("pageIndex")
+    if isinstance(raw_index, int) and 0 <= raw_index < len(pages):
+        return raw_index
+    if bounds is None:
+        bounds = stroke_world_bounds(stroke)
+    if bounds is None:
+        return None
+    min_x, min_y, max_x, max_y = bounds
+    center_x = (min_x + max_x) / 2.0
+    center_y = (min_y + max_y) / 2.0
+    return min(
+        range(len(pages)),
+        key=lambda index: page_distance_squared(center_x, center_y, pages[index]),
+    )
+
+
+def build_pdf_export_layout(
+    snapshot: dict[str, Any],
+    overflow_margin: float = 0.0,
+) -> list[dict[str, Any]]:
     pages = snapshot.get("document", {}).get("pages", [])
     if not pages:
         return []
+    overflow_margin = max(0.0, min(200.0, float(overflow_margin)))
 
     layouts: list[dict[str, Any]] = []
     for page in pages:
@@ -776,15 +803,10 @@ def build_pdf_export_layout(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
 
     for stroke in snapshot.get("strokes", {}).values():
         bounds = stroke_world_bounds(stroke)
-        if bounds is None:
+        page_index = stroke_page_index(stroke, pages, bounds)
+        if bounds is None or page_index is None:
             continue
         min_x, min_y, max_x, max_y = bounds
-        center_x = (min_x + max_x) / 2.0
-        center_y = (min_y + max_y) / 2.0
-        page_index = min(
-            range(len(pages)),
-            key=lambda index: page_distance_squared(center_x, center_y, pages[index]),
-        )
         page = pages[page_index]
         local_min_x = min_x - float(page.get("x", 0.0))
         local_min_y = min_y - float(page.get("y", 0.0))
@@ -810,16 +832,21 @@ def build_pdf_export_layout(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
         page = layout["page"]
         original_width = float(page["width"])
         original_height = float(page["height"])
-        offset_x = -min(0.0, float(layout["minX"]))
-        offset_y = -min(0.0, float(layout["minY"]))
-        new_width = max(original_width, float(layout["maxX"])) + offset_x
-        new_height = max(original_height, float(layout["maxY"])) + offset_y
+        raw_left = max(0.0, -float(layout["minX"]))
+        raw_top = max(0.0, -float(layout["minY"]))
+        raw_right = max(0.0, float(layout["maxX"]) - original_width)
+        raw_bottom = max(0.0, float(layout["maxY"]) - original_height)
+
         margins = {
-            "left": offset_x,
-            "top": offset_y,
-            "right": max(0.0, float(layout["maxX"]) - original_width),
-            "bottom": max(0.0, float(layout["maxY"]) - original_height),
+            "left": raw_left + (overflow_margin if raw_left > 0.01 else 0.0),
+            "top": raw_top + (overflow_margin if raw_top > 0.01 else 0.0),
+            "right": raw_right + (overflow_margin if raw_right > 0.01 else 0.0),
+            "bottom": raw_bottom + (overflow_margin if raw_bottom > 0.01 else 0.0),
         }
+        offset_x = margins["left"]
+        offset_y = margins["top"]
+        new_width = original_width + margins["left"] + margins["right"]
+        new_height = original_height + margins["top"] + margins["bottom"]
         layout.update(
             {
                 "pageNumber": index + 1,
@@ -830,7 +857,7 @@ def build_pdf_export_layout(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
                 "newWidth": new_width,
                 "newHeight": new_height,
                 "margins": margins,
-                "overflow": any(value > 0.01 for value in margins.values()),
+                "overflow": any(value > 0.01 for value in (raw_left, raw_top, raw_right, raw_bottom)),
             }
         )
     return layouts
@@ -1152,8 +1179,74 @@ def draw_stroke_on_pdf_page(
         )
 
 
-def create_flattened_pdf(snapshot: dict[str, Any], pdf_content: bytes) -> tuple[Path, dict[str, Any]]:
-    layouts = build_pdf_export_layout(snapshot)
+def outer_grid_palette(style: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    normalized = style.strip().lower()
+    palettes = {
+        "system": ((0.95, 0.95, 0.96), (0.72, 0.72, 0.75)),
+        "white": ((1.0, 1.0, 1.0), (0.72, 0.72, 0.72)),
+        "light-gray": ((0.86, 0.86, 0.86), (0.60, 0.60, 0.60)),
+        "dark-gray": ((0.20, 0.20, 0.20), (0.48, 0.48, 0.48)),
+        "black": ((0.0, 0.0, 0.0), (0.38, 0.38, 0.38)),
+    }
+    if normalized not in palettes:
+        raise HTTPException(status_code=422, detail="outerGridStyle is not supported")
+    return palettes[normalized]
+
+
+def draw_outer_grid(
+    page: fitz.Page,
+    layout: dict[str, Any],
+    style: str,
+    spacing: float,
+) -> None:
+    if not layout.get("overflow"):
+        return
+    background, line = outer_grid_palette(style)
+    spacing = max(4.0, min(200.0, float(spacing)))
+    left = float(layout["offsetX"])
+    top = float(layout["offsetY"])
+    original_width = float(layout["originalWidth"])
+    original_height = float(layout["originalHeight"])
+    new_width = float(layout["newWidth"])
+    new_height = float(layout["newHeight"])
+    right_start = left + original_width
+    bottom_start = top + original_height
+
+    regions = [
+        fitz.Rect(0, 0, left, new_height),
+        fitz.Rect(right_start, 0, new_width, new_height),
+        fitz.Rect(left, 0, right_start, top),
+        fitz.Rect(left, bottom_start, right_start, new_height),
+    ]
+    for region in regions:
+        if region.width <= 0.01 or region.height <= 0.01:
+            continue
+        page.draw_rect(region, color=None, fill=background, overlay=False)
+        x = math.floor(region.x0 / spacing) * spacing
+        while x <= region.x1 + 0.01:
+            page.draw_line(
+                fitz.Point(x, region.y0), fitz.Point(x, region.y1),
+                color=line, width=0.55, stroke_opacity=0.72, overlay=False,
+            )
+            x += spacing
+        y = math.floor(region.y0 / spacing) * spacing
+        while y <= region.y1 + 0.01:
+            page.draw_line(
+                fitz.Point(region.x0, y), fitz.Point(region.x1, y),
+                color=line, width=0.55, stroke_opacity=0.72, overlay=False,
+            )
+            y += spacing
+
+
+def create_flattened_pdf(
+    snapshot: dict[str, Any],
+    pdf_content: bytes,
+    *,
+    overflow_margin: float = 0.0,
+    outer_grid_style: str | None = None,
+    outer_grid_spacing: float = 20.0,
+) -> tuple[Path, dict[str, Any]]:
+    layouts = build_pdf_export_layout(snapshot, overflow_margin=overflow_margin)
     if not layouts:
         raise HTTPException(status_code=400, detail="Open a PDF before exporting notes")
     try:
@@ -1167,6 +1260,8 @@ def create_flattened_pdf(snapshot: dict[str, Any], pdf_content: bytes) -> tuple[
             raise HTTPException(status_code=409, detail="The saved page layout does not match the current PDF")
         for index, layout in enumerate(layouts):
             output_page = output.new_page(width=layout["newWidth"], height=layout["newHeight"])
+            if outer_grid_style is not None:
+                draw_outer_grid(output_page, layout, outer_grid_style, outer_grid_spacing)
             original_rect = fitz.Rect(
                 layout["offsetX"],
                 layout["offsetY"],
@@ -1254,6 +1349,113 @@ async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
     return JSONResponse({"ok": True, "document": snapshot})
 
 
+def remap_strokes_after_page_insert(
+    strokes: Any,
+    old_pages: list[dict[str, Any]],
+    new_pages: list[dict[str, Any]],
+    after_page_index: int,
+) -> list[dict[str, Any]]:
+    if not isinstance(strokes, dict):
+        return []
+    shifted: list[dict[str, Any]] = []
+    for stroke in strokes.values():
+        if not isinstance(stroke, dict):
+            continue
+        old_index = stroke_page_index(stroke, old_pages)
+        if old_index is None or old_index <= after_page_index:
+            continue
+        new_index = old_index + 1
+        if not (0 <= new_index < len(new_pages)):
+            continue
+        delta_y = float(new_pages[new_index].get("y", 0.0)) - float(old_pages[old_index].get("y", 0.0))
+        points = stroke.get("points", [])
+        if isinstance(points, list):
+            for point in points:
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    point["y"] = float(point.get("y", 0.0)) + delta_y
+                    if "y_raw" in point:
+                        point["y_raw"] = float(point.get("y_raw", point["y"])) + delta_y
+                except (TypeError, ValueError):
+                    continue
+        stroke["pageIndex"] = new_index
+        shifted.append(copy.deepcopy(stroke))
+    return shifted
+
+
+@app.post("/api/pages/insert")
+async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
+    async with state_lock:
+        old_pages = copy.deepcopy(state.get("document", {}).get("pages", []))
+        if not CURRENT_PDF.exists() or not old_pages:
+            raise HTTPException(status_code=400, detail="Open a PDF before inserting a page")
+        if not (1 <= afterPageNumber <= len(old_pages)):
+            raise HTTPException(status_code=422, detail="afterPageNumber must refer to an existing page")
+        pdf_content = CURRENT_PDF.read_bytes()
+        filename = state["document"].get("filename") or "document.pdf"
+
+    try:
+        document = fitz.open(stream=pdf_content, filetype="pdf")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Could not open the current PDF: {exc}") from exc
+
+    try:
+        if document.page_count >= MAX_PDF_PAGES:
+            raise HTTPException(status_code=400, detail=f"Prototype limit is {MAX_PDF_PAGES} pages")
+        reference_index = afterPageNumber - 1
+        reference_rect = document.load_page(reference_index).rect
+        # PyMuPDF inserts before pno. A one-based page N therefore inserts
+        # directly below it at zero-based index N.
+        document.new_page(
+            pno=afterPageNumber,
+            width=float(reference_rect.width),
+            height=float(reference_rect.height),
+        )
+        updated_pdf = document.tobytes(garbage=4, deflate=True)
+    finally:
+        document.close()
+
+    temp_root, pages = prepare_pdf(updated_pdf)
+    try:
+        async with state_lock:
+            if state.get("document", {}).get("pages", []) != old_pages:
+                raise HTTPException(status_code=409, detail="The document changed while the page was being inserted")
+            updated_strokes = copy.deepcopy(state.get("strokes", {}))
+            shifted_strokes = remap_strokes_after_page_insert(
+                updated_strokes, old_pages, pages, afterPageNumber - 1
+            )
+            commit_prepared_pdf(temp_root)
+            state["document"] = {"filename": filename, "pages": pages}
+            state["strokes"] = updated_strokes
+            history.clear()
+            redo_history.clear()
+            pending_stroke_history.clear()
+            save_state_atomic()
+            snapshot = copy.deepcopy(state["document"])
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+    inserted_page_number = afterPageNumber + 1
+    message = {
+        "type": "document_changed",
+        "document": snapshot,
+        "clearStrokes": False,
+        "focusPageNumber": inserted_page_number,
+        "notice": f"Blank page {inserted_page_number} inserted",
+    }
+    await broadcast(message)
+    if shifted_strokes:
+        await broadcast({"type": "replace_strokes", "strokes": shifted_strokes})
+    await broadcast(history_status_message())
+    return JSONResponse({
+        "ok": True,
+        "document": snapshot,
+        "pageNumber": inserted_page_number,
+        "shiftedStrokeCount": len(shifted_strokes),
+    })
+
+
 @app.post("/api/pages/append")
 async def append_blank_page() -> JSONResponse:
     async with state_lock:
@@ -1299,23 +1501,44 @@ async def append_blank_page() -> JSONResponse:
 
 
 @app.get("/api/pdf/export-info")
-async def pdf_export_info() -> JSONResponse:
+async def pdf_export_info(overflowMargin: float = 0.0) -> JSONResponse:
+    if not (0.0 <= overflowMargin <= 200.0):
+        raise HTTPException(status_code=422, detail="overflowMargin must be between 0 and 200")
     async with state_lock:
         if not CURRENT_PDF.exists() or not state.get("document", {}).get("pages"):
             raise HTTPException(status_code=400, detail="Open a PDF before exporting notes")
         snapshot = copy.deepcopy(state)
-    return JSONResponse(export_layout_summary(build_pdf_export_layout(snapshot)))
+    return JSONResponse(export_layout_summary(
+        build_pdf_export_layout(snapshot, overflow_margin=overflowMargin)
+    ))
 
 
 @app.get("/api/pdf/export")
-async def export_flattened_pdf() -> FileResponse:
+async def export_flattened_pdf(
+    overflowMargin: float = 0.0,
+    outerGridStyle: str | None = None,
+    outerGridSpacing: float = 20.0,
+) -> FileResponse:
+    if not (0.0 <= overflowMargin <= 200.0):
+        raise HTTPException(status_code=422, detail="overflowMargin must be between 0 and 200")
+    if not (4.0 <= outerGridSpacing <= 200.0):
+        raise HTTPException(status_code=422, detail="outerGridSpacing must be between 4 and 200")
+    if outerGridStyle is not None:
+        outer_grid_palette(outerGridStyle)
+
     async with state_lock:
         if not CURRENT_PDF.exists() or not state.get("document", {}).get("pages"):
             raise HTTPException(status_code=400, detail="Open a PDF before exporting notes")
         snapshot = copy.deepcopy(state)
         pdf_content = CURRENT_PDF.read_bytes()
 
-    temp_path, _summary = create_flattened_pdf(snapshot, pdf_content)
+    temp_path, _summary = create_flattened_pdf(
+        snapshot,
+        pdf_content,
+        overflow_margin=overflowMargin,
+        outer_grid_style=outerGridStyle,
+        outer_grid_spacing=outerGridSpacing,
+    )
     document_name = snapshot.get("document", {}).get("filename") or "infinite-notes.pdf"
     export_name = safe_filename(
         f"{Path(document_name).stem}-notes.pdf",

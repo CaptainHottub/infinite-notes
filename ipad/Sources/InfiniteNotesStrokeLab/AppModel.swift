@@ -19,6 +19,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var clipboardCount = 0
     @Published var snapGuide: GeometrySnapResult?
     @Published private(set) var settingsRevision = 0
+    @Published private(set) var workspaceRevision = 0
+    @Published var exportedPDFURL: URL?
 
     @Published var selectedTool: NoteTool {
         didSet { UserDefaults.standard.set(selectedTool.rawValue, forKey: "native.selectedTool") }
@@ -73,6 +75,7 @@ final class AppModel: ObservableObject {
     private var strokes: [String: NoteStroke] = [:]
     private var pageStrokeIDs: [Int: Set<String>] = [:]
     private var strokeMembership: [String: Set<Int>] = [:]
+    private var pageWorkspaceStates: [Int: PageWorkspaceState] = [:]
     private var liveStrokeIDs: Set<String> = []
     private var selectionClipboard: [NoteStroke] = []
     private var selectionPasteSerial = 0
@@ -386,6 +389,66 @@ final class AppModel: ObservableObject {
         fetchNotebookState(reason: "manual_sync")
     }
 
+    func addPageAtEnd() {
+        performPageMutation(path: "/api/pages/append", queryItems: [], pendingNotice: "Adding a page…")
+    }
+
+    func addPageBelowCurrent() {
+        guard currentPageNumber > 0 else {
+            lastError = "Open a page before inserting below it"
+            return
+        }
+        performPageMutation(
+            path: "/api/pages/insert",
+            queryItems: [URLQueryItem(name: "afterPageNumber", value: String(currentPageNumber))],
+            pendingNotice: "Inserting a page…"
+        )
+    }
+
+    func exportFlattenedPDF() {
+        guard let url = endpoint(
+            path: "/api/pdf/export",
+            queryItems: [
+                URLQueryItem(name: "overflowMargin", value: "20"),
+                URLQueryItem(name: "outerGridStyle", value: appSettings.configuration.resolvedOffPageGridStyle.rawValue),
+                URLQueryItem(name: "outerGridSpacing", value: String(appSettings.configuration.resolvedOffPageGridSpacing)),
+            ]
+        ) else {
+            lastError = "The computer server address is invalid"
+            return
+        }
+        notice = "Preparing PDF export…"
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.timeoutInterval = 180
+        URLSession.shared.downloadTask(with: request) { [weak self] temporaryURL, response, error in
+            guard let self else { return }
+            if let error {
+                Task { @MainActor in self.lastError = "PDF export failed: \(error.localizedDescription)" }
+                return
+            }
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), let temporaryURL else {
+                Task { @MainActor in self.lastError = "The computer could not export the PDF" }
+                return
+            }
+            do {
+                let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+                    .appendingPathComponent("InfiniteNotesNative/Exports", isDirectory: true)
+                try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+                let destination = root.appendingPathComponent("notes-\(UUID().uuidString).pdf")
+                try? FileManager.default.removeItem(at: destination)
+                try FileManager.default.copyItem(at: temporaryURL, to: destination)
+                Task { @MainActor in
+                    self.exportedPDFURL = destination
+                    self.notice = "PDF export ready"
+                    self.lastError = nil
+                }
+            } catch {
+                Task { @MainActor in self.lastError = "Could not save the exported PDF: \(error.localizedDescription)" }
+            }
+        }.resume()
+    }
+
     func undo() {
         guard canUndo else { return }
         client.sendJSONObject(["type": "undo"])
@@ -601,7 +664,7 @@ final class AppModel: ObservableObject {
 
     func insertXYPlane(pageIndex: Int? = nil) {
         let index = pageIndex ?? max(0, currentPageNumber - 1)
-        guard let page = pageInfo(at: index) else { return }
+        guard let page = sourcePageInfo(at: index) else { return }
         let settings = appSettings.configuration
         let width = min(page.width * settings.xyPlaneWidthFraction, 520)
         let height = min(page.height * settings.xyPlaneHeightFraction, 420)
@@ -794,9 +857,78 @@ final class AppModel: ObservableObject {
         else { invalidateAllPages(committedChange: false) }
     }
 
-    func pageInfo(at index: Int) -> PageInfo? {
+    func sourcePageInfo(at index: Int) -> PageInfo? {
         guard document.pages.indices.contains(index) else { return nil }
         return document.pages[index]
+    }
+
+    func workspaceState(at index: Int) -> PageWorkspaceState {
+        pageWorkspaceStates[index] ?? PageWorkspaceState()
+    }
+
+    func pageInfo(at index: Int) -> PageInfo? {
+        guard let source = sourcePageInfo(at: index) else { return nil }
+        return workspaceState(at: index).workspacePage(from: source)
+    }
+
+    func sourcePDFFrame(inWorkspaceAt index: Int) -> CGRect? {
+        guard let source = sourcePageInfo(at: index), let workspace = pageInfo(at: index) else { return nil }
+        return workspaceState(at: index).sourcePDFFrame(source: source, workspace: workspace)
+    }
+
+    func rebuildAllWorkspaceStates() {
+        var rebuilt: [Int: PageWorkspaceState] = [:]
+        rebuilt.reserveCapacity(document.pages.count)
+        for index in document.pages.indices {
+            rebuilt[index] = OffPageWorkspaceGeometry.state(
+                sourcePage: document.pages[index],
+                strokes: strokesForPage(index)
+            )
+        }
+        guard rebuilt != pageWorkspaceStates else { return }
+        pageWorkspaceStates = rebuilt
+        workspaceRevision &+= 1
+    }
+
+    private func refreshWorkspaceStates(for pages: Set<Int>) {
+        var changed = false
+        for index in pages where document.pages.indices.contains(index) {
+            let next = OffPageWorkspaceGeometry.state(
+                sourcePage: document.pages[index],
+                strokes: strokesForPage(index)
+            )
+            if pageWorkspaceStates[index] != next {
+                pageWorkspaceStates[index] = next
+                changed = true
+            }
+        }
+        let stale = pageWorkspaceStates.keys.filter { !document.pages.indices.contains($0) }
+        for index in stale {
+            pageWorkspaceStates.removeValue(forKey: index)
+            changed = true
+        }
+        if changed { workspaceRevision &+= 1 }
+    }
+
+    private func expandWorkspaceStates(for stroke: NoteStroke, pages: Set<Int>) {
+        var changed = false
+        for index in pages where document.pages.indices.contains(index) {
+            let required = OffPageWorkspaceGeometry.state(
+                sourcePage: document.pages[index],
+                strokes: [stroke]
+            )
+            let current = workspaceState(at: index)
+            let expanded = PageWorkspaceState(
+                leftPageWidths: max(current.leftPageWidths, required.leftPageWidths),
+                rightPageWidths: max(current.rightPageWidths, required.rightPageWidths),
+                hasOffPageContent: current.hasOffPageContent || required.hasOffPageContent
+            )
+            if expanded != current {
+                pageWorkspaceStates[index] = expanded
+                changed = true
+            }
+        }
+        if changed { workspaceRevision &+= 1 }
     }
 
     func strokesForPage(_ index: Int) -> [NoteStroke] {
@@ -897,7 +1029,9 @@ final class AppModel: ObservableObject {
         guard !points.isEmpty, var stroke = strokes[strokeID] else { return }
         stroke.points.append(contentsOf: points)
         strokes[strokeID] = stroke
-        invalidatePages(strokeMembership[strokeID] ?? [], committedChange: false)
+        let pages = strokeMembership[strokeID] ?? []
+        expandWorkspaceStates(for: stroke, pages: pages)
+        invalidatePages(pages, committedChange: false)
         pendingPointBatches[strokeID, default: []].append(contentsOf: points)
 
         if pendingPointBatches[strokeID, default: []].count >= max(1, strokeSettings.configuration.networkBatchSize) {
@@ -1019,6 +1153,7 @@ final class AppModel: ObservableObject {
                     selectedStrokeIDs.removeAll()
                 }
                 rebuildPageIndex()
+                rebuildAllWorkspaceStates()
                 invalidateAllPages()
                 fetchSourcePDF()
                 if let focus = message.focusPageNumber {
@@ -1035,7 +1170,9 @@ final class AppModel: ObservableObject {
             if let id = message.id, let points = message.points, var stroke = strokes[id] {
                 stroke.points.append(contentsOf: points)
                 strokes[id] = stroke
-                invalidatePages(strokeMembership[id] ?? [], committedChange: false)
+                let pages = strokeMembership[id] ?? []
+                expandWorkspaceStates(for: stroke, pages: pages)
+                invalidatePages(pages, committedChange: false)
             }
         case "stroke_end":
             if let id = message.id {
@@ -1058,6 +1195,7 @@ final class AppModel: ObservableObject {
             pageStrokeIDs.removeAll()
             strokeMembership.removeAll()
             selectedStrokeIDs.removeAll()
+            rebuildAllWorkspaceStates()
             invalidateAllPages()
         case "error":
             lastError = message.message ?? "Server error"
@@ -1131,6 +1269,7 @@ final class AppModel: ObservableObject {
         liveStrokeIDs = liveIDs
         selectedStrokeIDs = Set(selectedStrokeIDs.filter { strokes[$0] != nil })
         rebuildPageIndex()
+        rebuildAllWorkspaceStates()
         invalidateAllPages()
     }
 
@@ -1184,11 +1323,43 @@ final class AppModel: ObservableObject {
         }.resume()
     }
 
-    private func endpoint(path: String) -> URL? {
+    private func endpoint(path: String, queryItems: [URLQueryItem] = []) -> URL? {
         guard let baseURL, var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else { return nil }
         components.path = path
-        components.queryItems = [URLQueryItem(name: "native", value: String(Int(Date().timeIntervalSince1970)))]
+        components.queryItems = queryItems + [
+            URLQueryItem(name: "native", value: String(Int(Date().timeIntervalSince1970)))
+        ]
         return components.url
+    }
+
+    private func performPageMutation(path: String, queryItems: [URLQueryItem], pendingNotice: String) {
+        guard isConnected else {
+            lastError = "Connect to the computer before changing pages"
+            return
+        }
+        guard let url = endpoint(path: path, queryItems: queryItems) else {
+            lastError = "The computer server address is invalid"
+            return
+        }
+        notice = pendingNotice
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 120
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            if let error {
+                Task { @MainActor in self.lastError = "Page update failed: \(error.localizedDescription)" }
+                return
+            }
+            guard let http = response as? HTTPURLResponse else {
+                Task { @MainActor in self.lastError = "The computer did not return a page-update response" }
+                return
+            }
+            if !(200..<300).contains(http.statusCode) {
+                let detail = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["detail"] as? String
+                Task { @MainActor in self.lastError = detail ?? "Page update failed (HTTP \(http.statusCode))" }
+            }
+        }.resume()
     }
 
     private func scheduleReconnect() {
@@ -1209,7 +1380,13 @@ final class AppModel: ObservableObject {
         let pages = membership(for: stroke)
         strokeMembership[stroke.id] = pages
         for page in pages { pageStrokeIDs[page, default: []].insert(stroke.id) }
-        invalidatePages(oldPages.union(pages), committedChange: committedChange)
+        let affectedPages = oldPages.union(pages)
+        if committedChange || !oldPages.subtracting(pages).isEmpty {
+            refreshWorkspaceStates(for: affectedPages)
+        } else {
+            expandWorkspaceStates(for: stroke, pages: pages)
+        }
+        invalidatePages(affectedPages, committedChange: committedChange)
     }
 
     private func removeStroke(id: String) {
@@ -1219,6 +1396,7 @@ final class AppModel: ObservableObject {
         pendingPointBatches.removeValue(forKey: id)
         selectedStrokeIDs.remove(id)
         for page in pages { pageStrokeIDs[page]?.remove(id) }
+        refreshWorkspaceStates(for: pages)
         invalidatePages(pages)
     }
 
