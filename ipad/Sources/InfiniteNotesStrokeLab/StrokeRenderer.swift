@@ -53,7 +53,7 @@ enum StrokeRenderer {
     private static func viewWidth(_ width: Double, page: PageInfo, bounds: CGRect) -> CGFloat {
         let scaleX = bounds.width / max(0.001, CGFloat(page.width))
         let scaleY = bounds.height / max(0.001, CGFloat(page.height))
-        return max(0.35, CGFloat(width) * (scaleX + scaleY) / 2)
+        return max(0.1, CGFloat(width) * (scaleX + scaleY) / 2)
     }
 
     private static func drawInk(
@@ -83,7 +83,7 @@ enum StrokeRenderer {
 
         if samples.count == 1 {
             let scale = stroke.tool == "pen" ? pressureScale(first.pressure, settings: settings) : 1
-            let radius = max(0.35, baseWidth * scale / 2)
+            let radius = max(0.05, baseWidth * scale / 2)
             context.fillEllipse(in: CGRect(
                 x: first.point.x - radius,
                 y: first.point.y - radius,
@@ -142,6 +142,25 @@ enum StrokeRenderer {
         viewBounds: CGRect,
         configuration: StrokePipelineConfiguration
     ) -> [LiveStrokeLayerDescriptor] {
+        vectorLayerDescriptors(
+            stroke: stroke,
+            page: page,
+            viewBounds: viewBounds,
+            configuration: configuration,
+            includeDiagnostics: true
+        )
+    }
+
+    /// Builds retained Core Animation vector paths for ink. Sample points become
+    /// vertices in one path (or one filled pressure ribbon), not one layer per
+    /// sample. Diagnostic dots are also combined into one compound path.
+    static func vectorLayerDescriptors(
+        stroke: NoteStroke,
+        page: PageInfo,
+        viewBounds: CGRect,
+        configuration: StrokePipelineConfiguration,
+        includeDiagnostics: Bool
+    ) -> [LiveStrokeLayerDescriptor] {
         guard stroke.tool != "text", stroke.tool != "shape", !stroke.points.isEmpty else { return [] }
 
         let samples = StrokeGeometryBuilder.computedSamples(
@@ -158,7 +177,7 @@ enum StrokeRenderer {
 
         if samples.count == 1 {
             let scale = stroke.tool == "pen" ? pressureScale(first.pressure, settings: settings) : 1
-            let radius = max(0.35, baseWidth * scale / 2)
+            let radius = max(0.05, baseWidth * scale / 2)
             let path = CGPath(ellipseIn: CGRect(
                 x: first.point.x - radius,
                 y: first.point.y - radius,
@@ -198,13 +217,15 @@ enum StrokeRenderer {
             }
         }
 
-        result.append(contentsOf: liveDiagnosticDescriptors(
-            stroke: stroke,
-            page: page,
-            bounds: viewBounds,
-            configuration: configuration,
-            computed: samples
-        ))
+        if includeDiagnostics {
+            result.append(contentsOf: liveDiagnosticDescriptors(
+                stroke: stroke,
+                page: page,
+                bounds: viewBounds,
+                configuration: configuration,
+                computed: samples
+            ))
+        }
         return result
     }
 
@@ -228,9 +249,9 @@ enum StrokeRenderer {
             ))
         }
 
-        func addDots(_ samples: [StrokeGeometrySample], color: UIColor) {
+        func addDots(_ samples: [StrokeGeometrySample], color: UIColor, diameter value: Double) {
             guard !samples.isEmpty else { return }
-            let diameter = CGFloat(max(1, configuration.debugPointDiameter))
+            let diameter = CGFloat(max(0.1, value))
             let radius = diameter / 2
             let path = CGMutablePath()
             for sample in samples {
@@ -255,7 +276,7 @@ enum StrokeRenderer {
             if configuration.showRawConnections {
                 addLine(raw, color: UIColor.lightGray.withAlphaComponent(0.85), width: 0.8)
             }
-            if configuration.showRawPoints { addDots(raw, color: .systemRed) }
+            if configuration.showRawPoints { addDots(raw, color: .systemRed, diameter: configuration.resolvedRawPointDiameter) }
         }
 
         if configuration.showFilteredConnections || configuration.showFilteredPoints {
@@ -263,7 +284,7 @@ enum StrokeRenderer {
             if configuration.showFilteredConnections {
                 addLine(filtered, color: UIColor.systemOrange.withAlphaComponent(0.65), width: 0.9)
             }
-            if configuration.showFilteredPoints { addDots(filtered, color: .systemOrange) }
+            if configuration.showFilteredPoints { addDots(filtered, color: .systemOrange, diameter: configuration.resolvedFilteredPointDiameter) }
         }
 
         if configuration.showComputedConnections {
@@ -272,7 +293,7 @@ enum StrokeRenderer {
         if configuration.showComputedCenterline {
             addLine(computed, color: UIColor.systemPurple.withAlphaComponent(0.8), width: 1.2, dash: [4, 3])
         }
-        if configuration.showComputedPoints { addDots(computed, color: .systemBlue) }
+        if configuration.showComputedPoints { addDots(computed, color: .systemBlue, diameter: configuration.resolvedComputedPointDiameter) }
         return result
     }
 
@@ -446,7 +467,7 @@ enum StrokeRenderer {
                 drawDiagnosticPolyline(raw, color: UIColor.lightGray.withAlphaComponent(0.85), width: 0.8, context: context)
             }
             if configuration.showRawPoints {
-                drawDiagnosticPoints(raw, color: .systemRed, diameter: configuration.debugPointDiameter, context: context)
+                drawDiagnosticPoints(raw, color: .systemRed, diameter: configuration.resolvedRawPointDiameter, context: context)
             }
         }
 
@@ -456,7 +477,7 @@ enum StrokeRenderer {
                 drawDiagnosticPolyline(filtered, color: UIColor.systemOrange.withAlphaComponent(0.65), width: 0.9, context: context)
             }
             if configuration.showFilteredPoints {
-                drawDiagnosticPoints(filtered, color: .systemOrange, diameter: configuration.debugPointDiameter, context: context)
+                drawDiagnosticPoints(filtered, color: .systemOrange, diameter: configuration.resolvedFilteredPointDiameter, context: context)
             }
         }
 
@@ -471,7 +492,7 @@ enum StrokeRenderer {
             context.setLineDash(phase: 0, lengths: [])
         }
         if configuration.showComputedPoints {
-            drawDiagnosticPoints(computed, color: .systemBlue, diameter: configuration.debugPointDiameter, context: context)
+            drawDiagnosticPoints(computed, color: .systemBlue, diameter: configuration.resolvedComputedPointDiameter, context: context)
         }
         context.restoreGState()
     }
@@ -498,7 +519,7 @@ enum StrokeRenderer {
         diameter: Double,
         context: CGContext
     ) {
-        let size = CGFloat(max(1, diameter))
+        let size = CGFloat(max(0.1, diameter))
         let radius = size / 2
         context.setFillColor(color.cgColor)
         for sample in samples {

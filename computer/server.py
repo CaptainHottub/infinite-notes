@@ -44,7 +44,6 @@ MAX_NATIVE_WS_MESSAGE_BYTES = 2 * 1024 * 1024
 PROJECT_FORMAT = "infinite-notes-project"
 PROJECT_FORMAT_VERSION = 1
 APP_VERSION = 24
-RENDER_SCALE = 2.0
 PAGE_GAP = 0.0
 
 app = FastAPI(title="Infinite Notes Prototype")
@@ -432,7 +431,7 @@ def sanitize_stroke(raw: Any) -> dict[str, Any]:
     if tool not in {"pen", "fixed-pen", "highlighter", "text", "shape"}:
         raise ValueError("unsupported tool")
     color = str(raw.get("color", "#111111"))[:32]
-    width = max(0.25, min(100.0, float(raw.get("width", 3.0))))
+    width = max(0.1, min(100.0, float(raw.get("width", 3.0))))
     opacity = max(0.01, min(1.0, float(raw.get("opacity", 1.0))))
     points_raw = raw.get("points", [])
     if not isinstance(points_raw, list) or len(points_raw) > 100000:
@@ -557,15 +556,18 @@ def prepare_pdf(content: bytes) -> tuple[Path, list[dict[str, Any]]]:
 
     pages: list[dict[str, Any]] = []
     y = 0.0
-    matrix = fitz.Matrix(RENDER_SCALE, RENDER_SCALE)
     cache_token = uuid.uuid4().hex[:8]
     try:
         for index in range(document.page_count):
             page = document.load_page(index)
             rect = page.rect
-            pixmap = page.get_pixmap(matrix=matrix, alpha=False)
-            output_name = f"page-{index + 1:04d}.png"
-            pixmap.save(temp_pages / output_name)
+            # Keep the server-side page cache vector. The browser may still
+            # composite the SVG into its canvas, but the server no longer
+            # creates full-page PNG bitmaps for each PDF page. Text is emitted
+            # as paths so appearance does not depend on browser font matching.
+            svg = page.get_svg_image(text_as_path=True)
+            output_name = f"page-{index + 1:04d}.svg"
+            (temp_pages / output_name).write_text(svg, encoding="utf-8")
             pages.append(
                 {
                     "id": f"page-{index + 1}",
@@ -591,9 +593,10 @@ def commit_prepared_pdf(temp_root: Path) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     PDF_PAGES_DIR.mkdir(parents=True, exist_ok=True)
 
-    for old in PDF_PAGES_DIR.glob("page-*.png"):
-        old.unlink(missing_ok=True)
-    for rendered in sorted((temp_root / "pdf_pages").glob("page-*.png")):
+    for pattern in ("page-*.png", "page-*.svg"):
+        for old in PDF_PAGES_DIR.glob(pattern):
+            old.unlink(missing_ok=True)
+    for rendered in sorted((temp_root / "pdf_pages").glob("page-*.svg")):
         os.replace(rendered, PDF_PAGES_DIR / rendered.name)
     os.replace(temp_root / "current.pdf", CURRENT_PDF)
     shutil.rmtree(temp_root, ignore_errors=True)
@@ -602,8 +605,9 @@ def commit_prepared_pdf(temp_root: Path) -> None:
 def clear_document_files() -> None:
     CURRENT_PDF.unlink(missing_ok=True)
     PDF_PAGES_DIR.mkdir(parents=True, exist_ok=True)
-    for old in PDF_PAGES_DIR.glob("page-*.png"):
-        old.unlink(missing_ok=True)
+    for pattern in ("page-*.png", "page-*.svg"):
+        for old in PDF_PAGES_DIR.glob(pattern):
+            old.unlink(missing_ok=True)
 
 
 def sanitize_project_pages(raw_pages: Any) -> list[dict[str, Any]]:
@@ -1040,7 +1044,7 @@ def draw_shape_on_pdf_page(
     color = color_to_pdf(stroke.get("color"))
     grid_color = color_to_pdf(stroke.get("gridColor", "#7a7f89"))
     opacity = max(0.01, min(1.0, float(stroke.get("opacity", 1.0))))
-    width = max(0.25, float(stroke.get("width", 3.0)))
+    width = max(0.1, float(stroke.get("width", 3.0)))
     style = str(stroke.get("lineStyle", "solid"))
     dashes = None
     if style == "dashed":
@@ -1131,13 +1135,13 @@ def draw_stroke_on_pdf_page(
     ]
     color = color_to_pdf(stroke.get("color"))
     opacity = max(0.01, min(1.0, float(stroke.get("opacity", 1.0))))
-    base_width = max(0.25, float(stroke.get("width", 3.0)))
+    base_width = max(0.1, float(stroke.get("width", 3.0)))
     style = str(stroke.get("lineStyle", "solid"))
     tool = str(stroke.get("tool", "pen"))
 
     if len(points) == 1:
         scale = pressure_width_scale(raw_points[0].get("p", 0.5)) if tool == "pen" else 1.0
-        radius = max(0.25, base_width * scale / 2.0)
+        radius = max(0.05, base_width * scale / 2.0)
         page.draw_circle(
             points[0], radius, color=color, fill=color, width=0,
             stroke_opacity=opacity, fill_opacity=opacity, overlay=True,
@@ -1148,7 +1152,7 @@ def draw_stroke_on_pdf_page(
         average_scale = 1.0
         if tool == "pen":
             average_scale = sum(pressure_width_scale(point.get("p", 0.5)) for point in raw_points) / len(raw_points)
-        width = max(0.25, base_width * average_scale)
+        width = max(0.1, base_width * average_scale)
         if style == "dashed":
             dashes = f"[{max(4.0, width * 3.2):.2f} {max(3.0, width * 1.9):.2f}] 0"
         else:
@@ -1172,7 +1176,7 @@ def draw_stroke_on_pdf_page(
     for index in range(1, len(points)):
         p0 = raw_points[index - 1].get("p", 0.5)
         p1 = raw_points[index].get("p", 0.5)
-        width = max(0.25, base_width * (pressure_width_scale(p0) + pressure_width_scale(p1)) / 2.0)
+        width = max(0.1, base_width * (pressure_width_scale(p0) + pressure_width_scale(p1)) / 2.0)
         page.draw_line(
             points[index - 1], points[index], color=color, width=width,
             lineCap=1, lineJoin=1, stroke_opacity=opacity, overlay=True,

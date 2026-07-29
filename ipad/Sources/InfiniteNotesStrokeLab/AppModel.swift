@@ -21,6 +21,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var settingsRevision = 0
     @Published private(set) var workspaceRevision = 0
     @Published var exportedPDFURL: URL?
+    @Published private(set) var displayFPS = 0.0
 
     @Published var selectedTool: NoteTool {
         didSet { UserDefaults.standard.set(selectedTool.rawValue, forKey: "native.selectedTool") }
@@ -99,7 +100,7 @@ final class AppModel: ObservableObject {
 
         let savedTool = NoteTool(rawValue: defaults.string(forKey: "native.selectedTool") ?? "pen") ?? .pressurePen
         let initialInkColorHex = defaults.string(forKey: "native.inkColorHex") ?? "#111111"
-        let initialInkWidth = defaults.object(forKey: "native.inkWidth") as? Double ?? 3.0
+        let initialInkWidth = max(0.1, min(30, defaults.object(forKey: "native.inkWidth") as? Double ?? 3.0))
         let initialEraserSize = defaults.object(forKey: "native.eraserSize") as? Double ?? 30.0
 
         selectedTool = savedTool == .fixedPen ? .pressurePen : savedTool
@@ -122,7 +123,7 @@ final class AppModel: ObservableObject {
         let savedPenWidths = Self.loadWidthPresets(
             defaults.array(forKey: "native.penWidthPresets") as? [Double],
             fallback: [1.5, 3.0, 6.0],
-            range: 0.5...30
+            range: 0.1...30
         )
         penWidthPresets = savedPenWidths
 
@@ -289,7 +290,7 @@ final class AppModel: ObservableObject {
     func updatePenWidthPreset(_ index: Int, value: Double) {
         guard penWidthPresets.indices.contains(index) else { return }
         var updated = penWidthPresets
-        updated[index] = max(0.5, min(30, value))
+        updated[index] = max(0.1, min(30, value))
         penWidthPresets = updated
         activePenWidthPresetIndex = index
         applyInkWidth(updated[index])
@@ -319,12 +320,12 @@ final class AppModel: ObservableObject {
     }
 
     func applyInkWidth(_ width: Double) {
-        inkWidth = max(0.5, min(30, width))
+        inkWidth = max(0.1, min(30, width))
         applyCurrentWidthToSelection()
     }
 
     func applyCurrentWidthToSelection() {
-        let width = max(0.25, min(100, inkWidth))
+        let width = max(0.1, min(100, inkWidth))
         applyAppearanceToSelection { stroke in
             guard stroke.isInk || GeometryEngine.isGeometry(stroke) else { return stroke }
             var changed = stroke
@@ -641,7 +642,7 @@ final class AppModel: ObservableObject {
             id: "\(clientID)-shape-\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString.prefix(8).lowercased())",
             tool: "shape",
             color: inkColorHex,
-            width: max(0.25, min(100, inkWidth)),
+            width: max(0.1, min(100, inkWidth)),
             opacity: 1,
             smoothing: 0,
             strokeDetail: 100,
@@ -967,6 +968,13 @@ final class AppModel: ObservableObject {
         mountedPageIndices.remove(index)
     }
 
+    func updateDisplayFPS(_ fps: Double) {
+        let clamped = max(0, min(240, fps))
+        if abs(displayFPS - clamped) >= 0.25 {
+            displayFPS = clamped
+        }
+    }
+
     func setCurrentPage(index: Int) {
         currentPageNumber = document.pages.indices.contains(index) ? index + 1 : 0
     }
@@ -992,7 +1000,7 @@ final class AppModel: ObservableObject {
             id: "\(clientID)-\(Int(Date().timeIntervalSince1970 * 1000))-\(UUID().uuidString.prefix(8).lowercased())",
             tool: storedTool,
             color: inkColorHex,
-            width: max(0.25, min(100, inkWidth)),
+            width: max(0.1, min(100, inkWidth)),
             opacity: drawingTool == .highlighter ? 0.28 : 1,
             smoothing: max(0, min(100, pipelineConfiguration.smoothingStrength * 100)),
             strokeDetail: 100,

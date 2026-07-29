@@ -13,7 +13,10 @@ def test_finished_strokes_have_a_no_flash_commit_handoff():
     assert "pendingCommitOverlayIDs" in INK_VIEW
     assert "beginCommitTransition(strokeID:" in APP_MODEL
     assert "beginCommitTransition(strokeID:" in INK_VIEW
-    assert "The committed image is already installed" in INK_VIEW
+    assert "pendingCommitOverlayIDs.insert(strokeID)" in INK_VIEW
+    assert "committedVectorEntries" in INK_VIEW
+    assert "committedLayerHost" in INK_VIEW
+    assert "pendingCommitOverlayIDs.removeAll(keepingCapacity: true)" in INK_VIEW
 
 
 def test_top_chrome_cannot_trigger_document_scroll_to_top():

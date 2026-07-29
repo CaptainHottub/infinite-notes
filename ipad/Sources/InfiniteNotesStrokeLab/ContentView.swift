@@ -14,13 +14,23 @@ struct ContentView: View {
         VStack(spacing: 0) {
             toolbar
             Divider()
-            ZStack {
+            ZStack(alignment: .trailing) {
                 if model.pdfDocument != nil {
                     PDFKitNotebookView(model: model, navigator: navigator)
                 } else {
                     emptyState
                 }
+
+                if model.appSettings.configuration.resolvedShowPipelineDiagnosticsSidebar {
+                    PipelineDiagnosticsSidebar(
+                        strokeSettings: model.strokeSettings,
+                        appSettings: model.appSettings
+                    )
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                    .zIndex(20)
+                }
             }
+            .animation(.easeInOut(duration: 0.18), value: model.appSettings.configuration.resolvedShowPipelineDiagnosticsSidebar)
             if model.appSettings.configuration.showStatusBar { statusBar }
         }
         .background(Color(uiColor: .systemBackground))
@@ -403,6 +413,10 @@ struct ContentView: View {
             }
             Text("• Native 0.5.3 • Vector PDF • stable ink hand-off")
                 .foregroundStyle(.secondary)
+            if model.appSettings.configuration.resolvedShowFPSInStatusBar {
+                Text("• \(Int(model.displayFPS.rounded())) FPS")
+                    .font(.caption.monospacedDigit().weight(.semibold))
+            }
             Spacer()
             if !model.mountedPageIndices.isEmpty {
                 let sortedPages = model.mountedPageIndices.sorted()
@@ -490,7 +504,7 @@ private struct InkToolSettingsPopover: View {
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
-                Slider(value: widthBinding, in: 0.5...30, step: 0.5)
+                Slider(value: widthBinding, in: 0.1...30, step: 0.1)
             }
 
             VStack(alignment: .leading, spacing: 8) {

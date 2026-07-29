@@ -13,7 +13,7 @@ enum InteractionOverlayRenderer {
     private static func viewWidth(_ width: Double, page: PageInfo, bounds: CGRect) -> CGFloat {
         let x = bounds.width / max(0.001, CGFloat(page.width))
         let y = bounds.height / max(0.001, CGFloat(page.height))
-        return max(0.5, CGFloat(width) * (x + y) / 2)
+        return max(0.1, CGFloat(width) * (x + y) / 2)
     }
 
     static func shapePreview(

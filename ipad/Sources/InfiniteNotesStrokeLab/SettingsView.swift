@@ -104,12 +104,9 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Committed ink cache") {
-                valueSlider("Maximum backing scale", value: $strokeSettings.configuration.maximumInkCacheScale,
-                            range: 2...12, step: 0.5, format: "%.1f×")
-                valueSlider("Per-page pixel budget", value: $strokeSettings.configuration.maximumInkCacheMegapixels,
-                            range: 4...64, step: 1, format: "%.0f MP")
-                Text("Live writing remains vector-backed. These limits affect only completed page ink after zooming settles.")
+            Section("Ink rendering") {
+                LabeledContent("Completed ink", value: "Retained vectors")
+                Text("Finished strokes remain as Core Animation paths. Erasing removes only the affected stroke layers; no page-sized ink bitmap is rebuilt.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -145,8 +142,8 @@ struct SettingsView: View {
                             get: { model.penWidthPresets[index] },
                             set: { model.updatePenWidthPreset(index, value: $0) }
                         ),
-                        range: 0.5...30,
-                        step: 0.5,
+                        range: 0.1...30,
+                        step: 0.1,
                         format: "%.1f pt"
                     )
                 }
@@ -340,19 +337,35 @@ struct SettingsView: View {
     private var diagnosticsTab: some View {
         settingsNavigation(title: "Diagnostics") {
             Section("Pipeline visualization") {
-                Toggle("Only visualize active stroke", isOn: $strokeSettings.configuration.debugLiveStrokeOnly)
-                Toggle("Raw Pencil points — red", isOn: $strokeSettings.configuration.showRawPoints)
-                Toggle("Raw connections — light gray", isOn: $strokeSettings.configuration.showRawConnections)
-                Toggle("Filtered points — orange", isOn: $strokeSettings.configuration.showFilteredPoints)
-                Toggle("Filtered connections — orange", isOn: $strokeSettings.configuration.showFilteredConnections)
-                Toggle("Computed spline points — blue", isOn: $strokeSettings.configuration.showComputedPoints)
-                Toggle("Computed connections — blue", isOn: $strokeSettings.configuration.showComputedConnections)
-                Toggle("Computed centreline — purple", isOn: $strokeSettings.configuration.showComputedCenterline)
-                valueSlider("Debug dot diameter", value: $strokeSettings.configuration.debugPointDiameter,
-                            range: 1...12, step: 0.5, format: "%.1f pt")
+                Toggle(
+                    "Show pipeline side panel",
+                    isOn: Binding(
+                        get: { appSettings.configuration.resolvedShowPipelineDiagnosticsSidebar },
+                        set: { appSettings.configuration.showPipelineDiagnosticsSidebar = $0 }
+                    )
+                )
+                Toggle("Only visualize active notebook stroke", isOn: $strokeSettings.configuration.debugLiveStrokeOnly)
+                Text("The side panel contains a local Pencil pad and the raw, filtered and computed point/connection controls. Its test strokes remain on the iPad and are never synchronized.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Runtime") {
+                Button {
+                    let next = !appSettings.configuration.resolvedShowFPSInStatusBar
+                    appSettings.configuration.showFPSInStatusBar = next
+                    if next {
+                        appSettings.configuration.showStatusBar = true
+                    }
+                } label: {
+                    Label(
+                        appSettings.configuration.resolvedShowFPSInStatusBar
+                            ? "Hide FPS from bottom status bar"
+                            : "Show FPS in bottom status bar",
+                        systemImage: "speedometer"
+                    )
+                }
+                LabeledContent("Current FPS", value: model.displayFPS > 0 ? "\(Int(model.displayFPS.rounded()))" : "—")
                 LabeledContent("Build", value: "0.5.3")
                 LabeledContent("PDF", value: model.pdfDocument == nil ? "Not loaded" : "Loaded")
                 LabeledContent("Connection", value: model.connectionLabel)

@@ -81,18 +81,27 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     private var selectionGesture: SelectionTransformGesture?
     private var recognitionWorkItem: DispatchWorkItem?
 
-    private var committedImage: UIImage?
-    private var committedImageSize: CGSize = .zero
+    private struct CommittedVectorEntry {
+        var stroke: NoteStroke
+        var layers: [CALayer]
+    }
+
+    // Completed strokes stay as retained Core Animation vector paths. There is
+    // deliberately no page-sized UIImage or bitmap cache. Erasing one stroke
+    // removes only that stroke's layer group instead of repainting the page.
+    private let committedLayerHost = CALayer()
+    private var committedVectorEntries: [String: CommittedVectorEntry] = [:]
     private var committedContentDirty = true
-    private var committedRenderScale: CGFloat = UIScreen.main.scale
-    private var committedRebuildScheduled = false
+    private var committedRefreshScheduled = false
+    private var committedLayoutSize: CGSize = .zero
+    private var committedPageSnapshot: PageInfo?
+    private var committedPipelineSnapshot: StrokePipelineConfiguration?
     private var pendingPDFScale: CGFloat = 1
     private var committedExclusions: Set<String> = []
     private var pendingCommitOverlayIDs: Set<String> = []
 
-    // Pencil ink, geometry previews, selection handles and lasso paths all use
-    // reusable vector-backed CAShapeLayers. Only completed content is flattened
-    // into the per-page committed cache.
+    // Active Pencil ink, geometry previews, selection handles and lasso paths
+    // use a second vector host above completed content.
     private let liveLayerHost = CALayer()
     private var liveShapeLayers: [CAShapeLayer] = []
     private var liveDisplayScale: CGFloat = UIScreen.main.scale
@@ -153,10 +162,11 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         isUserInteractionEnabled = false
         isMultipleTouchEnabled = true
         contentMode = .redraw
-        layer.contentsGravity = .resize
-        layer.magnificationFilter = .linear
-        layer.minificationFilter = .linear
+        committedLayerHost.masksToBounds = true
+        committedLayerHost.shouldRasterize = false
         liveLayerHost.masksToBounds = true
+        liveLayerHost.shouldRasterize = false
+        layer.addSublayer(committedLayerHost)
         layer.addSublayer(liveLayerHost)
         fingerGeometryTap.require(toFail: fingerGeometryPan)
         model.register(pageView: self, pageIndex: pageIndex)
@@ -191,19 +201,20 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
 
     override func layoutSubviews() {
         super.layoutSubviews()
+        committedLayerHost.frame = bounds
         liveLayerHost.frame = bounds
         for shapeLayer in liveShapeLayers { shapeLayer.frame = bounds }
-        if committedImageSize != bounds.size {
+
+        if committedLayoutSize != bounds.size {
             committedContentDirty = true
-            settleDisplayScale()
-            scheduleCommittedRebuild()
+            scheduleCommittedRefresh()
             refreshLiveContent()
         }
     }
 
     func invalidateCommittedContent() {
         committedContentDirty = true
-        scheduleCommittedRebuild()
+        scheduleCommittedRefresh()
     }
 
     func beginCommitTransition(strokeID: String) {
@@ -214,26 +225,333 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     private func setCommittedExclusions(_ ids: Set<String>) {
         guard ids != committedExclusions else { return }
         committedExclusions = ids
-        committedContentDirty = true
-        scheduleCommittedRebuild()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (id, entry) in committedVectorEntries {
+            for layer in entry.layers { layer.isHidden = ids.contains(id) }
+        }
+        CATransaction.commit()
+        scheduleLiveRefresh()
     }
 
-    private func scheduleCommittedRebuild() {
-        guard !committedRebuildScheduled else { return }
-        committedRebuildScheduled = true
+    private func scheduleCommittedRefresh() {
+        guard !committedRefreshScheduled else { return }
+        committedRefreshScheduled = true
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.committedRebuildScheduled = false
-            guard self.committedContentDirty,
-                  let model = self.model,
-                  let page = model.pageInfo(at: self.pageIndex),
-                  self.bounds.width > 0, self.bounds.height > 0 else { return }
-            self.rebuildCommittedImage(
-                model: model,
+            self.committedRefreshScheduled = false
+            self.refreshCommittedVectorsIfNeeded()
+        }
+    }
+
+    private func refreshCommittedVectorsIfNeeded() {
+        guard committedContentDirty,
+              let model,
+              let page = model.pageInfo(at: pageIndex),
+              bounds.width > 0, bounds.height > 0 else { return }
+
+        let configuration = model.strokeSettings.configuration
+        let forceRebuild = committedPageSnapshot != page
+            || committedLayoutSize != bounds.size
+            || committedPipelineSnapshot != configuration
+
+        if forceRebuild {
+            removeAllCommittedVectorEntries()
+        }
+
+        let strokes = model.committedStrokesForPage(pageIndex)
+        let currentIDs = Set(strokes.map(\.id))
+
+        for id in Array(committedVectorEntries.keys) where !currentIDs.contains(id) {
+            removeCommittedVectorEntry(id: id)
+        }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (order, stroke) in strokes.enumerated() {
+            if let existing = committedVectorEntries[stroke.id], existing.stroke == stroke {
+                for (suborder, layer) in existing.layers.enumerated() {
+                    layer.isHidden = committedExclusions.contains(stroke.id)
+                    layer.zPosition = CGFloat(order * 8 + suborder)
+                }
+                continue
+            }
+
+            removeCommittedVectorEntry(id: stroke.id)
+            let layers = makeCommittedVectorLayers(
+                stroke: stroke,
                 page: page,
-                configuration: model.strokeSettings.configuration
+                configuration: configuration
+            )
+            for (suborder, layer) in layers.enumerated() {
+                layer.isHidden = committedExclusions.contains(stroke.id)
+                layer.zPosition = CGFloat(order * 8 + suborder)
+                committedLayerHost.addSublayer(layer)
+            }
+            committedVectorEntries[stroke.id] = CommittedVectorEntry(stroke: stroke, layers: layers)
+        }
+        CATransaction.commit()
+
+        committedPageSnapshot = page
+        committedPipelineSnapshot = configuration
+        committedLayoutSize = bounds.size
+        committedContentDirty = false
+
+        if !pendingCommitOverlayIDs.isEmpty {
+            pendingCommitOverlayIDs.removeAll(keepingCapacity: true)
+            refreshLiveContent()
+        }
+    }
+
+    private func makeCommittedVectorLayers(
+        stroke: NoteStroke,
+        page: PageInfo,
+        configuration: StrokePipelineConfiguration
+    ) -> [CALayer] {
+        if stroke.tool == "text" {
+            return makeTextLayer(stroke: stroke, page: page).map { [$0] } ?? []
+        }
+
+        let descriptors: [LiveStrokeLayerDescriptor]
+        if GeometryEngine.isGeometry(stroke) {
+            descriptors = committedShapeDescriptors(
+                stroke: stroke,
+                page: page,
+                settings: model?.appSettings.configuration ?? .default
+            )
+        } else {
+            descriptors = StrokeRenderer.vectorLayerDescriptors(
+                stroke: stroke,
+                page: page,
+                viewBounds: bounds,
+                configuration: configuration,
+                includeDiagnostics: !configuration.debugLiveStrokeOnly
             )
         }
+
+        var layers: [CALayer] = descriptors.map { descriptor in
+            let shapeLayer = CAShapeLayer()
+            shapeLayer.frame = bounds
+            shapeLayer.contentsScale = liveDisplayScale
+            shapeLayer.shouldRasterize = false
+            shapeLayer.path = descriptor.path
+            shapeLayer.fillColor = descriptor.fillColor
+            shapeLayer.strokeColor = descriptor.strokeColor
+            shapeLayer.lineWidth = descriptor.lineWidth
+            shapeLayer.lineDashPattern = descriptor.lineDashPattern
+            shapeLayer.lineCap = descriptor.lineCap
+            shapeLayer.lineJoin = descriptor.lineJoin
+            return shapeLayer
+        }
+        if stroke.shapeType == "xy-plane" {
+            layers.append(contentsOf: makeXYPlaneLabelLayers(stroke: stroke, page: page))
+        }
+        return layers
+    }
+
+    private func makeXYPlaneLabelLayers(stroke: NoteStroke, page: PageInfo) -> [CALayer] {
+        guard let box = GeometryEngine.shapeBox(stroke) else { return [] }
+        let scaleX = bounds.width / max(0.001, CGFloat(page.width))
+        let scaleY = bounds.height / max(0.001, CGFloat(page.height))
+        let lineWidth = max(0.1, CGFloat(stroke.width) * (scaleX + scaleY) / 2)
+        let fontSize = max(10, lineWidth * 4)
+        let xEnd = viewPoint(from: box.localToWorld(x: box.width, y: box.height / 2), page: page)
+        let yEnd = viewPoint(from: box.localToWorld(x: box.width / 2, y: 0), page: page)
+        let color = UIColor(noteHex: stroke.color, alpha: 0.82).cgColor
+
+        func label(_ text: String, origin: CGPoint) -> CATextLayer {
+            let layer = CATextLayer()
+            layer.string = text
+            layer.font = UIFont.systemFont(ofSize: fontSize, weight: .medium)
+            layer.fontSize = fontSize
+            layer.foregroundColor = color
+            layer.contentsScale = liveDisplayScale
+            layer.shouldRasterize = false
+            layer.alignmentMode = .center
+            layer.frame = CGRect(x: origin.x, y: origin.y, width: fontSize * 1.4, height: fontSize * 1.4)
+            return layer
+        }
+
+        return [
+            label("x", origin: CGPoint(x: xEnd.x - fontSize * 1.1, y: xEnd.y - fontSize * 1.1)),
+            label("y", origin: CGPoint(x: yEnd.x + fontSize * 0.35, y: yEnd.y + fontSize * 0.15)),
+        ]
+    }
+
+    private func committedShapeDescriptors(
+        stroke: NoteStroke,
+        page: PageInfo,
+        settings: NativeAppConfiguration
+    ) -> [LiveStrokeLayerDescriptor] {
+        guard GeometryEngine.isGeometry(stroke), !stroke.points.isEmpty else { return [] }
+        let color = UIColor(noteHex: stroke.color, alpha: CGFloat(stroke.opacity)).cgColor
+        let gridColor = UIColor(noteHex: stroke.gridColor ?? "#7a7f89", alpha: min(0.45, CGFloat(stroke.opacity))).cgColor
+        let scaleX = bounds.width / max(0.001, CGFloat(page.width))
+        let scaleY = bounds.height / max(0.001, CGFloat(page.height))
+        let width = max(0.1, CGFloat(stroke.width) * (scaleX + scaleY) / 2)
+        let dash: [NSNumber]?
+        switch stroke.lineStyle {
+        case "dashed": dash = [NSNumber(value: Double(max(5, width * 3.2))), NSNumber(value: Double(max(4, width * 2)))]
+        case "dotted": dash = [NSNumber(value: Double(max(0.5, width * 0.18))), NSNumber(value: Double(max(4, width * 2.1)))]
+        default: dash = nil
+        }
+
+        if stroke.shapeType == "xy-plane", let box = GeometryEngine.shapeBox(stroke) {
+            let topLeft = viewPoint(from: box.topLeft, page: page)
+            let topRight = viewPoint(from: box.topRight, page: page)
+            let bottomRight = viewPoint(from: box.bottomRight, page: page)
+            let bottomLeft = viewPoint(from: box.bottomLeft, page: page)
+            let boxWidth = max(0.001, hypot(topRight.x - topLeft.x, topRight.y - topLeft.y))
+            let boxHeight = max(0.001, hypot(bottomLeft.x - topLeft.x, bottomLeft.y - topLeft.y))
+            let viewBox = GeometryBox(
+                topLeft: topLeft,
+                topRight: topRight,
+                bottomRight: bottomRight,
+                bottomLeft: bottomLeft,
+                width: boxWidth,
+                height: boxHeight,
+                ux: CGPoint(x: (topRight.x - topLeft.x) / boxWidth, y: (topRight.y - topLeft.y) / boxWidth),
+                uy: CGPoint(x: (bottomLeft.x - topLeft.x) / boxHeight, y: (bottomLeft.y - topLeft.y) / boxHeight)
+            )
+            let gridPath = CGMutablePath()
+            let divisions = max(2, min(40, settings.xyPlaneGridDivisions))
+            for index in 1..<divisions {
+                let x = viewBox.width * CGFloat(index) / CGFloat(divisions)
+                let y = viewBox.height * CGFloat(index) / CGFloat(divisions)
+                gridPath.move(to: viewBox.localToWorld(x: x, y: 0))
+                gridPath.addLine(to: viewBox.localToWorld(x: x, y: viewBox.height))
+                gridPath.move(to: viewBox.localToWorld(x: 0, y: y))
+                gridPath.addLine(to: viewBox.localToWorld(x: viewBox.width, y: y))
+            }
+            let xStart = viewBox.localToWorld(x: 0, y: viewBox.height / 2)
+            let xEnd = viewBox.localToWorld(x: viewBox.width, y: viewBox.height / 2)
+            let yStart = viewBox.localToWorld(x: viewBox.width / 2, y: viewBox.height)
+            let yEnd = viewBox.localToWorld(x: viewBox.width / 2, y: 0)
+            let axes = CGMutablePath()
+            axes.move(to: xStart); axes.addLine(to: xEnd)
+            axes.move(to: yStart); axes.addLine(to: yEnd)
+            appendArrowHead(to: axes, from: viewBox.localToWorld(x: max(0, viewBox.width - 20), y: viewBox.height / 2), to: xEnd, size: max(9, width * 4.5))
+            appendArrowHead(to: axes, from: viewBox.localToWorld(x: viewBox.width / 2, y: min(20, viewBox.height)), to: yEnd, size: max(9, width * 4.5))
+            return [
+                LiveStrokeLayerDescriptor(path: gridPath, fillColor: nil, strokeColor: gridColor, lineWidth: max(0.45, width * 0.34), lineDashPattern: nil),
+                LiveStrokeLayerDescriptor(path: axes, fillColor: nil, strokeColor: color, lineWidth: max(1, width), lineDashPattern: nil),
+            ]
+        }
+
+        let world = GeometryEngine.polyline(for: stroke, segments: 96)
+        guard let first = world.first else { return [] }
+        let path = CGMutablePath()
+        path.move(to: viewPoint(from: first, page: page))
+        for point in world.dropFirst() { path.addLine(to: viewPoint(from: point, page: page)) }
+        var result = [LiveStrokeLayerDescriptor(
+            path: path,
+            fillColor: nil,
+            strokeColor: color,
+            lineWidth: width,
+            lineDashPattern: dash
+        )]
+        if stroke.shapeType == "arrow", world.count >= 2 {
+            let start = viewPoint(from: world[0], page: page)
+            let end = viewPoint(from: world[1], page: page)
+            let arrow = CGMutablePath()
+            appendArrowHead(to: arrow, from: start, to: end, size: max(9, width * 4.5))
+            result.append(LiveStrokeLayerDescriptor(
+                path: arrow, fillColor: nil, strokeColor: color, lineWidth: width, lineDashPattern: nil
+            ))
+        }
+        return result
+    }
+
+    private func appendArrowHead(to path: CGMutablePath, from start: CGPoint, to end: CGPoint, size: CGFloat) {
+        let angle = atan2(end.y - start.y, end.x - start.x)
+        path.move(to: end)
+        path.addLine(to: CGPoint(
+            x: end.x - cos(angle - .pi / 6) * size,
+            y: end.y - sin(angle - .pi / 6) * size
+        ))
+        path.move(to: end)
+        path.addLine(to: CGPoint(
+            x: end.x - cos(angle + .pi / 6) * size,
+            y: end.y - sin(angle + .pi / 6) * size
+        ))
+    }
+
+    private func makeTextLayer(stroke: NoteStroke, page: PageInfo) -> CALayer? {
+        guard stroke.points.count >= 4, let text = stroke.text, !text.isEmpty else { return nil }
+        let points = stroke.points.map { viewPoint(from: $0.cgPoint, page: page) }
+        let topLeft = points[0]
+        let topRight = points[1]
+        let bottomLeft = points[3]
+        let width = max(1, hypot(topRight.x - topLeft.x, topRight.y - topLeft.y))
+        let height = max(1, hypot(bottomLeft.x - topLeft.x, bottomLeft.y - topLeft.y))
+        let angle = atan2(topRight.y - topLeft.y, topRight.x - topLeft.x)
+        let scaleX = bounds.width / max(0.001, CGFloat(page.width))
+        let scaleY = bounds.height / max(0.001, CGFloat(page.height))
+        let fontSize = max(1, CGFloat(stroke.width) * (scaleX + scaleY) / 2)
+        let inset = max(2, fontSize * 0.16)
+
+        let family: String
+        switch stroke.fontFamily {
+        case "serif": family = "Times New Roman"
+        case "monospace": family = "Menlo"
+        default: family = ".AppleSystemUIFont"
+        }
+        let font = UIFont(name: family, size: fontSize) ?? UIFont.systemFont(ofSize: fontSize)
+
+        let paragraph = NSMutableParagraphStyle()
+        switch stroke.textAlign {
+        case "center": paragraph.alignment = .center
+        case "right": paragraph.alignment = .right
+        default: paragraph.alignment = .left
+        }
+        let attributed = NSAttributedString(
+            string: text,
+            attributes: [
+                .font: font,
+                .foregroundColor: UIColor(noteHex: stroke.color, alpha: CGFloat(stroke.opacity)),
+                .paragraphStyle: paragraph,
+            ]
+        )
+
+        let transformLayer = CALayer()
+        transformLayer.anchorPoint = .zero
+        transformLayer.position = topLeft
+        transformLayer.bounds = CGRect(x: 0, y: 0, width: width, height: height)
+        transformLayer.setAffineTransform(CGAffineTransform(rotationAngle: angle))
+        transformLayer.masksToBounds = true
+        transformLayer.shouldRasterize = false
+
+        let textLayer = CATextLayer()
+        textLayer.frame = CGRect(
+            x: inset,
+            y: inset,
+            width: max(1, width - inset * 2),
+            height: max(1, height - inset * 2)
+        )
+        textLayer.string = attributed
+        textLayer.isWrapped = true
+        textLayer.truncationMode = .none
+        textLayer.contentsScale = liveDisplayScale
+        textLayer.shouldRasterize = false
+        switch stroke.textAlign {
+        case "center": textLayer.alignmentMode = .center
+        case "right": textLayer.alignmentMode = .right
+        default: textLayer.alignmentMode = .left
+        }
+        transformLayer.addSublayer(textLayer)
+        return transformLayer
+    }
+
+    private func removeCommittedVectorEntry(id: String) {
+        guard let entry = committedVectorEntries.removeValue(forKey: id) else { return }
+        for layer in entry.layers { layer.removeFromSuperlayer() }
+    }
+
+    private func removeAllCommittedVectorEntries() {
+        for entry in committedVectorEntries.values {
+            for layer in entry.layers { layer.removeFromSuperlayer() }
+        }
+        committedVectorEntries.removeAll(keepingCapacity: true)
     }
 
     func scheduleLiveRefresh() {
@@ -278,10 +596,8 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
             ))
         }
 
-        // Keep a just-finished stroke visible as a vector until the new
-        // committed page image has actually been installed. Without this
-        // hand-off the live layer disappears one run-loop turn before the
-        // raster cache is ready, producing a visible flash.
+        // Keep a just-finished stroke visible until its retained committed
+        // vector group is installed on the next main-queue turn.
         for id in pendingCommitOverlayIDs.sorted() {
             guard let stroke = model.stroke(withID: id) else { continue }
             if GeometryEngine.isGeometry(stroke) {
@@ -317,10 +633,8 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
                     zoomScale: interactionZoomScale
                 ))
             } else {
-                // During transforms, selected originals are excluded from the
-                // committed page image and their current replacements are drawn
-                // as live vectors. This avoids both ghosting and repeated
-                // high-resolution bitmap rebuilds while dragging.
+                // During transforms, selected originals are hidden from the
+                // committed vector host and their replacements are drawn live.
                 for stroke in model.selectedStrokesForPage(pageIndex) {
                     if GeometryEngine.isGeometry(stroke) {
                         descriptors.append(contentsOf: InteractionOverlayRenderer.shapePreview(
@@ -375,6 +689,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
             shapeLayer.isHidden = false
             shapeLayer.frame = bounds
             shapeLayer.contentsScale = liveDisplayScale
+            shapeLayer.shouldRasterize = false
             shapeLayer.path = descriptor.path
             shapeLayer.fillColor = descriptor.fillColor
             shapeLayer.strokeColor = descriptor.strokeColor
@@ -393,6 +708,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
             let shapeLayer = CAShapeLayer()
             shapeLayer.frame = bounds
             shapeLayer.contentsScale = liveDisplayScale
+            shapeLayer.shouldRasterize = false
             liveLayerHost.addSublayer(shapeLayer)
             liveShapeLayers.append(shapeLayer)
         }
@@ -413,72 +729,32 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         let previousScale = pendingPDFScale
         pendingPDFScale = max(0.05, pdfScale)
         liveDisplayScale = UIScreen.main.scale * min(max(1, pendingPDFScale), 4)
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        for shapeLayer in liveShapeLayers { shapeLayer.contentsScale = liveDisplayScale }
-        CATransaction.commit()
+        updateVectorContentsScale()
         if abs(previousScale - pendingPDFScale) > 0.001 {
             scheduleLiveRefresh()
         }
     }
 
     func settleDisplayScale() {
-        guard let model else { return }
-        let configuration = model.strokeSettings.configuration
-        let screenScale = UIScreen.main.scale
-        let requested = screenScale * max(1, pendingPDFScale)
-        let maxScale = CGFloat(max(screenScale, configuration.maximumInkCacheScale))
-        let area = max(1, bounds.width * bounds.height)
-        let pixelBudget = CGFloat(max(1, configuration.maximumInkCacheMegapixels) * 1_000_000)
-        let budgetScale = sqrt(pixelBudget / area)
-        let desired = max(screenScale, min(requested, maxScale, budgetScale))
-
-        if abs(committedRenderScale - desired) > 0.08 {
-            committedRenderScale = desired
-            committedContentDirty = true
-            scheduleCommittedRebuild()
-        }
+        // Retained CAShapeLayer / CATextLayer content remains vector-backed.
+        // There is no page bitmap to regenerate when zooming settles.
+        updateVectorContentsScale()
     }
 
-    private func rebuildCommittedImage(
-        model: AppModel,
-        page: PageInfo,
-        configuration: StrokePipelineConfiguration
-    ) {
-        guard bounds.width > 0, bounds.height > 0 else { return }
-        let format = UIGraphicsImageRendererFormat()
-        format.opaque = false
-        format.scale = committedRenderScale
-        let renderer = UIGraphicsImageRenderer(size: bounds.size, format: format)
-        committedImage = renderer.image { rendererContext in
-            let context = rendererContext.cgContext
-            context.clear(bounds)
-            context.clip(to: bounds)
-            for stroke in model.committedStrokesForPage(pageIndex) where !committedExclusions.contains(stroke.id) {
-                StrokeRenderer.draw(
-                    stroke: stroke,
-                    page: page,
-                    in: context,
-                    viewBounds: bounds,
-                    configuration: configuration,
-                    appConfiguration: model.appSettings.configuration,
-                    isLive: false
-                )
-            }
-        }
-        committedImageSize = bounds.size
-        committedContentDirty = false
+    private func updateVectorContentsScale() {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        layer.contents = committedImage?.cgImage
-        layer.contentsScale = committedRenderScale
+        for shapeLayer in liveShapeLayers { shapeLayer.contentsScale = liveDisplayScale }
+        for entry in committedVectorEntries.values {
+            for layer in entry.layers { updateContentsScaleRecursively(layer) }
+        }
         CATransaction.commit()
+    }
 
-        if !pendingCommitOverlayIDs.isEmpty {
-            pendingCommitOverlayIDs.removeAll(keepingCapacity: true)
-            // The committed image is already installed, so removing the live
-            // duplicate here cannot expose an empty frame.
-            refreshLiveContent()
+    private func updateContentsScaleRecursively(_ layer: CALayer) {
+        layer.contentsScale = liveDisplayScale
+        for sublayer in layer.sublayers ?? [] {
+            updateContentsScaleRecursively(sublayer)
         }
     }
 
@@ -683,8 +959,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         } else if let id = activeStrokeID {
             model.endStroke(strokeID: id)
         }
-        committedImage = nil
-        layer.contents = nil
+        removeAllCommittedVectorEntries()
         committedContentDirty = true
         for shapeLayer in liveShapeLayers { shapeLayer.removeFromSuperlayer() }
         liveShapeLayers.removeAll(keepingCapacity: false)

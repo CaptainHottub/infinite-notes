@@ -81,10 +81,6 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
     private var lastSettingsRevision = -1
     private var lastWorkspaceRevision = -1
     private var appliedPageGap: CGFloat = 18
-    private var isRebuildingPageLayout = false
-    private var fpsDisplayLink: CADisplayLink?
-    private var fpsWindowStart: CFTimeInterval = 0
-    private var fpsFrameCount = 0
 
     private let horizontalMargin: CGFloat = 18
     private let verticalMargin: CGFloat = 18
@@ -122,7 +118,6 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
 
         documentView.backgroundColor = .clear
         addSubview(documentView)
-        startFPSMonitor()
     }
 
     required init?(coder: NSCoder) {
@@ -143,9 +138,7 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
                 updateContentInsets()
             }
         }
-        if !isRebuildingPageLayout {
-            updateWorkingSet()
-        }
+        updateWorkingSet()
     }
 
     func applySettings(settingsRevision: Int, workspaceRevision: Int) {
@@ -169,31 +162,22 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         }
 
         let target = min(max(0, currentPageIndex), max(0, pdfFrames.count - 1))
-        let preservedZoomScale = zoomScale
         let sourceAnchor: CGPoint?
         if pdfFrames.indices.contains(target), zoomScale > 0 {
             let oldPDF = pdfFrames[target]
-            let viewportCenter = viewportCenterInDocumentCoordinates()
+            let viewportCenter = CGPoint(
+                x: (contentOffset.x + contentInset.left + bounds.width / 2) / zoomScale,
+                y: (contentOffset.y + contentInset.top + bounds.height / 2) / zoomScale
+            )
             sourceAnchor = CGPoint(x: viewportCenter.x - oldPDF.minX, y: viewportCenter.y - oldPDF.minY)
         } else {
             sourceAnchor = nil
         }
 
-        // UIScrollView applies its zoom as a transform to documentView. Changing
-        // the frame of that transformed view, then assigning an unscaled
-        // contentSize, can leave the scrollable range permanently truncated.
-        // Return to an identity transform before rebuilding the document bounds,
-        // then restore the previous zoom and source-PDF anchor.
-        isRebuildingPageLayout = true
         unmountAllPages()
-        setZoomScale(1, animated: false)
         buildPageLayout(pageCount: min(document.pageCount, coreDocument.numberOfPages))
         currentPageIndex = min(target, max(0, workspaceFrames.count - 1))
         model.setCurrentPage(index: currentPageIndex)
-        let restoredZoomScale = min(maximumZoomScale, max(minimumZoomScale, preservedZoomScale))
-        setZoomScale(restoredZoomScale, animated: false)
-        layoutIfNeeded()
-        updateContentInsets()
         mountWorkingSet(around: currentPageIndex)
 
         if let sourceAnchor, pdfFrames.indices.contains(currentPageIndex) {
@@ -205,8 +189,6 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         } else {
             goToPage(index: currentPageIndex, animated: false)
         }
-        isRebuildingPageLayout = false
-        updateWorkingSet()
     }
 
 
@@ -220,11 +202,7 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
     }
 
     func setDocument(_ document: PDFDocument?, sourceURL: URL?) {
-        isRebuildingPageLayout = true
         unmountAllPages()
-        // A new PDF can arrive while the old document is zoomed. Resetting first
-        // prevents assigning frame/contentSize to a transformed zoom view.
-        setZoomScale(1, animated: false)
         pdfDocument = document
         self.sourceURL = sourceURL
         coreDocument = sourceURL.flatMap { CGPDFDocument($0 as CFURL) }
@@ -236,7 +214,6 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
             documentView.frame = .zero
             contentSize = .zero
             model.setCurrentPage(index: -1)
-            isRebuildingPageLayout = false
             return
         }
 
@@ -249,14 +226,10 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         model.setCurrentPage(index: requestedPage)
         mountWorkingSet(around: requestedPage)
         needsInitialFit = true
-        isRebuildingPageLayout = false
         setNeedsLayout()
     }
 
     func prepareForRemoval() {
-        fpsDisplayLink?.invalidate()
-        fpsDisplayLink = nil
-        model.updateDisplayFPS(0)
         unmountAllPages()
         if model.mountedPageIndices.isEmpty == false {
             for index in model.mountedPageIndices {
@@ -265,45 +238,15 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         }
     }
 
-    private func startFPSMonitor() {
-        let link = CADisplayLink(target: self, selector: #selector(displayLinkDidFire(_:)))
-        link.add(to: .main, forMode: .common)
-        fpsDisplayLink = link
-    }
-
-    @objc private func displayLinkDidFire(_ link: CADisplayLink) {
-        guard window != nil,
-              model.appSettings.configuration.resolvedShowFPSInStatusBar else {
-            fpsWindowStart = 0
-            fpsFrameCount = 0
-            if model.displayFPS != 0 { model.updateDisplayFPS(0) }
-            return
-        }
-
-        if fpsWindowStart == 0 {
-            fpsWindowStart = link.timestamp
-            fpsFrameCount = 0
-        }
-        fpsFrameCount += 1
-        let elapsed = link.timestamp - fpsWindowStart
-        if elapsed >= 0.5 {
-            model.updateDisplayFPS(Double(fpsFrameCount) / elapsed)
-            fpsWindowStart = link.timestamp
-            fpsFrameCount = 0
-        }
-    }
-
     func viewForZooming(in scrollView: UIScrollView) -> UIView? {
         documentView
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        guard !isRebuildingPageLayout else { return }
         updateWorkingSet()
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
-        guard !isRebuildingPageLayout else { return }
         updateContentInsets()
         updateMountedInkScales(settle: false)
         updateWorkingSet()
@@ -330,7 +273,7 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         updateMountedInkScales(settle: true)
 
         let pageFrame = workspaceFrames[index]
-        let targetY = pageFrame.minY * zoomScale - 8
+        let targetY = pageFrame.minY * zoomScale - contentInset.top - 8
         let minY = -contentInset.top
         let maxY = max(minY, contentSize.height - bounds.height + contentInset.bottom)
         setContentOffset(
@@ -349,8 +292,8 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         let clamped = min(maximumZoomScale, max(minimumZoomScale, scale))
         setZoomScale(clamped, animated: animated)
 
-        let targetX = page.midX * clamped - bounds.width / 2
-        let targetY = page.midY * clamped - bounds.height / 2
+        let targetX = page.midX * clamped - bounds.width / 2 - contentInset.left
+        let targetY = page.midY * clamped - bounds.height / 2 - contentInset.top
         let minX = -contentInset.left
         let minY = -contentInset.top
         let maxX = max(minX, contentSize.width - bounds.width + contentInset.right)
@@ -411,6 +354,7 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         documentView.frame = CGRect(x: 0, y: 0, width: width, height: height)
         contentSize = documentView.bounds.size
         updateZoomLimits()
+        mountWorkingSet(around: min(max(0, currentPageIndex), max(0, workspaceFrames.count - 1)))
     }
 
 
@@ -437,17 +381,9 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         contentInset = UIEdgeInsets(top: vertical, left: horizontal, bottom: vertical, right: horizontal)
     }
 
-    private func viewportCenterInDocumentCoordinates() -> CGPoint {
-        guard zoomScale > 0 else { return .zero }
-        return CGPoint(
-            x: (contentOffset.x + bounds.width / 2) / zoomScale,
-            y: (contentOffset.y + bounds.height / 2) / zoomScale
-        )
-    }
-
     private func restoreViewportCenter(_ documentPoint: CGPoint, animated: Bool) {
-        let targetX = documentPoint.x * zoomScale - bounds.width / 2
-        let targetY = documentPoint.y * zoomScale - bounds.height / 2
+        let targetX = documentPoint.x * zoomScale - bounds.width / 2 - contentInset.left
+        let targetY = documentPoint.y * zoomScale - bounds.height / 2 - contentInset.top
         let minX = -contentInset.left
         let minY = -contentInset.top
         let maxX = max(minX, contentSize.width - bounds.width + contentInset.right)
@@ -460,7 +396,7 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
 
     private func updateWorkingSet() {
         guard !workspaceFrames.isEmpty, zoomScale > 0 else { return }
-        let visibleMidY = (contentOffset.y + bounds.height / 2) / zoomScale
+        let visibleMidY = (contentOffset.y + contentInset.top + bounds.height / 2) / zoomScale
         let index = nearestPage(toDocumentY: visibleMidY)
         if index != currentPageIndex {
             currentPageIndex = index

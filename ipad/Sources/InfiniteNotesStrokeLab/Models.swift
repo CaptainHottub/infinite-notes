@@ -135,6 +135,9 @@ struct NativeAppConfiguration: Codable, Equatable {
     var pageWorkingRadius = 2
     var maximumZoom = 12.0
     var showStatusBar = true
+    /// Optional so existing saved settings continue decoding after diagnostics UI additions.
+    var showFPSInStatusBar: Bool?
+    var showPipelineDiagnosticsSidebar: Bool?
 
     // Geometry creation and snapping
     var geometryLineStyle: GeometryLineStyle = .solid
@@ -171,6 +174,14 @@ struct NativeAppConfiguration: Codable, Equatable {
 
     var resolvedOffPageGridSpacing: Double {
         max(4, min(200, offPageGridSpacing ?? 20))
+    }
+
+    var resolvedShowFPSInStatusBar: Bool {
+        showFPSInStatusBar ?? false
+    }
+
+    var resolvedShowPipelineDiagnosticsSidebar: Bool {
+        showPipelineDiagnosticsSidebar ?? false
     }
 
     static let `default` = NativeAppConfiguration()
@@ -248,7 +259,8 @@ struct StrokePipelineConfiguration: Codable, Equatable {
     var endTaperLength = 2.0
     var taperMinimumScale = 0.18
 
-    // Rendering cache
+    // Legacy persisted values retained for compatibility with older settings.
+    // Vector ink rendering no longer uses a page bitmap cache.
     var maximumInkCacheScale = 8.0
     var maximumInkCacheMegapixels = 28.0
 
@@ -261,7 +273,23 @@ struct StrokePipelineConfiguration: Codable, Equatable {
     var showComputedPoints = false
     var showComputedConnections = false
     var showComputedCenterline = false
+    /// Legacy shared diameter retained so older saved settings continue decoding.
     var debugPointDiameter = 4.0
+    var rawPointDiameter: Double?
+    var filteredPointDiameter: Double?
+    var computedPointDiameter: Double?
+
+    var resolvedRawPointDiameter: Double {
+        max(0.1, min(32, rawPointDiameter ?? debugPointDiameter))
+    }
+
+    var resolvedFilteredPointDiameter: Double {
+        max(0.1, min(32, filteredPointDiameter ?? debugPointDiameter))
+    }
+
+    var resolvedComputedPointDiameter: Double {
+        max(0.1, min(32, computedPointDiameter ?? debugPointDiameter))
+    }
 
     static let `default` = StrokePipelineConfiguration()
 }

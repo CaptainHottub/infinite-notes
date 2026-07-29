@@ -386,7 +386,11 @@ def test_project_import_renders_embedded_pdf(monkeypatch, tmp_path):
     assert restored["document"]["filename"] == "restored.pdf"
     assert len(restored["document"]["pages"]) == 1
     assert server.CURRENT_PDF.read_bytes() == pdf_content
-    assert (server.PDF_PAGES_DIR / "page-0001.png").exists()
+    preview = server.PDF_PAGES_DIR / "page-0001.svg"
+    assert preview.exists()
+    assert "<svg" in preview.read_text(encoding="utf-8")[:1000]
+    assert not (server.PDF_PAGES_DIR / "page-0001.png").exists()
+    assert restored["document"]["pages"][0]["imageUrl"].split("?", 1)[0].endswith("/page-0001.svg")
 
 
 def test_project_import_rejects_wrong_format(monkeypatch, tmp_path):

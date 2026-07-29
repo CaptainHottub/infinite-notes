@@ -408,7 +408,7 @@ enum GeometryEngine {
                 y: anchor.y + (CGFloat(point.y) - anchor.y) * clamped
             ), page: page)
         }
-        result.width = max(0.25, min(100, stroke.width * Double(clamped)))
+        result.width = max(0.1, min(100, stroke.width * Double(clamped)))
         return result
     }
 
