@@ -1725,9 +1725,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             raise ValueError("final stroke id does not match")
                     history_changed = False
                     replaced_live = False
+                    restored_missing = False
                     async with state_lock:
                         stroke = state["strokes"].get(stroke_id)
-                        if stroke is not None:
+                        if stroke is None and final_stroke is not None:
+                            # A complete final stroke is authoritative even when
+                            # stroke_begin/point frames were lost while offline.
+                            state["strokes"][stroke_id] = final_stroke
+                            stroke = final_stroke
+                            pending_stroke_history.discard(stroke_id)
+                            push_history({"type": "add", "strokes": [copy.deepcopy(stroke)]})
+                            history_changed = True
+                            restored_missing = True
+                        elif stroke is not None:
                             if final_stroke is not None:
                                 state["strokes"][stroke_id] = final_stroke
                                 stroke = final_stroke
@@ -1736,10 +1746,72 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 pending_stroke_history.discard(stroke_id)
                                 push_history({"type": "add", "strokes": [copy.deepcopy(stroke)]})
                                 history_changed = True
+                        if stroke is not None:
                             save_state_atomic()
-                    if replaced_live and final_stroke is not None:
+                    if restored_missing and final_stroke is not None:
+                        await broadcast({"type": "restore_strokes", "strokes": [final_stroke]}, exclude=websocket)
+                    elif replaced_live and final_stroke is not None:
                         await broadcast({"type": "replace_strokes", "strokes": [final_stroke]}, exclude=websocket)
                     await broadcast({"type": "stroke_end", "id": stroke_id}, exclude=websocket)
+                    if history_changed:
+                        await broadcast(history_status_message())
+                    # Preserve the existing client contract: history_state is
+                    # delivered first for a newly committed stroke. The native
+                    # reconnect code still receives stroke_ack immediately after.
+                    if stroke is not None and client_kind == "native":
+                        await websocket.send_json({"type": "stroke_ack", "ids": [stroke_id]})
+
+                elif message_type == "reconcile_strokes":
+                    strokes_raw = message.get("strokes", [])
+                    if not isinstance(strokes_raw, list) or len(strokes_raw) > MAX_SELECTION_STROKES:
+                        raise ValueError("invalid reconnect stroke collection")
+                    reconciled = [sanitize_stroke(raw_stroke) for raw_stroke in strokes_raw]
+                    ids = [stroke["id"] for stroke in reconciled]
+                    if len(ids) != len(set(ids)):
+                        raise ValueError("duplicate reconnect stroke ids")
+
+                    restored: list[dict[str, Any]] = []
+                    replaced: list[dict[str, Any]] = []
+                    history_changed = False
+                    async with state_lock:
+                        for final_stroke in reconciled:
+                            stroke_id = final_stroke["id"]
+                            existing = state["strokes"].get(stroke_id)
+                            was_pending = stroke_id in pending_stroke_history
+
+                            if existing is None:
+                                state["strokes"][stroke_id] = final_stroke
+                                pending_stroke_history.discard(stroke_id)
+                                push_history({"type": "add", "strokes": [copy.deepcopy(final_stroke)]})
+                                restored.append(copy.deepcopy(final_stroke))
+                                history_changed = True
+                            elif existing != final_stroke:
+                                before = copy.deepcopy(existing)
+                                state["strokes"][stroke_id] = final_stroke
+                                pending_stroke_history.discard(stroke_id)
+                                if was_pending:
+                                    push_history({"type": "add", "strokes": [copy.deepcopy(final_stroke)]})
+                                else:
+                                    push_history({
+                                        "type": "replace",
+                                        "before": [before],
+                                        "after": [copy.deepcopy(final_stroke)],
+                                    })
+                                replaced.append(copy.deepcopy(final_stroke))
+                                history_changed = True
+                            elif was_pending:
+                                pending_stroke_history.discard(stroke_id)
+                                push_history({"type": "add", "strokes": [copy.deepcopy(final_stroke)]})
+                                history_changed = True
+
+                        if reconciled:
+                            save_state_atomic()
+
+                    await websocket.send_json({"type": "reconcile_ack", "ids": ids})
+                    if restored:
+                        await broadcast({"type": "restore_strokes", "strokes": restored}, exclude=websocket)
+                    if replaced:
+                        await broadcast({"type": "replace_strokes", "strokes": replaced}, exclude=websocket)
                     if history_changed:
                         await broadcast(history_status_message())
 

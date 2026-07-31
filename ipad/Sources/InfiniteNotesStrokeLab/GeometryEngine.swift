@@ -363,6 +363,30 @@ enum GeometryEngine {
         return best <= limit ? best : nil
     }
 
+    /// Eraser hit testing follows the rendered geometry path, never the
+    /// selection/bounding box. This is intentionally separate from selection
+    /// hit testing, where clicking inside some closed shapes is useful.
+    static func eraserHitTest(_ stroke: NoteStroke, point: CGPoint, radius: CGFloat) -> Bool {
+        let limit = max(0.1, radius) + max(0.05, CGFloat(stroke.width) / 2)
+
+        if isGeometry(stroke) {
+            let path = polyline(for: stroke, segments: 96)
+            guard let first = path.first else { return false }
+            if path.count == 1 {
+                return hypot(point.x - first.x, point.y - first.y) <= limit
+            }
+            let limitSquared = limit * limit
+            for index in 1..<path.count {
+                if segmentDistanceSquared(point, path[index - 1], path[index]) <= limitSquared {
+                    return true
+                }
+            }
+            return false
+        }
+
+        return hitTest(stroke, point: point, threshold: limit) != nil
+    }
+
     static func segmentDistanceSquared(_ point: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
         let vx = b.x - a.x
         let vy = b.y - a.y

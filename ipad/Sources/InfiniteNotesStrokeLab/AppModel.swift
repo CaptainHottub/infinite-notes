@@ -78,6 +78,13 @@ final class AppModel: ObservableObject {
     private var strokeMembership: [String: Set<Int>] = [:]
     private var pageWorkspaceStates: [Int: PageWorkspaceState] = [:]
     private var liveStrokeIDs: Set<String> = []
+    // Completed local strokes remain here until the server acknowledges them.
+    // If the socket drops after Pencil input was accepted locally, these final
+    // vector strokes are replayed before a reconnect snapshot is allowed to
+    // replace the iPad's state.
+    private var pendingCommitStrokes: [String: NoteStroke] = [:]
+    private var isReconcilingPendingStrokes = false
+    private var deferredStateRefreshReason: String?
     private var selectionClipboard: [NoteStroke] = []
     private var selectionPasteSerial = 0
 
@@ -189,7 +196,9 @@ final class AppModel: ObservableObject {
                 self.lastError = nil
                 self.reconnectWorkItem?.cancel()
                 self.reconnectWorkItem = nil
+                self.beginPendingStrokeReconciliationIfNeeded()
             case .disconnected, .failed:
+                self.isReconcilingPendingStrokes = false
                 if self.shouldReconnect { self.scheduleReconnect() }
             case .connecting:
                 break
@@ -980,9 +989,8 @@ final class AppModel: ObservableObject {
     }
 
     func beginStroke(pageIndex: Int, firstPoint: NotePoint, tool contactTool: NoteTool? = nil) -> String? {
-        guard isConnected else {
-            notice = "Drawing is disabled while disconnected"
-            return nil
+        if !isConnected {
+            notice = "Drawing offline — Pencil strokes will upload after reconnecting"
         }
         guard document.pages.indices.contains(pageIndex) else { return nil }
         let drawingTool = contactTool ?? selectedTool
@@ -1054,14 +1062,18 @@ final class AppModel: ObservableObject {
         let pages = strokeMembership[strokeID] ?? []
         beginCommitTransition(strokeID: strokeID, pages: pages)
         liveStrokeIDs.remove(strokeID)
-        let finalStroke = strokes[strokeID]
-        if let finalStroke { insertOrReplace(finalStroke) }
-        if let finalStroke, finalStroke.tool == "shape", finalStroke.recognitionSource != nil,
-           let encoded = try? JSONHelpers.object(from: finalStroke) {
-            client.sendJSONObject(["type": "stroke_end", "id": strokeID, "stroke": encoded])
-        } else {
-            client.sendJSONObject(["type": "stroke_end", "id": strokeID])
+        guard let finalStroke = strokes[strokeID] else { return }
+        insertOrReplace(finalStroke)
+        pendingCommitStrokes[strokeID] = finalStroke
+
+        // Always include the complete final vector stroke. The streamed point
+        // batches keep live collaboration responsive, while this final payload
+        // makes the commit recoverable if any earlier WebSocket frame was lost.
+        guard let encoded = try? JSONHelpers.object(from: finalStroke) else {
+            lastError = "Could not encode the completed stroke"
+            return
         }
+        client.sendJSONObject(["type": "stroke_end", "id": strokeID, "stroke": encoded])
     }
 
     func beginEraseOperation() -> String {
@@ -1148,7 +1160,13 @@ final class AppModel: ObservableObject {
                 fetchSourcePDF()
             }
         case "state_refresh":
-            fetchNotebookState(reason: message.reason ?? "sync")
+            let reason = message.reason ?? "sync"
+            if !pendingCommitStrokes.isEmpty || isReconcilingPendingStrokes {
+                deferredStateRefreshReason = reason
+                beginPendingStrokeReconciliationIfNeeded()
+            } else {
+                fetchNotebookState(reason: reason)
+            }
         case "history_state":
             canUndo = message.canUndo ?? false
             canRedo = message.canRedo ?? false
@@ -1205,13 +1223,55 @@ final class AppModel: ObservableObject {
             selectedStrokeIDs.removeAll()
             rebuildAllWorkspaceStates()
             invalidateAllPages()
+        case "stroke_ack":
+            for id in message.ids ?? [] {
+                pendingCommitStrokes.removeValue(forKey: id)
+            }
+        case "reconcile_ack":
+            for id in message.ids ?? [] {
+                pendingCommitStrokes.removeValue(forKey: id)
+            }
+            isReconcilingPendingStrokes = false
+            if pendingCommitStrokes.isEmpty {
+                let reason = deferredStateRefreshReason ?? "reconnect_reconciled"
+                deferredStateRefreshReason = nil
+                fetchNotebookState(reason: reason)
+            } else {
+                beginPendingStrokeReconciliationIfNeeded()
+            }
         case "error":
+            if isReconcilingPendingStrokes {
+                isReconcilingPendingStrokes = false
+            }
             lastError = message.message ?? "Server error"
         case "pong", "delete_ack":
             break
         default:
             break
         }
+    }
+
+    private func beginPendingStrokeReconciliationIfNeeded() {
+        guard isConnected,
+              !isReconcilingPendingStrokes,
+              !pendingCommitStrokes.isEmpty else { return }
+
+        let ordered = pendingCommitStrokes.values.sorted { lhs, rhs in
+            let leftTime = lhs.points.first?.t ?? 0
+            let rightTime = rhs.points.first?.t ?? 0
+            if leftTime == rightTime { return lhs.id < rhs.id }
+            return leftTime < rightTime
+        }
+        guard let encoded = try? JSONHelpers.object(from: ordered) else {
+            lastError = "Could not encode disconnected Pencil progress"
+            return
+        }
+        isReconcilingPendingStrokes = true
+        notice = "Restoring disconnected Pencil progress…"
+        client.sendJSONObject([
+            "type": "reconcile_strokes",
+            "strokes": encoded,
+        ])
     }
 
     private func fetchNotebookState(reason: String) {
@@ -1273,7 +1333,11 @@ final class AppModel: ObservableObject {
 
     private func applySnapshot(_ snapshot: NotebookState, liveIDs: Set<String>) {
         document = snapshot.document
-        strokes = snapshot.strokes
+        var mergedStrokes = snapshot.strokes
+        for (id, stroke) in pendingCommitStrokes {
+            mergedStrokes[id] = stroke
+        }
+        strokes = mergedStrokes
         liveStrokeIDs = liveIDs
         selectedStrokeIDs = Set(selectedStrokeIDs.filter { strokes[$0] != nil })
         rebuildPageIndex()
@@ -1526,45 +1590,14 @@ final class AppModel: ObservableObject {
     }
 
     private static func stroke(_ stroke: NoteStroke, isWithin radius: Double, of point: CGPoint) -> Bool {
-        let threshold = radius + max(1, stroke.width / 2)
-        let thresholdSquared = threshold * threshold
-        let points = stroke.points.map { CGPoint(x: $0.x, y: $0.y) }
-        guard let first = points.first else { return false }
-        if points.count == 1 {
-            return Self.distanceSquared(first, point) <= thresholdSquared
-        }
-        for index in 1..<points.count {
-            if Self.segmentDistanceSquared(point, points[index - 1], points[index]) <= thresholdSquared {
-                return true
-            }
-        }
-        if stroke.tool == "text" || stroke.tool == "shape" {
-            let rect = points.reduce(CGRect.null) { partial, next in
-                partial.union(CGRect(x: next.x, y: next.y, width: 0.1, height: 0.1))
-            }.insetBy(dx: -threshold, dy: -threshold)
-            return rect.contains(point)
-        }
-        return false
+        GeometryEngine.eraserHitTest(
+            stroke,
+            point: point,
+            radius: CGFloat(max(0.1, radius))
+        )
     }
 
-    private static func distanceSquared(_ a: CGPoint, _ b: CGPoint) -> Double {
-        let dx = Double(a.x - b.x)
-        let dy = Double(a.y - b.y)
-        return dx * dx + dy * dy
-    }
 
-    private static func segmentDistanceSquared(_ point: CGPoint, _ a: CGPoint, _ b: CGPoint) -> Double {
-        let vx = Double(b.x - a.x)
-        let vy = Double(b.y - a.y)
-        let wx = Double(point.x - a.x)
-        let wy = Double(point.y - a.y)
-        let lengthSquared = vx * vx + vy * vy
-        if lengthSquared <= 0.000_001 { return wx * wx + wy * wy }
-        let t = max(0, min(1, (wx * vx + wy * vy) / lengthSquared))
-        let dx = Double(point.x) - (Double(a.x) + t * vx)
-        let dy = Double(point.y) - (Double(a.y) + t * vy)
-        return dx * dx + dy * dy
-    }
 }
 
 private final class WeakPageView {
