@@ -56,10 +56,10 @@ def test_reconcile_restores_a_completed_native_stroke(monkeypatch, tmp_path):
         assert websocket.receive_json()["type"] == "history_state"
 
         websocket.send_json({"type": "reconcile_strokes", "strokes": [stroke]})
-        assert websocket.receive_json() == {
-            "type": "reconcile_ack",
-            "ids": [stroke["id"]],
-        }
+        ack = websocket.receive_json()
+        assert ack["type"] == "reconcile_ack"
+        assert ack["ids"] == [stroke["id"]]
+        assert ack["stateToken"]
         history_state = websocket.receive_json()
         assert history_state["type"] == "history_state"
         assert history_state["canUndo"] is True
@@ -82,10 +82,10 @@ def test_reconcile_is_idempotent(monkeypatch, tmp_path):
 
         history_count = len(server.history)
         websocket.send_json({"type": "reconcile_strokes", "strokes": [stroke]})
-        assert websocket.receive_json() == {
-            "type": "reconcile_ack",
-            "ids": [stroke["id"]],
-        }
+        ack = websocket.receive_json()
+        assert ack["type"] == "reconcile_ack"
+        assert ack["ids"] == [stroke["id"]]
+        assert ack["stateToken"]
 
     assert len(server.state["strokes"]) == 1
     assert len(server.history) == history_count
@@ -108,10 +108,11 @@ def test_complete_stroke_end_recovers_a_missing_stroke_begin(monkeypatch, tmp_pa
         history_state = websocket.receive_json()
         assert history_state["type"] == "history_state"
         assert history_state["canUndo"] is True
-        assert websocket.receive_json() == {
-            "type": "stroke_ack",
-            "ids": [stroke["id"]],
-        }
+        ack = websocket.receive_json()
+        assert ack["type"] == "stroke_ack"
+        assert ack["ids"] == [stroke["id"]]
+        assert ack["pointCount"] == len(stroke["points"])
+        assert ack["stateToken"]
 
     assert stroke["id"] in server.state["strokes"]
     assert server.history[-1]["type"] == "add"

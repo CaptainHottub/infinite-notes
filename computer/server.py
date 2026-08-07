@@ -223,9 +223,46 @@ NATIVE_HISTORY_DELTA_FIELDS = {
 pending_delete_operations: dict[str, dict[str, Any]] = {}
 DELETE_OPERATION_STALE_SECONDS = 60.0
 
+# A reconnect token lets native clients distinguish a harmless WebSocket
+# transport reconnect from an actual notebook-state change. The per-process
+# UUID also guarantees a server restart forces one fresh state download.
+SERVER_INSTANCE_ID = uuid.uuid4().hex
+state_revision = 0
+
+
+def current_state_token() -> str:
+    return f"{SERVER_INSTANCE_ID}:{state_revision}"
+
 
 def save_state_atomic() -> None:
+    global state_revision
     write_state_atomic(state)
+    state_revision += 1
+
+
+def discard_client(websocket: WebSocket) -> None:
+    clients.discard(websocket)
+    client_roles.pop(websocket, None)
+    client_kinds.pop(websocket, None)
+
+
+async def safe_send_json(websocket: WebSocket, message: dict[str, Any]) -> bool:
+    """Send a direct reply without crashing if the peer closed first.
+
+    Campus Wi-Fi can drop the native socket between a state mutation and its
+    acknowledgement. Starlette raises RuntimeError when code then tries to send
+    after websocket.close. Treat that exactly like a disconnect; the native
+    client keeps unacknowledged work locally and reconciles it on the next socket.
+    """
+    try:
+        await websocket.send_json(message)
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        discard_client(websocket)
+        return False
+    except Exception:
+        discard_client(websocket)
+        return False
 
 
 def split_native_history_delta(
@@ -375,11 +412,18 @@ def snapshot_message(*, reason: str = "sync") -> dict[str, Any]:
 
 def state_refresh_message(*, reason: str = "sync") -> dict[str, Any]:
     """Small WebSocket notification telling native clients to fetch /api/state."""
-    return {
+    message = {
         "type": "state_refresh",
         "reason": reason,
         "serverTime": datetime.now(timezone.utc).isoformat(),
     }
+    # The token is only needed for the native initial reconnect handshake.
+    # Other state_refresh messages deliberately retain the pre-token wire
+    # format; the native client fetches /api/state for those refreshes and
+    # receives the authoritative token in that snapshot.
+    if reason == "initial":
+        message["stateToken"] = current_state_token()
+    return message
 
 
 def push_history(action: dict[str, Any]) -> None:
@@ -1363,7 +1407,9 @@ async def root() -> FileResponse:
 @app.get("/api/state")
 async def get_state() -> JSONResponse:
     async with state_lock:
-        return JSONResponse(state)
+        snapshot = copy.deepcopy(state)
+        snapshot["stateToken"] = current_state_token()
+        return JSONResponse(snapshot)
 
 
 @app.get("/api/pdf/source")
@@ -1744,8 +1790,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 else snapshot_message(reason="initial")
             )
         initial_message["clientRole"] = role
-        await websocket.send_json(initial_message)
-        await websocket.send_json(initial_history)
+        if not await safe_send_json(websocket, initial_message):
+            return
+        if not await safe_send_json(websocket, initial_history):
+            return
 
         while True:
             raw_text = await websocket.receive_text()
@@ -1822,7 +1870,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     # delivered first for a newly committed stroke. The native
                     # reconnect code still receives stroke_ack immediately after.
                     if stroke is not None and client_kind == "native":
-                        await websocket.send_json({"type": "stroke_ack", "ids": [stroke_id]})
+                        ack_sent = await safe_send_json(websocket, {
+                            "type": "stroke_ack",
+                            "ids": [stroke_id],
+                            "pointCount": len(stroke.get("points", [])),
+                            "stateToken": current_state_token(),
+                        })
+                        if not ack_sent:
+                            break
 
                 elif message_type == "reconcile_strokes":
                     strokes_raw = message.get("strokes", [])
@@ -1870,13 +1925,19 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         if reconciled:
                             save_state_atomic()
 
-                    await websocket.send_json({"type": "reconcile_ack", "ids": ids})
+                    reconcile_ack_sent = await safe_send_json(websocket, {
+                        "type": "reconcile_ack",
+                        "ids": ids,
+                        "stateToken": current_state_token(),
+                    })
                     if restored:
                         await broadcast({"type": "restore_strokes", "strokes": restored}, exclude=websocket)
                     if replaced:
                         await broadcast({"type": "replace_strokes", "strokes": replaced}, exclude=websocket)
                     if history_changed:
                         await broadcast(history_status_message())
+                    if not reconcile_ack_sent:
+                        break
 
                 elif message_type == "add_strokes":
                     strokes_raw = message.get("strokes", [])
@@ -1973,15 +2034,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             history_changed = True
 
                         save_state_atomic()
-
-                    acknowledgement = {"type": "delete_ack", "ids": ids, "final": final}
+                    acknowledgement = {
+                        "type": "delete_ack",
+                        "ids": ids,
+                        "final": final,
+                    }
+                    # Reconnect state tokens are a native-iPad protocol detail.
+                    # Browser/desktop clients keep the original exact ACK shape.
+                    if client_kind == "native":
+                        acknowledgement["stateToken"] = current_state_token()
                     if operation_id:
                         acknowledgement["operationId"] = operation_id
-                    await websocket.send_json(acknowledgement)
+                    delete_ack_sent = await safe_send_json(websocket, acknowledgement)
                     if ids:
                         await broadcast({"type": "delete_strokes", "ids": ids}, exclude=websocket)
                     if history_changed:
                         await broadcast(history_status_message())
+                    if not delete_ack_sent:
+                        break
 
                 elif message_type == "sync_request":
                     async with state_lock:
@@ -1991,8 +2061,10 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             if client_kind == "native"
                             else snapshot_message(reason="manual_sync")
                         )
-                    await websocket.send_json(requested_message)
-                    await websocket.send_json(requested_history)
+                    if not await safe_send_json(websocket, requested_message):
+                        break
+                    if not await safe_send_json(websocket, requested_history):
+                        break
 
                 elif message_type == "clear_strokes":
                     async with state_lock:
@@ -2021,13 +2093,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     await broadcast(history_status_message())
 
                 elif message_type == "ping":
-                    await websocket.send_json({"type": "pong", "clientTime": message.get("clientTime")})
+                    if not await safe_send_json(websocket, {
+                        "type": "pong",
+                        "clientTime": message.get("clientTime"),
+                    }):
+                        break
 
                 else:
-                    await websocket.send_json({"type": "error", "message": "Unknown message type"})
+                    if not await safe_send_json(websocket, {
+                        "type": "error",
+                        "message": "Unknown message type",
+                    }):
+                        break
 
             except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
-                await websocket.send_json({"type": "error", "message": str(exc)})
+                if not await safe_send_json(websocket, {"type": "error", "message": str(exc)}):
+                    break
 
     except WebSocketDisconnect:
         pass

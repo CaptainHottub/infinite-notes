@@ -23,8 +23,11 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     private var session: URLSession!
     private var task: URLSessionWebSocketTask?
     private let sendQueue = DispatchQueue(label: "InfiniteNotesNative.WebSocketSend")
+    private let heartbeatQueue = DispatchQueue(label: "InfiniteNotesNative.WebSocketHeartbeat")
     private let stateLock = NSLock()
+    private var heartbeatTimer: DispatchSourceTimer?
     private var explicitlyDisconnected = false
+    private static let heartbeatInterval: TimeInterval = 8
 
     override init() {
         super.init()
@@ -74,6 +77,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
             defer { task = nil }
             return task
         }
+        stopHeartbeat()
         oldTask?.cancel(with: .goingAway, reason: nil)
         if notify {
             notifyStatus(.disconnected)
@@ -104,6 +108,43 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     func ping() {
         let milliseconds = Date().timeIntervalSince1970 * 1000
         sendJSONObject(["type": "ping", "clientTime": milliseconds])
+    }
+
+    private func startHeartbeat(for targetTask: URLSessionWebSocketTask) {
+        heartbeatQueue.async { [weak self, weak targetTask] in
+            guard let self, let targetTask else { return }
+            self.heartbeatTimer?.cancel()
+
+            let timer = DispatchSource.makeTimerSource(queue: self.heartbeatQueue)
+            timer.schedule(
+                deadline: .now() + Self.heartbeatInterval,
+                repeating: Self.heartbeatInterval,
+                leeway: .milliseconds(500)
+            )
+            timer.setEventHandler { [weak self, weak targetTask] in
+                guard let self, let targetTask,
+                      self.withConnectionState({ self.task === targetTask }) else { return }
+                // A real WebSocket ping keeps enterprise Wi-Fi/NAT mappings alive
+                // without triggering a notebook sync or application message.
+                targetTask.sendPing { [weak self, weak targetTask] error in
+                    guard let self, let targetTask, let error else { return }
+                    self.failCurrentConnection(
+                        targetTask,
+                        message: "Heartbeat failed: \(error.localizedDescription)"
+                    )
+                }
+            }
+            self.heartbeatTimer = timer
+            timer.resume()
+        }
+    }
+
+    private func stopHeartbeat() {
+        heartbeatQueue.async { [weak self] in
+            guard let self else { return }
+            self.heartbeatTimer?.cancel()
+            self.heartbeatTimer = nil
+        }
     }
 
     private func receiveNext(from task: URLSessionWebSocketTask) {
@@ -146,6 +187,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
             return !explicitlyDisconnected
         }
         guard shouldNotify else { return }
+        stopHeartbeat()
         failedTask.cancel(with: .goingAway, reason: nil)
         notifyStatus(.failed(message))
     }
@@ -162,6 +204,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         didOpenWithProtocol protocol: String?
     ) {
         guard withConnectionState({ task === webSocketTask }) else { return }
+        startHeartbeat(for: webSocketTask)
         notifyStatus(.connected)
     }
 
@@ -177,6 +220,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
             return !explicitlyDisconnected
         }
         if shouldNotify {
+            stopHeartbeat()
             let detail = reason.flatMap { String(data: $0, encoding: .utf8) }
             let suffix = detail.map { ": \($0)" } ?? ""
             notifyStatus(.failed("Connection closed (\(closeCode.rawValue))\(suffix)"))

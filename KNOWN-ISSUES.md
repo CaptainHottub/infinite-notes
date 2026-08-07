@@ -36,3 +36,12 @@ Native Pencil strokes can continue while disconnected and remain in a local pend
 ## Previously applied viewport fix
 
 The off-page workspace relayout now resets the zoom view before changing the document frame/content size, suppresses callbacks during the transient layout, and restores the PDF-relative viewport anchor afterward. This still needs continued on-device observation.
+
+
+## Campus Wi-Fi reconnect loop — fix under test
+
+- On the university Wi-Fi, the native iPad WebSocket could periodically drop and reconnect.
+- Every native reconnect previously triggered a full `/api/state` and source-PDF refresh, even when notebook state had not changed.
+- A dropped socket could also close between committing a stroke and `stroke_ack`, causing the server to log `Unexpected ASGI message 'websocket.send', after sending 'websocket.close'`.
+- The current fix adds WebSocket heartbeats, safe acknowledgements, reconnect state tokens, and server point-count verification before the iPad discards locally pending ink.
+- Continue testing this on the university Wi-Fi before considering the networking issue closed.

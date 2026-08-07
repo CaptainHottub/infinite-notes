@@ -85,6 +85,7 @@ final class AppModel: ObservableObject {
     private var pendingCommitStrokes: [String: NoteStroke] = [:]
     private var isReconcilingPendingStrokes = false
     private var deferredStateRefreshReason: String?
+    private var lastAppliedStateToken: String?
     // Keep reconnect payloads comfortably below common WebSocket frame limits.
     // Sending the entire offline queue in one JSON message can create a permanent
     // reconnect loop: the peer closes the oversized socket, then the client sends
@@ -1177,6 +1178,13 @@ final class AppModel: ObservableObject {
             if !pendingCommitStrokes.isEmpty || isReconcilingPendingStrokes {
                 deferredStateRefreshReason = reason
                 beginPendingStrokeReconciliationIfNeeded()
+            } else if reason == "initial",
+                      let incomingToken = message.stateToken,
+                      incomingToken == lastAppliedStateToken {
+                // A campus-Wi-Fi transport reconnect should not automatically
+                // re-download and reapply the complete notebook/PDF when the
+                // server state did not change while the socket was away.
+                notice = "Reconnected"
             } else {
                 fetchNotebookState(reason: reason)
             }
@@ -1244,12 +1252,31 @@ final class AppModel: ObservableObject {
             rebuildAllWorkspaceStates()
             invalidateAllPages()
         case "stroke_ack":
-            for id in message.ids ?? [] {
+            let acknowledgedIDs = message.ids ?? []
+            for id in acknowledgedIDs {
+                if acknowledgedIDs.count == 1,
+                   let expected = pendingCommitStrokes[id],
+                   let serverPointCount = message.pointCount,
+                   serverPointCount != expected.points.count {
+                    // Never discard the local authoritative final stroke when
+                    // the server only received a partial streamed version.
+                    notice = "Repairing an incomplete stroke after reconnect…"
+                    continue
+                }
                 pendingCommitStrokes.removeValue(forKey: id)
+            }
+            if let token = message.stateToken {
+                lastAppliedStateToken = token
+            }
+            if acknowledgedIDs.contains(where: { pendingCommitStrokes[$0] != nil }) {
+                beginPendingStrokeReconciliationIfNeeded()
             }
         case "reconcile_ack":
             for id in message.ids ?? [] {
                 pendingCommitStrokes.removeValue(forKey: id)
+            }
+            if let token = message.stateToken {
+                lastAppliedStateToken = token
             }
             isReconcilingPendingStrokes = false
             if pendingCommitStrokes.isEmpty {
@@ -1264,7 +1291,11 @@ final class AppModel: ObservableObject {
                 isReconcilingPendingStrokes = false
             }
             lastError = message.message ?? "Server error"
-        case "pong", "delete_ack":
+        case "delete_ack":
+            if let token = message.stateToken {
+                lastAppliedStateToken = token
+            }
+        case "pong":
             break
         default:
             break
@@ -1380,6 +1411,9 @@ final class AppModel: ObservableObject {
 
     private func applySnapshot(_ snapshot: NotebookState, liveIDs: Set<String>) {
         document = snapshot.document
+        if let token = snapshot.stateToken {
+            lastAppliedStateToken = token
+        }
         var mergedStrokes = snapshot.strokes
         for (id, stroke) in pendingCommitStrokes {
             mergedStrokes[id] = stroke
