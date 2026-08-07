@@ -211,12 +211,60 @@ redo_history: list[dict[str, Any]] = []
 pending_stroke_history: set[str] = set()
 MAX_HISTORY_ACTIONS = 250
 MAX_SELECTION_STROKES = 50_000
+# History deltas should remain comfortably below the native WebSocket frame
+# threshold. Large undo/redo operations are split into these smaller logical
+# deltas instead of forcing the iPad to download the complete notebook state.
+NATIVE_HISTORY_DELTA_TARGET_BYTES = 512 * 1024
+NATIVE_HISTORY_DELTA_FIELDS = {
+    "restore_strokes": "strokes",
+    "replace_strokes": "strokes",
+    "delete_strokes": "ids",
+}
 pending_delete_operations: dict[str, dict[str, Any]] = {}
 DELETE_OPERATION_STALE_SECONDS = 60.0
 
 
 def save_state_atomic() -> None:
     write_state_atomic(state)
+
+
+def split_native_history_delta(
+    message: dict[str, Any],
+    *,
+    target_bytes: int = NATIVE_HISTORY_DELTA_TARGET_BYTES,
+) -> list[dict[str, Any]] | None:
+    """Split one large history delta without changing its semantics.
+
+    Returning ``None`` means the message is not a chunkable history delta. A
+    single very large stroke may still exceed the WebSocket hard limit; the
+    caller keeps the existing state-refresh recovery path for that rare case.
+    """
+    field = NATIVE_HISTORY_DELTA_FIELDS.get(str(message.get("type", "")))
+    if field is None:
+        return None
+    values = message.get(field)
+    if not isinstance(values, list):
+        return None
+    if not values:
+        return [copy.deepcopy(message)]
+
+    envelope = {key: copy.deepcopy(value) for key, value in message.items() if key != field}
+    batches: list[dict[str, Any]] = []
+    current: list[Any] = []
+
+    for value in values:
+        candidate = current + [value]
+        candidate_message = {**envelope, field: candidate}
+        candidate_size = len(json.dumps(candidate_message, separators=(",", ":")).encode("utf-8"))
+        if current and candidate_size > target_bytes:
+            batches.append({**envelope, field: current})
+            current = [value]
+        else:
+            current = candidate
+
+    if current:
+        batches.append({**envelope, field: current})
+    return batches
 
 
 async def broadcast(
@@ -233,6 +281,17 @@ async def broadcast(
         state_refresh_message(reason=f"oversized_{message.get('type', 'update')}"),
         separators=(",", ":"),
     )
+    native_delta_payloads: list[str] | None = None
+    if encoded_size > MAX_NATIVE_WS_MESSAGE_BYTES:
+        split_messages = split_native_history_delta(message)
+        if split_messages is not None:
+            candidate_payloads = [
+                json.dumps(part, separators=(",", ":")) for part in split_messages
+            ]
+            if all(len(payload.encode("utf-8")) <= MAX_NATIVE_WS_MESSAGE_BYTES
+                   for payload in candidate_payloads):
+                native_delta_payloads = candidate_payloads
+
     dead: list[WebSocket] = []
     for ws in list(clients):
         if ws is exclude:
@@ -241,7 +300,11 @@ async def broadcast(
             continue
         try:
             if client_kinds.get(ws) == "native" and encoded_size > MAX_NATIVE_WS_MESSAGE_BYTES:
-                await ws.send_text(native_refresh)
+                if native_delta_payloads is not None:
+                    for payload in native_delta_payloads:
+                        await ws.send_text(payload)
+                else:
+                    await ws.send_text(native_refresh)
             else:
                 await ws.send_text(encoded)
         except Exception:

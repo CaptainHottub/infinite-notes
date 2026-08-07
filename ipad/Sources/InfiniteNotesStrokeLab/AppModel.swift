@@ -1355,7 +1355,13 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
                     self.applySnapshot(snapshot, liveIDs: [])
-                    self.notice = reason == "project_import" ? "Project loaded" : "Notebook synchronized"
+                    if reason == "project_import" {
+                        self.notice = "Project loaded"
+                    } else if reason == "page_mutation" {
+                        self.notice = "Page updated"
+                    } else {
+                        self.notice = "Notebook synchronized"
+                    }
                     self.lastError = nil
                     if !snapshot.document.pages.isEmpty {
                         self.fetchSourcePDF()
@@ -1471,6 +1477,23 @@ final class AppModel: ObservableObject {
             if !(200..<300).contains(http.statusCode) {
                 let detail = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["detail"] as? String
                 Task { @MainActor in self.lastError = detail ?? "Page update failed (HTTP \(http.statusCode))" }
+                return
+            }
+
+            // The HTTP mutation response is authoritative. Previously the iPad
+            // waited for document_changed over WebSocket; if that notification
+            // was delayed or missed, Add Page Below appeared to do nothing even
+            // though the server had already modified the PDF. Refresh the state
+            // after every successful page mutation and preserve the returned page
+            // as the navigation target.
+            let payload = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let pageNumber = (payload?["pageNumber"] as? NSNumber)?.intValue
+            Task { @MainActor in
+                if let pageNumber, pageNumber > 0 {
+                    self.currentPageNumber = pageNumber
+                }
+                self.lastError = nil
+                self.fetchNotebookState(reason: "page_mutation")
             }
         }.resume()
     }
