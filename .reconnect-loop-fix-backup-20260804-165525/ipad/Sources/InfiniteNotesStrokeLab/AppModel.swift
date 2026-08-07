@@ -85,12 +85,6 @@ final class AppModel: ObservableObject {
     private var pendingCommitStrokes: [String: NoteStroke] = [:]
     private var isReconcilingPendingStrokes = false
     private var deferredStateRefreshReason: String?
-    // Keep reconnect payloads comfortably below common WebSocket frame limits.
-    // Sending the entire offline queue in one JSON message can create a permanent
-    // reconnect loop: the peer closes the oversized socket, then the client sends
-    // the exact same oversized message on the replacement socket.
-    private static let maximumReconciliationBatchStrokes = 12
-    private static let maximumReconciliationBatchBytes = 512 * 1024
     private var selectionClipboard: [NoteStroke] = []
     private var selectionPasteSerial = 0
 
@@ -1072,21 +1066,14 @@ final class AppModel: ObservableObject {
         insertOrReplace(finalStroke)
         pendingCommitStrokes[strokeID] = finalStroke
 
-        // WebSocket delivery is ordered and reliable while this connection is
-        // alive, so ordinary ink does not need to repeat every sample again in
-        // stroke_end. If the connection dies before acknowledgement, the final
-        // local stroke remains in pendingCommitStrokes and is replayed in bounded
-        // batches after reconnecting. Recognized geometry must still replace the
-        // streamed freehand stroke, but its final payload contains only 2–3 points.
-        var message: [String: Any] = ["type": "stroke_end", "id": strokeID]
-        if finalStroke.tool == "shape" || finalStroke.tool == "text" {
-            guard let encoded = try? JSONHelpers.object(from: finalStroke) else {
-                lastError = "Could not encode the completed stroke"
-                return
-            }
-            message["stroke"] = encoded
+        // Always include the complete final vector stroke. The streamed point
+        // batches keep live collaboration responsive, while this final payload
+        // makes the commit recoverable if any earlier WebSocket frame was lost.
+        guard let encoded = try? JSONHelpers.object(from: finalStroke) else {
+            lastError = "Could not encode the completed stroke"
+            return
         }
-        client.sendJSONObject(message)
+        client.sendJSONObject(["type": "stroke_end", "id": strokeID, "stroke": encoded])
     }
 
     func beginEraseOperation() -> String {
@@ -1190,13 +1177,6 @@ final class AppModel: ObservableObject {
                     strokes.removeAll()
                     liveStrokeIDs.removeAll()
                     selectedStrokeIDs.removeAll()
-                    // Pending commits belong to the previous document. Replaying
-                    // them into a newly opened PDF is both incorrect and can keep
-                    // a previously oversized reconnect payload alive forever.
-                    pendingCommitStrokes.removeAll()
-                    pendingPointBatches.removeAll()
-                    isReconcilingPendingStrokes = false
-                    deferredStateRefreshReason = nil
                 }
                 rebuildPageIndex()
                 rebuildAllWorkspaceStates()
@@ -1282,33 +1262,12 @@ final class AppModel: ObservableObject {
             if leftTime == rightTime { return lhs.id < rhs.id }
             return leftTime < rightTime
         }
-
-        var batch: [NoteStroke] = []
-        var estimatedBytes = 96 // envelope and JSON punctuation
-        for stroke in ordered {
-            guard let strokeData = try? JSONHelpers.encoder.encode(stroke) else {
-                lastError = "Could not encode disconnected Pencil progress"
-                return
-            }
-            let projectedBytes = estimatedBytes + strokeData.count + (batch.isEmpty ? 0 : 1)
-            if !batch.isEmpty,
-               (batch.count >= Self.maximumReconciliationBatchStrokes ||
-                projectedBytes > Self.maximumReconciliationBatchBytes) {
-                break
-            }
-            batch.append(stroke)
-            estimatedBytes = projectedBytes
-        }
-
-        guard !batch.isEmpty,
-              let encoded = try? JSONHelpers.object(from: batch) else {
+        guard let encoded = try? JSONHelpers.object(from: ordered) else {
             lastError = "Could not encode disconnected Pencil progress"
             return
         }
         isReconcilingPendingStrokes = true
-        notice = pendingCommitStrokes.count == batch.count
-            ? "Restoring disconnected Pencil progress…"
-            : "Restoring disconnected Pencil progress (\(batch.count) of \(pendingCommitStrokes.count))…"
+        notice = "Restoring disconnected Pencil progress…"
         client.sendJSONObject([
             "type": "reconcile_strokes",
             "strokes": encoded,

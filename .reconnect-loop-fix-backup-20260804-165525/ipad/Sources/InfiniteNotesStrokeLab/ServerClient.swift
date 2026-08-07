@@ -23,7 +23,6 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     private var session: URLSession!
     private var task: URLSessionWebSocketTask?
     private let sendQueue = DispatchQueue(label: "InfiniteNotesNative.WebSocketSend")
-    private let stateLock = NSLock()
     private var explicitlyDisconnected = false
 
     override init() {
@@ -36,7 +35,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
 
     func connect(baseURL: URL, clientID: String) {
         disconnect(notify: false)
-        withConnectionState { explicitlyDisconnected = false }
+        explicitlyDisconnected = false
 
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             notifyStatus(.failed("Invalid server address"))
@@ -59,7 +58,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         // notebook snapshot through one WebSocket message. New servers use HTTP
         // for full-state transfers, but this prevents an immediate reconnect loop.
         task.maximumMessageSize = 256 * 1024 * 1024
-        withConnectionState { self.task = task }
+        self.task = task
         task.resume()
         receiveNext(from: task)
     }
@@ -69,11 +68,9 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     }
 
     private func disconnect(notify: Bool) {
-        let oldTask = withConnectionState { () -> URLSessionWebSocketTask? in
-            explicitlyDisconnected = true
-            defer { task = nil }
-            return task
-        }
+        explicitlyDisconnected = true
+        let oldTask = task
+        task = nil
         oldTask?.cancel(with: .goingAway, reason: nil)
         if notify {
             notifyStatus(.disconnected)
@@ -81,22 +78,18 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     }
 
     func sendJSONObject(_ object: [String: Any]) {
-        // Capture the socket that owned this message. Previously queued work read
-        // self.task only when it eventually executed, allowing packets from a dead
-        // connection to spill into a newly opened socket and trigger another close.
-        guard let targetTask = withConnectionState({ task }) else { return }
-        sendQueue.async { [weak self, weak targetTask] in
-            guard let self, let targetTask,
-                  self.withConnectionState({ self.task === targetTask }) else { return }
+        sendQueue.async { [weak self] in
+            guard let self else { return }
             do {
                 let data = try JSONSerialization.data(withJSONObject: object, options: [])
                 guard let text = String(data: data, encoding: .utf8) else { return }
-                targetTask.send(.string(text)) { [weak self, weak targetTask] error in
-                    guard let self, let targetTask, let error else { return }
-                    self.failCurrentConnection(targetTask, message: error.localizedDescription)
+                self.task?.send(.string(text)) { [weak self] error in
+                    if let error {
+                        self?.notifyStatus(.failed(error.localizedDescription))
+                    }
                 }
             } catch {
-                self.failCurrentConnection(targetTask, message: "Could not encode message")
+                self.notifyStatus(.failed("Could not encode message"))
             }
         }
     }
@@ -108,8 +101,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
 
     private func receiveNext(from task: URLSessionWebSocketTask) {
         task.receive { [weak self, weak task] result in
-            guard let self, let task,
-                  self.withConnectionState({ self.task === task }) else { return }
+            guard let self, let task, task === self.task else { return }
             switch result {
             case .success(let message):
                 switch message {
@@ -128,26 +120,11 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
                 }
                 self.receiveNext(from: task)
             case .failure(let error):
-                self.failCurrentConnection(task, message: error.localizedDescription)
+                if !self.explicitlyDisconnected {
+                    self.notifyStatus(.failed(error.localizedDescription))
+                }
             }
         }
-    }
-
-    private func withConnectionState<T>(_ body: () -> T) -> T {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return body()
-    }
-
-    private func failCurrentConnection(_ failedTask: URLSessionWebSocketTask, message: String) {
-        let shouldNotify = withConnectionState { () -> Bool in
-            guard task === failedTask else { return false }
-            task = nil
-            return !explicitlyDisconnected
-        }
-        guard shouldNotify else { return }
-        failedTask.cancel(with: .goingAway, reason: nil)
-        notifyStatus(.failed(message))
     }
 
     private func notifyStatus(_ status: Status) {
@@ -161,7 +138,6 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         webSocketTask: URLSessionWebSocketTask,
         didOpenWithProtocol protocol: String?
     ) {
-        guard withConnectionState({ task === webSocketTask }) else { return }
         notifyStatus(.connected)
     }
 
@@ -171,15 +147,10 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
         reason: Data?
     ) {
-        let shouldNotify = withConnectionState { () -> Bool in
-            guard webSocketTask === task else { return false }
-            task = nil
-            return !explicitlyDisconnected
-        }
-        if shouldNotify {
-            let detail = reason.flatMap { String(data: $0, encoding: .utf8) }
-            let suffix = detail.map { ": \($0)" } ?? ""
-            notifyStatus(.failed("Connection closed (\(closeCode.rawValue))\(suffix)"))
+        guard webSocketTask === task else { return }
+        task = nil
+        if !explicitlyDisconnected {
+            notifyStatus(.disconnected)
         }
     }
 }
