@@ -29,6 +29,7 @@ Thumbs.db
 
 # Logs, archives and local backups
 *.log
+/computer/logs/
 *.bak
 *.backup
 backups/

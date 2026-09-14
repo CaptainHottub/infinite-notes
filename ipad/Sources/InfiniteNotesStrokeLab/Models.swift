@@ -483,6 +483,7 @@ struct DocumentInfo: Codable, Equatable {
 
 struct NotebookState: Codable {
     var version: Int?
+    var documentRevision: Int?
     var document: DocumentInfo
     var strokes: [String: NoteStroke]
     var stateToken: String?
@@ -494,6 +495,8 @@ struct ServerEnvelope: Decodable {
     var liveStrokeIds: [String]?
     var reason: String?
     var clientRole: String?
+    var debugEnabled: Bool?
+    var sessionId: String?
 
     var document: DocumentInfo?
     var clearStrokes: Bool?
@@ -507,6 +510,7 @@ struct ServerEnvelope: Decodable {
     var ids: [String]?
     var pointCount: Int?
     var stateToken: String?
+    var documentRevision: Int?
 
     var canUndo: Bool?
     var canRedo: Bool?

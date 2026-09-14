@@ -60,6 +60,7 @@ def test_reconcile_restores_a_completed_native_stroke(monkeypatch, tmp_path):
         assert ack["type"] == "reconcile_ack"
         assert ack["ids"] == [stroke["id"]]
         assert ack["stateToken"]
+        assert ack["documentRevision"] == 1
         history_state = websocket.receive_json()
         assert history_state["type"] == "history_state"
         assert history_state["canUndo"] is True

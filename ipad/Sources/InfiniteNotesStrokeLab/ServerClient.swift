@@ -38,6 +38,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     }
 
     func connect(baseURL: URL, clientID: String) {
+        DebugSessionLogger.shared.event("connection", "connect_requested", fields: ["clientId": clientID])
         disconnect(notify: false)
         withConnectionState { explicitlyDisconnected = false }
 
@@ -72,6 +73,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     }
 
     private func disconnect(notify: Bool) {
+        DebugSessionLogger.shared.event("connection", "disconnect_requested", fields: ["notify": notify])
         let oldTask = withConnectionState { () -> URLSessionWebSocketTask? in
             explicitlyDisconnected = true
             defer { task = nil }
@@ -95,6 +97,11 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
             do {
                 let data = try JSONSerialization.data(withJSONObject: object, options: [])
                 guard let text = String(data: data, encoding: .utf8) else { return }
+                DebugSessionLogger.shared.protocolEvent(
+                    direction: "tx",
+                    object: object,
+                    byteCount: data.count
+                )
                 targetTask.send(.string(text)) { [weak self, weak targetTask] error in
                     guard let self, let targetTask, let error else { return }
                     self.failCurrentConnection(targetTask, message: error.localizedDescription)
@@ -187,6 +194,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
             return !explicitlyDisconnected
         }
         guard shouldNotify else { return }
+        DebugSessionLogger.shared.event("connection", "failed", fields: ["reason": message])
         stopHeartbeat()
         failedTask.cancel(with: .goingAway, reason: nil)
         notifyStatus(.failed(message))
@@ -204,6 +212,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         didOpenWithProtocol protocol: String?
     ) {
         guard withConnectionState({ task === webSocketTask }) else { return }
+        DebugSessionLogger.shared.event("connection", "opened")
         startHeartbeat(for: webSocketTask)
         notifyStatus(.connected)
     }
@@ -223,6 +232,11 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
             stopHeartbeat()
             let detail = reason.flatMap { String(data: $0, encoding: .utf8) }
             let suffix = detail.map { ": \($0)" } ?? ""
+            DebugSessionLogger.shared.event(
+                "connection",
+                "closed",
+                fields: ["closeCode": closeCode.rawValue]
+            )
             notifyStatus(.failed("Connection closed (\(closeCode.rawValue))\(suffix)"))
         }
     }

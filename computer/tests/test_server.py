@@ -182,6 +182,7 @@ async def test_oversized_native_broadcast_falls_back_to_state_refresh():
         "type": "state_refresh",
         "reason": "oversized_replace_strokes",
         "serverTime": websocket.messages[0]["serverTime"],
+        "documentRevision": server.current_document_revision(),
     }]
 
 def test_undo_and_redo_stroke():

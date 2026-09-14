@@ -198,6 +198,11 @@ final class AppModel: ObservableObject {
         client.onStatus = { [weak self] status in
             guard let self else { return }
             self.connectionStatus = status
+            DebugSessionLogger.shared.event(
+                "connection",
+                "status_changed",
+                fields: ["status": status.label, "pendingStrokeCount": self.pendingCommitStrokes.count]
+            )
             switch status {
             case .connected:
                 self.lastError = nil
@@ -1157,6 +1162,17 @@ final class AppModel: ObservableObject {
         guard let data = text.data(using: .utf8) else { return }
         do {
             let message = try JSONHelpers.decoder.decode(ServerEnvelope.self, from: data)
+            if message.type == "state_refresh", message.reason == "initial" {
+                DebugSessionLogger.shared.configure(
+                    enabled: message.debugEnabled == true,
+                    sessionID: message.sessionId
+                )
+            }
+            DebugSessionLogger.shared.protocolEvent(
+                direction: "rx",
+                envelope: message,
+                byteCount: data.count
+            )
             handle(message)
         } catch {
             lastError = "The server sent an unsupported message"
@@ -1175,7 +1191,19 @@ final class AppModel: ObservableObject {
             }
         case "state_refresh":
             let reason = message.reason ?? "sync"
+            DebugSessionLogger.shared.event(
+                "sync",
+                "state_refresh_received",
+                fields: [
+                    "reason": reason,
+                    "pendingStrokeCount": pendingCommitStrokes.count,
+                    "reconciling": isReconcilingPendingStrokes,
+                    "stateToken": message.stateToken ?? "",
+                    "documentRevision": message.documentRevision ?? 0,
+                ]
+            )
             if !pendingCommitStrokes.isEmpty || isReconcilingPendingStrokes {
+                DebugSessionLogger.shared.event("sync", "state_refresh_deferred", fields: ["reason": reason])
                 deferredStateRefreshReason = reason
                 beginPendingStrokeReconciliationIfNeeded()
             } else if reason == "initial",
@@ -1185,6 +1213,7 @@ final class AppModel: ObservableObject {
                 // re-download and reapply the complete notebook/PDF when the
                 // server state did not change while the socket was away.
                 notice = "Reconnected"
+                DebugSessionLogger.shared.event("sync", "state_fetch_skipped_matching_token", fields: ["stateToken": incomingToken])
             } else {
                 fetchNotebookState(reason: reason)
             }
@@ -1271,6 +1300,16 @@ final class AppModel: ObservableObject {
             if acknowledgedIDs.contains(where: { pendingCommitStrokes[$0] != nil }) {
                 beginPendingStrokeReconciliationIfNeeded()
             }
+            DebugSessionLogger.shared.event(
+                "ack",
+                "stroke_ack_applied",
+                fields: [
+                    "idCount": acknowledgedIDs.count,
+                    "pendingStrokeCount": pendingCommitStrokes.count,
+                    "stateToken": message.stateToken ?? "",
+                    "documentRevision": message.documentRevision ?? 0,
+                ]
+            )
         case "reconcile_ack":
             for id in message.ids ?? [] {
                 pendingCommitStrokes.removeValue(forKey: id)
@@ -1279,6 +1318,16 @@ final class AppModel: ObservableObject {
                 lastAppliedStateToken = token
             }
             isReconcilingPendingStrokes = false
+            DebugSessionLogger.shared.event(
+                "reconciliation",
+                "batch_acknowledged",
+                fields: [
+                    "idCount": message.ids?.count ?? 0,
+                    "pendingStrokeCount": pendingCommitStrokes.count,
+                    "stateToken": message.stateToken ?? "",
+                    "documentRevision": message.documentRevision ?? 0,
+                ]
+            )
             if pendingCommitStrokes.isEmpty {
                 let reason = deferredStateRefreshReason ?? "reconnect_reconciled"
                 deferredStateRefreshReason = nil
@@ -1337,6 +1386,15 @@ final class AppModel: ObservableObject {
             return
         }
         isReconcilingPendingStrokes = true
+        DebugSessionLogger.shared.event(
+            "reconciliation",
+            "batch_started",
+            fields: [
+                "batchStrokeCount": batch.count,
+                "pendingStrokeCount": pendingCommitStrokes.count,
+                "estimatedByteCount": estimatedBytes,
+            ]
+        )
         notice = pendingCommitStrokes.count == batch.count
             ? "Restoring disconnected Pencil progress…"
             : "Restoring disconnected Pencil progress (\(batch.count) of \(pendingCommitStrokes.count))…"
@@ -1355,6 +1413,12 @@ final class AppModel: ObservableObject {
         stateFetchTask?.cancel()
         stateFetchGeneration &+= 1
         let generation = stateFetchGeneration
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        DebugSessionLogger.shared.event(
+            "sync",
+            "state_fetch_started",
+            fields: ["reason": reason, "generation": generation, "pendingStrokeCount": pendingCommitStrokes.count]
+        )
 
         var request = URLRequest(url: stateURL)
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
@@ -1367,6 +1431,11 @@ final class AppModel: ObservableObject {
                 if (error as NSError).code == NSURLErrorCancelled { return }
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
+                    DebugSessionLogger.shared.event(
+                        "sync",
+                        "state_fetch_failed",
+                        fields: ["reason": reason, "generation": generation, "error": error.localizedDescription]
+                    )
                     self.lastError = "Notebook sync failed: \(error.localizedDescription)"
                 }
                 return
@@ -1376,6 +1445,7 @@ final class AppModel: ObservableObject {
                   let data else {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
+                    DebugSessionLogger.shared.event("sync", "state_fetch_failed", fields: ["reason": reason, "generation": generation])
                     self.lastError = "The computer did not return the notebook state"
                 }
                 return
@@ -1386,6 +1456,21 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
                     self.applySnapshot(snapshot, liveIDs: [])
+                    DebugSessionLogger.shared.event(
+                        "sync",
+                        "state_fetch_completed",
+                        fields: [
+                            "reason": reason,
+                            "generation": generation,
+                            "byteCount": data.count,
+                            "durationMs": (ProcessInfo.processInfo.systemUptime - startedAt) * 1000,
+                            "strokeCount": snapshot.strokes.count,
+                            "pageCount": snapshot.document.pages.count,
+                            "pendingStrokeCount": self.pendingCommitStrokes.count,
+                            "stateToken": snapshot.stateToken ?? "",
+                            "documentRevision": snapshot.documentRevision ?? 0,
+                        ]
+                    )
                     if reason == "project_import" {
                         self.notice = "Project loaded"
                     } else if reason == "page_mutation" {
@@ -1401,6 +1486,11 @@ final class AppModel: ObservableObject {
             } catch {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
+                    DebugSessionLogger.shared.event(
+                        "sync",
+                        "state_decode_failed",
+                        fields: ["reason": reason, "generation": generation, "byteCount": data.count]
+                    )
                     self.lastError = "Could not decode the notebook state: \(error.localizedDescription)"
                 }
             }
@@ -1495,13 +1585,18 @@ final class AppModel: ObservableObject {
             return
         }
         notice = pendingNotice
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        DebugSessionLogger.shared.event("page", "mutation_started", fields: ["path": path])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.timeoutInterval = 120
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             if let error {
-                Task { @MainActor in self.lastError = "Page update failed: \(error.localizedDescription)" }
+                Task { @MainActor in
+                    DebugSessionLogger.shared.event("page", "mutation_failed", fields: ["path": path, "error": error.localizedDescription])
+                    self.lastError = "Page update failed: \(error.localizedDescription)"
+                }
                 return
             }
             guard let http = response as? HTTPURLResponse else {
@@ -1527,6 +1622,15 @@ final class AppModel: ObservableObject {
                     self.currentPageNumber = pageNumber
                 }
                 self.lastError = nil
+                DebugSessionLogger.shared.event(
+                    "page",
+                    "mutation_completed",
+                    fields: [
+                        "path": path,
+                        "pageNumber": pageNumber ?? 0,
+                        "durationMs": (ProcessInfo.processInfo.systemUptime - startedAt) * 1000,
+                    ]
+                )
                 self.fetchNotebookState(reason: "page_mutation")
             }
         }.resume()

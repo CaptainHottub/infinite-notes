@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import copy
 import io
 import json
@@ -26,12 +27,15 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.middleware.gzip import GZipMiddleware
 
+from debug_logging import DebugEventLogger
+
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
 DATA_DIR = ROOT / "data"
 PDF_PAGES_DIR = DATA_DIR / "pdf_pages"
 STATE_FILE = DATA_DIR / "state.json"
 CURRENT_PDF = DATA_DIR / "current.pdf"
+LOGS_DIR = ROOT / "logs"
 
 MAX_PDF_BYTES = 100 * 1024 * 1024
 MAX_PDF_PAGES = 150
@@ -51,10 +55,30 @@ app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/pdf-pages", StaticFiles(directory=PDF_PAGES_DIR), name="pdf-pages")
 
+debug_log = DebugEventLogger.from_environment(LOGS_DIR)
+
+
+def debug_event(category: str, event: str, **fields: Any) -> None:
+    """Emit best-effort diagnostics without participating in product behavior."""
+    try:
+        debug_log.event(category, event, **fields)
+    except Exception:
+        pass
+
+
+def debug_protocol(direction: str, message: Any, byte_count: int, **fields: Any) -> None:
+    if not debug_log.enabled:
+        return
+    try:
+        debug_log.protocol(direction, message, byte_count=byte_count, **fields)
+    except Exception:
+        pass
+
 
 def empty_state() -> dict[str, Any]:
     return {
         "version": 1,
+        "documentRevision": 0,
         "document": {
             "filename": None,
             "pages": [],
@@ -164,6 +188,15 @@ def normalize_state_page_layout(value: dict[str, Any]) -> bool:
     return changed
 
 
+def normalize_document_revision(value: dict[str, Any]) -> bool:
+    """Migrate legacy or malformed state to a safe revision baseline."""
+    revision = value.get("documentRevision")
+    if type(revision) is int and revision >= 0:
+        return False
+    value["documentRevision"] = 0
+    return True
+
+
 def write_state_atomic(value: dict[str, Any]) -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix="state-", suffix=".json", dir=DATA_DIR)
@@ -191,7 +224,9 @@ def load_state() -> dict[str, Any]:
         value.setdefault("version", 1)
         value.setdefault("document", {"filename": None, "pages": []})
         value.setdefault("strokes", {})
-        if normalize_state_page_layout(value):
+        changed = normalize_document_revision(value)
+        changed = normalize_state_page_layout(value) or changed
+        if changed:
             write_state_atomic(value)
         return value
     except Exception as exc:
@@ -206,6 +241,7 @@ state_lock = asyncio.Lock()
 clients: set[WebSocket] = set()
 client_roles: dict[WebSocket, str] = {}
 client_kinds: dict[WebSocket, str] = {}
+client_ids: dict[WebSocket, str] = {}
 history: list[dict[str, Any]] = []
 redo_history: list[dict[str, Any]] = []
 pending_stroke_history: set[str] = set()
@@ -234,16 +270,64 @@ def current_state_token() -> str:
     return f"{SERVER_INSTANCE_ID}:{state_revision}"
 
 
-def save_state_atomic() -> None:
+def current_document_revision() -> int:
+    revision = state.get("documentRevision")
+    return revision if type(revision) is int and revision >= 0 else 0
+
+
+debug_event(
+    "lifecycle",
+    "session_started",
+    processId=os.getpid(),
+    stateToken=current_state_token(),
+)
+atexit.register(debug_log.close)
+
+
+def save_state_atomic() -> int:
     global state_revision
-    write_state_atomic(state)
+    started = time.perf_counter() if debug_log.enabled else None
+    previous_revision = state.get("documentRevision")
+    next_revision = current_document_revision() + 1
+    state["documentRevision"] = next_revision
+    if debug_log.enabled:
+        debug_event(
+            "persistence",
+            "save_started",
+            stateToken=current_state_token(),
+            strokeCount=len(state.get("strokes", {})),
+        )
+    try:
+        write_state_atomic(state)
+    except Exception:
+        if previous_revision is None:
+            state.pop("documentRevision", None)
+        else:
+            state["documentRevision"] = previous_revision
+        raise
     state_revision += 1
+    if started is not None:
+        try:
+            byte_count = STATE_FILE.stat().st_size
+        except OSError:
+            byte_count = None
+        debug_event(
+            "persistence",
+            "save_completed",
+            durationMs=round((time.perf_counter() - started) * 1000, 3),
+            byteCount=byte_count,
+            stateToken=current_state_token(),
+            documentRevision=next_revision,
+            strokeCount=len(state.get("strokes", {})),
+        )
+    return next_revision
 
 
 def discard_client(websocket: WebSocket) -> None:
     clients.discard(websocket)
     client_roles.pop(websocket, None)
     client_kinds.pop(websocket, None)
+    client_ids.pop(websocket, None)
 
 
 async def safe_send_json(websocket: WebSocket, message: dict[str, Any]) -> bool:
@@ -256,11 +340,34 @@ async def safe_send_json(websocket: WebSocket, message: dict[str, Any]) -> bool:
     """
     try:
         await websocket.send_json(message)
+        if debug_log.enabled:
+            encoded_size = len(json.dumps(message, separators=(",", ":")).encode("utf-8"))
+            debug_protocol(
+                "tx",
+                message,
+                encoded_size,
+                clientId=client_ids.get(websocket, ""),
+                clientRole=client_roles.get(websocket, ""),
+                clientKind=client_kinds.get(websocket, ""),
+                delivery="direct",
+            )
         return True
-    except (WebSocketDisconnect, RuntimeError):
+    except (WebSocketDisconnect, RuntimeError) as exc:
+        debug_event(
+            "connection",
+            "send_failed",
+            clientId=client_ids.get(websocket, ""),
+            errorType=type(exc).__name__,
+        )
         discard_client(websocket)
         return False
-    except Exception:
+    except Exception as exc:
+        debug_event(
+            "connection",
+            "send_failed",
+            clientId=client_ids.get(websocket, ""),
+            errorType=type(exc).__name__,
+        )
         discard_client(websocket)
         return False
 
@@ -330,6 +437,7 @@ async def broadcast(
                 native_delta_payloads = candidate_payloads
 
     dead: list[WebSocket] = []
+    delivered = 0
     for ws in list(clients):
         if ws is exclude:
             continue
@@ -344,12 +452,22 @@ async def broadcast(
                     await ws.send_text(native_refresh)
             else:
                 await ws.send_text(encoded)
+            delivered += 1
         except Exception:
             dead.append(ws)
     for ws in dead:
         clients.discard(ws)
         client_roles.pop(ws, None)
         client_kinds.pop(ws, None)
+        client_ids.pop(ws, None)
+    debug_protocol(
+        "tx",
+        message,
+        encoded_size,
+        delivery="broadcast",
+        recipientCount=delivered,
+        failedCount=len(dead),
+    )
 
 
 async def send_to_role(role: str, message: dict[str, Any]) -> int:
@@ -368,6 +486,16 @@ async def send_to_role(role: str, message: dict[str, Any]) -> int:
         clients.discard(ws)
         client_roles.pop(ws, None)
         client_kinds.pop(ws, None)
+        client_ids.pop(ws, None)
+    debug_protocol(
+        "tx",
+        message,
+        len(encoded.encode("utf-8")),
+        delivery="role",
+        recipientCount=delivered,
+        clientRole=role,
+        failedCount=len(dead),
+    )
     return delivered
 
 
@@ -387,6 +515,16 @@ async def send_to_kind(kind: str, message: dict[str, Any]) -> int:
         clients.discard(ws)
         client_roles.pop(ws, None)
         client_kinds.pop(ws, None)
+        client_ids.pop(ws, None)
+    debug_protocol(
+        "tx",
+        message,
+        len(encoded.encode("utf-8")),
+        delivery="kind",
+        recipientCount=delivered,
+        clientKind=kind,
+        failedCount=len(dead),
+    )
     return delivered
 
 
@@ -416,6 +554,7 @@ def state_refresh_message(*, reason: str = "sync") -> dict[str, Any]:
         "type": "state_refresh",
         "reason": reason,
         "serverTime": datetime.now(timezone.utc).isoformat(),
+        "documentRevision": current_document_revision(),
     }
     # The token is only needed for the native initial reconnect handshake.
     # Other state_refresh messages deliberately retain the pre-token wire
@@ -423,6 +562,9 @@ def state_refresh_message(*, reason: str = "sync") -> dict[str, Any]:
     # receives the authoritative token in that snapshot.
     if reason == "initial":
         message["stateToken"] = current_state_token()
+        message["debugEnabled"] = debug_log.enabled
+        if debug_log.enabled:
+            message["sessionId"] = debug_log.session_id
     return message
 
 
@@ -1406,10 +1548,22 @@ async def root() -> FileResponse:
 
 @app.get("/api/state")
 async def get_state() -> JSONResponse:
+    started = time.perf_counter()
+    debug_event("sync", "state_fetch_started")
     async with state_lock:
         snapshot = copy.deepcopy(state)
         snapshot["stateToken"] = current_state_token()
-        return JSONResponse(snapshot)
+        response = JSONResponse(snapshot)
+    debug_event(
+        "sync",
+        "state_fetch_completed",
+        durationMs=round((time.perf_counter() - started) * 1000, 3),
+        byteCount=len(response.body),
+        stateToken=snapshot.get("stateToken"),
+        strokeCount=len(snapshot.get("strokes", {})),
+        pageCount=len(snapshot.get("document", {}).get("pages", [])),
+    )
+    return response
 
 
 @app.get("/api/pdf/source")
@@ -1499,6 +1653,8 @@ def remap_strokes_after_page_insert(
 
 @app.post("/api/pages/insert")
 async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
+    started = time.perf_counter()
+    debug_event("page", "insert_started", afterPageNumber=afterPageNumber)
     async with state_lock:
         old_pages = copy.deepcopy(state.get("document", {}).get("pages", []))
         if not CURRENT_PDF.exists() or not old_pages:
@@ -1561,6 +1717,15 @@ async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
     if shifted_strokes:
         await broadcast({"type": "replace_strokes", "strokes": shifted_strokes})
     await broadcast(history_status_message())
+    debug_event(
+        "page",
+        "insert_completed",
+        durationMs=round((time.perf_counter() - started) * 1000, 3),
+        pageNumber=inserted_page_number,
+        pageCount=len(pages),
+        shiftedStrokeCount=len(shifted_strokes),
+        stateToken=current_state_token(),
+    )
     return JSONResponse({
         "ok": True,
         "document": snapshot,
@@ -1571,6 +1736,8 @@ async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
 
 @app.post("/api/pages/append")
 async def append_blank_page() -> JSONResponse:
+    started = time.perf_counter()
+    debug_event("page", "append_started")
     async with state_lock:
         if not CURRENT_PDF.exists() or not state.get("document", {}).get("pages"):
             raise HTTPException(status_code=400, detail="Open a PDF before adding a matching page")
@@ -1610,6 +1777,14 @@ async def append_blank_page() -> JSONResponse:
         "notice": f"Blank page {page_number} added",
     }
     await broadcast(message)
+    debug_event(
+        "page",
+        "append_completed",
+        durationMs=round((time.perf_counter() - started) * 1000, 3),
+        pageNumber=page_number,
+        pageCount=len(pages),
+        stateToken=current_state_token(),
+    )
     return JSONResponse({"ok": True, "document": snapshot, "pageNumber": page_number})
 
 
@@ -1725,8 +1900,12 @@ async def import_project(file: UploadFile = File(...)) -> JSONResponse:
             else:
                 clear_document_files()
 
+            previous_document_revision = current_document_revision()
             state.clear()
             state.update(imported_state)
+            # Imported archives are content, not synchronization authority. Keep
+            # the local authority's monotonic revision and advance it on save.
+            state["documentRevision"] = previous_document_revision
             history.clear()
             redo_history.clear()
             pending_stroke_history.clear()
@@ -1781,6 +1960,15 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     clients.add(websocket)
     client_roles[websocket] = role
     client_kinds[websocket] = client_kind
+    client_ids[websocket] = client_id
+    debug_event(
+        "connection",
+        "connected",
+        clientId=client_id,
+        clientRole=role,
+        clientKind=client_kind,
+        activeClientCount=len(clients),
+    )
     try:
         async with state_lock:
             initial_history = history_status_message()
@@ -1797,9 +1985,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
         while True:
             raw_text = await websocket.receive_text()
+            message_started = time.perf_counter()
             try:
                 message = json.loads(raw_text)
                 message_type = message.get("type")
+                debug_protocol(
+                    "rx",
+                    message,
+                    len(raw_text.encode("utf-8")),
+                    clientId=client_id,
+                    clientRole=role,
+                    clientKind=client_kind,
+                )
 
                 if message_type == "stroke_begin":
                     stroke = sanitize_stroke(message.get("stroke"))
@@ -1875,7 +2072,18 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             "ids": [stroke_id],
                             "pointCount": len(stroke.get("points", [])),
                             "stateToken": current_state_token(),
+                            "documentRevision": current_document_revision(),
                         })
+                        debug_event(
+                            "ack",
+                            "stroke_ack",
+                            clientId=client_id,
+                            strokeId=stroke_id,
+                            pointCount=len(stroke.get("points", [])),
+                            durationMs=round((time.perf_counter() - message_started) * 1000, 3),
+                            delivered=ack_sent,
+                            stateToken=current_state_token(),
+                        )
                         if not ack_sent:
                             break
 
@@ -1886,10 +2094,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     reconciled = [sanitize_stroke(raw_stroke) for raw_stroke in strokes_raw]
                     ids = [stroke["id"] for stroke in reconciled]
                     if len(ids) != len(set(ids)):
+                        debug_event(
+                            "reconciliation",
+                            "duplicate_ids_rejected",
+                            clientId=client_id,
+                            strokeCount=len(ids),
+                        )
                         raise ValueError("duplicate reconnect stroke ids")
 
+                    debug_event(
+                        "reconciliation",
+                        "batch_started",
+                        clientId=client_id,
+                        strokeCount=len(ids),
+                        pendingStrokeCount=len(pending_stroke_history),
+                    )
                     restored: list[dict[str, Any]] = []
                     replaced: list[dict[str, Any]] = []
+                    identical_count = 0
                     history_changed = False
                     async with state_lock:
                         for final_stroke in reconciled:
@@ -1921,6 +2143,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 pending_stroke_history.discard(stroke_id)
                                 push_history({"type": "add", "strokes": [copy.deepcopy(final_stroke)]})
                                 history_changed = True
+                            else:
+                                identical_count += 1
 
                         if reconciled:
                             save_state_atomic()
@@ -1929,7 +2153,21 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         "type": "reconcile_ack",
                         "ids": ids,
                         "stateToken": current_state_token(),
+                        "documentRevision": current_document_revision(),
                     })
+                    debug_event(
+                        "reconciliation",
+                        "batch_completed",
+                        clientId=client_id,
+                        strokeCount=len(ids),
+                        restoredCount=len(restored),
+                        replacedCount=len(replaced),
+                        duplicateCount=identical_count,
+                        pendingStrokeCount=len(pending_stroke_history),
+                        durationMs=round((time.perf_counter() - message_started) * 1000, 3),
+                        delivered=reconcile_ack_sent,
+                        stateToken=current_state_token(),
+                    )
                     if restored:
                         await broadcast({"type": "restore_strokes", "strokes": restored}, exclude=websocket)
                     if replaced:
@@ -1946,9 +2184,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     strokes = [sanitize_stroke(raw_stroke) for raw_stroke in strokes_raw]
                     ids = [stroke["id"] for stroke in strokes]
                     if len(ids) != len(set(ids)):
+                        debug_event("conflict", "duplicate_add_ids_rejected", clientId=client_id, strokeCount=len(ids))
                         raise ValueError("duplicate stroke ids")
                     async with state_lock:
                         if any(stroke_id in state["strokes"] for stroke_id in ids):
+                            debug_event("conflict", "existing_stroke_id_rejected", clientId=client_id, strokeCount=len(ids))
                             raise ValueError("stroke id already exists")
                         for stroke in strokes:
                             state["strokes"][stroke["id"]] = stroke
@@ -1966,10 +2206,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     replacements = [sanitize_stroke(raw_stroke) for raw_stroke in strokes_raw]
                     ids = [stroke["id"] for stroke in replacements]
                     if len(ids) != len(set(ids)):
+                        debug_event("conflict", "duplicate_replace_ids_rejected", clientId=client_id, strokeCount=len(ids))
                         raise ValueError("duplicate stroke ids")
                     async with state_lock:
                         missing = [stroke_id for stroke_id in ids if stroke_id not in state["strokes"]]
                         if missing:
+                            debug_event("conflict", "missing_replace_ids_rejected", clientId=client_id, missingCount=len(missing))
                             raise ValueError("cannot replace a missing stroke")
                         before = [copy.deepcopy(state["strokes"][stroke_id]) for stroke_id in ids]
                         for stroke in replacements:
@@ -2043,9 +2285,22 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     # Browser/desktop clients keep the original exact ACK shape.
                     if client_kind == "native":
                         acknowledgement["stateToken"] = current_state_token()
+                        acknowledgement["documentRevision"] = current_document_revision()
                     if operation_id:
                         acknowledgement["operationId"] = operation_id
                     delete_ack_sent = await safe_send_json(websocket, acknowledgement)
+                    debug_event(
+                        "ack",
+                        "delete_ack",
+                        clientId=client_id,
+                        idCount=len(ids),
+                        deletedCount=len(deleted),
+                        operationId=operation_id or None,
+                        final=final,
+                        durationMs=round((time.perf_counter() - message_started) * 1000, 3),
+                        delivered=delete_ack_sent,
+                        stateToken=current_state_token() if client_kind == "native" else None,
+                    )
                     if ids:
                         await broadcast({"type": "delete_strokes", "ids": ids}, exclude=websocket)
                     if history_changed:
@@ -2054,6 +2309,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         break
 
                 elif message_type == "sync_request":
+                    debug_event("sync", "request_started", clientId=client_id, clientKind=client_kind)
                     async with state_lock:
                         requested_history = history_status_message()
                         requested_message = (
@@ -2065,6 +2321,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         break
                     if not await safe_send_json(websocket, requested_history):
                         break
+                    debug_event(
+                        "sync",
+                        "request_completed",
+                        clientId=client_id,
+                        clientKind=client_kind,
+                        durationMs=round((time.perf_counter() - message_started) * 1000, 3),
+                        stateToken=current_state_token(),
+                    )
 
                 elif message_type == "clear_strokes":
                     async with state_lock:
@@ -2110,12 +2374,24 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if not await safe_send_json(websocket, {"type": "error", "message": str(exc)}):
                     break
 
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        debug_event(
+            "connection",
+            "peer_disconnected",
+            clientId=client_id,
+            closeCode=getattr(exc, "code", None),
+            closeReason=getattr(exc, "reason", None),
+        )
     finally:
-        clients.discard(websocket)
-        client_roles.pop(websocket, None)
-        client_kinds.pop(websocket, None)
+        discard_client(websocket)
+        debug_event(
+            "connection",
+            "closed",
+            clientId=client_id,
+            clientRole=role,
+            clientKind=client_kind,
+            activeClientCount=len(clients),
+        )
 
 
 def local_ipv4_addresses() -> list[str]:
@@ -2139,19 +2415,31 @@ def local_ipv4_addresses() -> list[str]:
     return sorted(addresses)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the Infinite Notes prototype")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--reload", action="store_true")
-    return parser.parse_args()
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="write one bounded diagnostic session under computer/logs",
+    )
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.debug:
+        # Uvicorn imports ``server`` as the application module. Passing debug via
+        # the environment gives that serving process exactly one session logger,
+        # and also works for the reload child process.
+        os.environ["INFINITE_NOTES_DEBUG"] = "1"
     print("\nInfinite Notes Prototype")
     print(f"Desktop: http://127.0.0.1:{args.port}/?mode=desktop")
     for address in local_ipv4_addresses():
         print(f"iPad:   http://{address}:{args.port}/?mode=ipad")
     print("\nThe iPad and laptop must be on the same private network.\n")
+    if args.debug:
+        print("Debug session enabled; logs will be written under computer/logs/.\n")
     uvicorn.run("server:app", host=args.host, port=args.port, reload=args.reload)

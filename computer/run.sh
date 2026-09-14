@@ -9,6 +9,7 @@ port="8000"
 open_browser=true
 use_hotspot=true
 reload=false
+debug=false
 server_pid=""
 hotspot_started=false
 cleanup_done=false
@@ -27,6 +28,7 @@ Options:
   --no-hotspot       Run the notes server without changing NetworkManager
   --no-open          Do not automatically open the desktop browser
   --reload           Enable Uvicorn development auto-reload
+  --debug            Enable one diagnostic session (terminal, text, and JSONL)
   -h, --help         Show this help
 
 Environment:
@@ -54,6 +56,7 @@ while (($#)); do
     --no-hotspot) use_hotspot=false ;;
     --no-open) open_browser=false ;;
     --reload) reload=true ;;
+    --debug) debug=true ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -202,6 +205,9 @@ fi
 server_args=(server.py --host "$host" --port "$port")
 if [[ "$reload" == true ]]; then
   server_args+=(--reload)
+fi
+if [[ "$debug" == true ]]; then
+  server_args+=(--debug)
 fi
 
 .venv/bin/python "${server_args[@]}" &
