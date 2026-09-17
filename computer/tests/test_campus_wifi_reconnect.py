@@ -23,6 +23,11 @@ def _reset_server(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(server, "STATE_FILE", data_dir / "state.json")
     monkeypatch.setattr(server, "CURRENT_PDF", data_dir / "current.pdf")
     server.state = server.empty_state()
+    store = server.NotebookStore(data_dir / "notebook.sqlite3")
+    store.initialize(server.state)
+    monkeypatch.setattr(server, "notebook_store", store)
+    server.stored_metadata = server.copy.deepcopy({key: value for key, value in server.state.items() if key != "strokes"})
+    server.persistence_failed = False
     server.history.clear()
     server.redo_history.clear()
     server.pending_stroke_history.clear()
@@ -47,7 +52,7 @@ def test_state_token_changes_after_saved_mutation(monkeypatch, tmp_path):
     _reset_server(monkeypatch, tmp_path)
     before = server.current_state_token()
     server.state["strokes"]["x"] = {"id": "x"}
-    server.save_state_atomic()
+    asyncio.run(server.save_state_atomic(upsert_ids={"x"}))
     assert server.current_state_token() != before
 
 
@@ -91,11 +96,23 @@ def test_native_ack_reports_server_point_count(monkeypatch, tmp_path):
         assert ack["stateToken"] == server.current_state_token()
 
 
-def test_native_client_source_contains_websocket_heartbeat_and_token_guard():
+def test_native_client_source_contains_websocket_heartbeat_and_revision_guard():
     repo_root = COMPUTER_DIR.parent
     server_client = (repo_root / "ipad/Sources/InfiniteNotesStrokeLab/ServerClient.swift").read_text()
     app_model = (repo_root / "ipad/Sources/InfiniteNotesStrokeLab/AppModel.swift").read_text()
     assert "targetTask.sendPing" in server_client
     assert "heartbeatInterval: TimeInterval = 8" in server_client
+    assert 'incomingRevision == lastAppliedDocumentRevision' in app_model
+    assert 'incomingDocumentID == lastAppliedDocumentID' in app_model
+    assert 'lastAppliedDocumentID = snapshot.documentId' in app_model
+    assert 'lastAppliedDocumentRevision = snapshot.documentRevision' in app_model
     assert 'incomingToken == lastAppliedStateToken' in app_model
+    assert 'state_fetch_skipped_matching_revision' in app_model
+    assert 'endpoint(path: "/api/changes"' in app_model
+    assert 'RevisionDeltaSafety.sameServerInstance(incomingToken, lastAppliedStateToken)' in app_model
+    assert 'fallbackRevisionChanges(reason: "local_or_live_edit")' in app_model
+    assert 'if pendingCommitStrokes.isEmpty { scheduleDeferredStateFetch() }' in app_model
+    assert 'if liveStrokeIDs.isEmpty { scheduleDeferredStateFetch() }' in app_model
+    assert 'self.syncMutationGeneration == mutationGeneration' in app_model
+    assert 'self.deferredStateRefreshReason = reason' in app_model
     assert 'serverPointCount != expected.points.count' in app_model

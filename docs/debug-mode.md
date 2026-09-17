@@ -46,21 +46,24 @@ Example JSONL record:
 ## iPad output
 
 After receiving an enabled initial debug handshake, the native app writes
-metadata to unified logging and to a rotating JSONL file inside its container:
+metadata to unified logging and to a rotating JSONL file in its shared Documents
+directory:
 
 ```text
-Library/Logs/InfiniteNotes/session-<session-id>.jsonl
-Library/Logs/InfiniteNotes/session-<session-id>.jsonl.1
+Documents/InfiniteNotes/Logs/session-<session-id>.jsonl
+Documents/InfiniteNotes/Logs/session-<session-id>.jsonl.1
 ```
 
 The active file rotates at 2 MiB and retains one backup. The in-memory queue is
 also bounded. Repeated reconnect handshakes for the same server session preserve
 the iPad event sequence.
 
-To retrieve the file from a physical iPad, use Xcode's Devices and Simulators
-window to download the Infinite Notes app container, then inspect
-`AppData/Library/Logs/InfiniteNotes`. Simulator containers can be inspected from
-the simulator's app data container.
+After installing the updated app, connect to the debug server, then browse the
+iPad's shared app files: `Infinite Notes/InfiniteNotes/Logs`. The Files app may
+also show this under **On My iPad → Infinite Notes → InfiniteNotes → Logs**.
+Alternatively, download the app container with Xcode's Devices and Simulators
+window and inspect `AppData/Documents/InfiniteNotes/Logs`. Logs from earlier app
+builds remain at `AppData/Library/Logs/InfiniteNotes` and are not moved.
 
 ## Privacy and failure behavior
 

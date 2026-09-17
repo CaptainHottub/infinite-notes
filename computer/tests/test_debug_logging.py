@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import plistlib
 import threading
 from pathlib import Path
 from unittest.mock import patch
@@ -105,11 +106,13 @@ def test_protocol_summary_uses_counts_without_walking_nested_points() -> None:
         "type": "stroke_points",
         "id": "s",
         "points": [1, 2],
+        "documentId": "de305d54-75b4-431b-adb2-eb6b9e546014",
         "documentRevision": 7,
     }) == {
         "messageType": "stroke_points",
         "strokeId": "s",
         "pointCount": 2,
+        "documentId": "de305d54-75b4-431b-adb2-eb6b9e546014",
         "documentRevision": 7,
     }
     assert protocol_summary(None) == {"messageType": "invalid"}
@@ -204,3 +207,18 @@ def test_ipad_debug_contract_avoids_second_decode_and_unbounded_dispatch() -> No
     assert "maximumPendingEvents" in logger
     assert "pendingEvents.count < maximumPendingEvents" in logger
     assert "strokes.reduce" not in logger
+
+
+def test_ipad_debug_logs_are_in_shared_documents_without_sharing_journal() -> None:
+    root = Path(__file__).resolve().parents[2] / "ipad"
+    plist = plistlib.loads((root / "Info.plist").read_bytes())
+    logger = (root / "Sources/InfiniteNotesStrokeLab/DebugSessionLogger.swift").read_text()
+    journal = (root / "Sources/InfiniteNotesStrokeLab/AppModel.swift").read_text()
+
+    assert plist["UIFileSharingEnabled"] is True
+    assert plist["LSSupportsOpeningDocumentsInPlace"] is True
+    append = logger.split("private func append(record:", 1)[1]
+    assert "for: .documentDirectory" in append
+    assert '.appendingPathComponent("InfiniteNotes", isDirectory: true)' in append
+    assert '.appendingPathComponent("Logs", isDirectory: true)' in append
+    assert "for: .applicationSupportDirectory" in journal

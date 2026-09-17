@@ -113,6 +113,9 @@ final class DebugSessionLogger: @unchecked Sendable {
         if let operationID = object["operationId"] as? String {
             fields["operationId"] = operationID
         }
+        if let documentID = object["documentId"] as? String {
+            fields["documentId"] = documentID
+        }
         if let reason = object["reason"] as? String { fields["reason"] = reason }
         if let points = object["points"] as? [Any] { fields["pointCount"] = points.count }
         if let strokes = object["strokes"] as? [Any] { fields["strokeCount"] = strokes.count }
@@ -135,6 +138,7 @@ final class DebugSessionLogger: @unchecked Sendable {
         if let id = envelope.id { fields["strokeId"] = id }
         if let ids = envelope.ids { fields["idCount"] = ids.count }
         if let operationID = envelope.operationId { fields["operationId"] = operationID }
+        if let documentID = envelope.documentId { fields["documentId"] = documentID }
         if let revision = envelope.documentRevision { fields["documentRevision"] = revision }
         if let reason = envelope.reason { fields["reason"] = reason }
         if let pointCount = envelope.pointCount {
@@ -150,6 +154,7 @@ final class DebugSessionLogger: @unchecked Sendable {
         if let state = envelope.state {
             fields["strokeCount"] = state.strokes.count
             fields["pageCount"] = state.document.pages.count
+            if let documentID = state.documentId { fields["documentId"] = documentID }
             if let revision = state.documentRevision { fields["documentRevision"] = revision }
         }
         event("protocol", "message", fields: fields)
@@ -238,15 +243,15 @@ final class DebugSessionLogger: @unchecked Sendable {
 
     private func append(record: [String: Any], sessionID: String) throws {
         let manager = FileManager.default
-        let library = try manager.url(
-            for: .libraryDirectory,
+        let documents = try manager.url(
+            for: .documentDirectory,
             in: .userDomainMask,
             appropriateFor: nil,
             create: true
         )
-        let directory = library
-            .appendingPathComponent("Logs", isDirectory: true)
+        let directory = documents
             .appendingPathComponent("InfiniteNotes", isDirectory: true)
+            .appendingPathComponent("Logs", isDirectory: true)
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let safeID = String(sessionID.prefix(128)).replacingOccurrences(

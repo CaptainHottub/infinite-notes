@@ -9,6 +9,11 @@
     <key>CFBundleVersion</key>
     <string>53</string>
 
+    <key>UIFileSharingEnabled</key>
+    <true/>
+    <key>LSSupportsOpeningDocumentsInPlace</key>
+    <true/>
+
     <key>UIDeviceFamily</key>
     <array>
         <integer>2</integer>

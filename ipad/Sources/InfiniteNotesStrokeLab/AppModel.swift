@@ -73,18 +73,32 @@ final class AppModel: ObservableObject {
     private var reconnectWorkItem: DispatchWorkItem?
     private var stateFetchTask: URLSessionDataTask?
     private var stateFetchGeneration = 0
+    private var syncMutationGeneration = 0
+    private var deferredFetchWorkItem: DispatchWorkItem?
     private var strokes: [String: NoteStroke] = [:]
     private var pageStrokeIDs: [Int: Set<String>] = [:]
     private var strokeMembership: [String: Set<Int>] = [:]
     private var pageWorkspaceStates: [Int: PageWorkspaceState] = [:]
-    private var liveStrokeIDs: Set<String> = []
+    private var liveStrokes = LiveStrokeTracker()
+    private var liveStrokeIDs: Set<String> { liveStrokes.ids }
     // Completed local strokes remain here until the server acknowledges them.
     // If the socket drops after Pencil input was accepted locally, these final
     // vector strokes are replayed before a reconnect snapshot is allowed to
     // replace the iPad's state.
     private var pendingCommitStrokes: [String: NoteStroke] = [:]
+    private let pendingJournal = PendingStrokeJournal<NoteStroke>(root:
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("InfiniteNotes/PendingStrokes", isDirectory: true))
+    private var pendingDocumentID: String?
+    private var connectedDocumentID: String?
+    private var journalBlocked = false
     private var isReconcilingPendingStrokes = false
     private var deferredStateRefreshReason: String?
+    // Only a fully applied snapshot or a complete, contiguous revision delta
+    // may advance this value. An operation ACK alone cannot prove that all
+    // concurrent remote edits through its revision reached this client.
+    private var lastAppliedDocumentID: String?
+    private var lastAppliedDocumentRevision: Int?
     private var lastAppliedStateToken: String?
     // Keep reconnect payloads comfortably below common WebSocket frame limits.
     // Sending the entire offline queue in one JSON message can create a permanent
@@ -92,6 +106,10 @@ final class AppModel: ObservableObject {
     // the exact same oversized message on the replacement socket.
     private static let maximumReconciliationBatchStrokes = 12
     private static let maximumReconciliationBatchBytes = 512 * 1024
+    private static let syncMutatingMessageTypes: Set<String> = [
+        "snapshot", "document_changed", "stroke_begin", "stroke_points", "stroke_end",
+        "restore_strokes", "replace_strokes", "delete_strokes", "clear_strokes",
+    ]
     private var selectionClipboard: [NoteStroke] = []
     private var selectionPasteSerial = 0
 
@@ -208,9 +226,16 @@ final class AppModel: ObservableObject {
                 self.lastError = nil
                 self.reconnectWorkItem?.cancel()
                 self.reconnectWorkItem = nil
-                self.beginPendingStrokeReconciliationIfNeeded()
             case .disconnected, .failed:
+                self.discardInterruptedRemoteStrokes()
+                self.connectedDocumentID = nil
                 self.isReconcilingPendingStrokes = false
+                self.deferredStateRefreshReason = nil
+                self.deferredFetchWorkItem?.cancel()
+                self.deferredFetchWorkItem = nil
+                self.stateFetchTask?.cancel()
+                self.stateFetchTask = nil
+                self.stateFetchGeneration &+= 1
                 if self.shouldReconnect { self.scheduleReconnect() }
             case .connecting:
                 break
@@ -378,11 +403,16 @@ final class AppModel: ObservableObject {
     }
 
     func connect(address: String) {
+        discardInterruptedRemoteStrokes()
+        connectedDocumentID = nil
+        deferredStateRefreshReason = nil
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
         stateFetchTask?.cancel()
         stateFetchTask = nil
         stateFetchGeneration &+= 1
+        deferredFetchWorkItem?.cancel()
+        deferredFetchWorkItem = nil
         guard let normalized = Self.normalizedBaseURL(address) else {
             lastError = "Enter a server address such as http://10.42.0.1:8000"
             return
@@ -394,11 +424,14 @@ final class AppModel: ObservableObject {
 
     func disconnect() {
         shouldReconnect = false
+        deferredStateRefreshReason = nil
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
         stateFetchTask?.cancel()
         stateFetchTask = nil
         stateFetchGeneration &+= 1
+        deferredFetchWorkItem?.cancel()
+        deferredFetchWorkItem = nil
         client.disconnect()
     }
 
@@ -630,7 +663,7 @@ final class AppModel: ObservableObject {
             return false
         }
 
-        liveStrokeIDs.insert(strokeID)
+        liveStrokes.begin(strokeID, local: true)
         insertOrReplace(stroke, committedChange: false)
         notice = String(format: "%@ recognized · %.1f%%", GeometryEngine.displayName(stroke), stroke.recognitionError ?? 0)
         return true
@@ -1039,12 +1072,14 @@ final class AppModel: ObservableObject {
             textAlign: nil,
             fontFamily: nil
         )
-        liveStrokeIDs.insert(stroke.id)
+        liveStrokes.begin(stroke.id, local: true)
         insertOrReplace(stroke, committedChange: false)
 
         do {
             let object = try JSONHelpers.object(from: stroke)
-            client.sendJSONObject(["type": "stroke_begin", "stroke": object])
+            if let documentID = pendingDocumentID, connectedDocumentID == documentID {
+                client.sendJSONObject(["type": "stroke_begin", "stroke": object, "documentId": documentID])
+            }
         } catch {
             removeStroke(id: stroke.id)
             lastError = "Could not encode the new stroke"
@@ -1055,6 +1090,7 @@ final class AppModel: ObservableObject {
 
     func appendPoints(strokeID: String, points: [NotePoint]) {
         guard !points.isEmpty, var stroke = strokes[strokeID] else { return }
+        syncMutationGeneration &+= 1
         stroke.points.append(contentsOf: points)
         strokes[strokeID] = stroke
         let pages = strokeMembership[strokeID] ?? []
@@ -1073,10 +1109,20 @@ final class AppModel: ObservableObject {
         flushPendingPoints(strokeID: strokeID)
         let pages = strokeMembership[strokeID] ?? []
         beginCommitTransition(strokeID: strokeID, pages: pages)
-        liveStrokeIDs.remove(strokeID)
+        liveStrokes.end(strokeID)
         guard let finalStroke = strokes[strokeID] else { return }
         insertOrReplace(finalStroke)
         pendingCommitStrokes[strokeID] = finalStroke
+        if let documentID = pendingDocumentID ?? lastAppliedDocumentID {
+            pendingDocumentID = documentID
+            do {
+                try pendingJournal.save(finalStroke, id: strokeID, documentID: documentID)
+            } catch {
+                journalBlocked = true
+                lastError = "Could not save offline stroke: \(error.localizedDescription)"
+                return
+            }
+        }
 
         // WebSocket delivery is ordered and reliable while this connection is
         // alive, so ordinary ink does not need to repeat every sample again in
@@ -1085,6 +1131,8 @@ final class AppModel: ObservableObject {
         // batches after reconnecting. Recognized geometry must still replace the
         // streamed freehand stroke, but its final payload contains only 2–3 points.
         var message: [String: Any] = ["type": "stroke_end", "id": strokeID]
+        guard let documentID = pendingDocumentID, connectedDocumentID == documentID else { return }
+        message["documentId"] = documentID
         if finalStroke.tool == "shape" || finalStroke.tool == "text" {
             guard let encoded = try? JSONHelpers.object(from: finalStroke) else {
                 lastError = "Could not encode the completed stroke"
@@ -1151,7 +1199,9 @@ final class AppModel: ObservableObject {
             pendingPointBatches.removeValue(forKey: id)
             do {
                 let encoded = try JSONHelpers.object(from: points)
-                client.sendJSONObject(["type": "stroke_points", "id": id, "points": encoded])
+                if let documentID = pendingDocumentID, connectedDocumentID == documentID {
+                    client.sendJSONObject(["type": "stroke_points", "id": id, "points": encoded, "documentId": documentID])
+                }
             } catch {
                 lastError = "Could not encode Pencil samples"
             }
@@ -1180,17 +1230,47 @@ final class AppModel: ObservableObject {
     }
 
     private func handle(_ message: ServerEnvelope) {
+        if Self.syncMutatingMessageTypes.contains(message.type) {
+            syncMutationGeneration &+= 1
+            if deferredStateRefreshReason != nil { scheduleDeferredStateFetch() }
+        }
         switch message.type {
         case "snapshot":
             // Compatibility with older computer servers. New servers only send
             // small state_refresh messages to native clients.
             guard let snapshot = message.state else { return }
-            applySnapshot(snapshot, liveIDs: Set(message.liveStrokeIds ?? []))
+            guard applySnapshot(snapshot, liveIDs: Set(message.liveStrokeIds ?? [])) else { return }
             if !snapshot.document.pages.isEmpty {
                 fetchSourcePDF()
             }
         case "state_refresh":
             let reason = message.reason ?? "sync"
+            connectedDocumentID = message.documentId
+            if let documentID = message.documentId {
+                if !pendingCommitStrokes.isEmpty, let pendingID = pendingDocumentID,
+                   pendingID != documentID {
+                    lastError = "Pending strokes belong to another notebook. Reopen that notebook to restore them."
+                    return
+                }
+                do {
+                    let recovered = try pendingJournal.load(documentID: documentID)
+                    journalBlocked = false
+                    pendingDocumentID = documentID
+                    for (id, stroke) in recovered where pendingCommitStrokes[id] == nil {
+                        pendingCommitStrokes[id] = stroke
+                    }
+                } catch {
+                    journalBlocked = true
+                    lastError = "Could not read saved offline strokes: \(error.localizedDescription)"
+                    DebugSessionLogger.shared.event(
+                        "journal", "load_failed",
+                        fields: ["documentId": documentID,
+                                 "errorType": String(describing: type(of: error)),
+                                 "detail": error.localizedDescription]
+                    )
+                    return
+                }
+            }
             DebugSessionLogger.shared.event(
                 "sync",
                 "state_refresh_received",
@@ -1202,30 +1282,64 @@ final class AppModel: ObservableObject {
                     "documentRevision": message.documentRevision ?? 0,
                 ]
             )
-            if !pendingCommitStrokes.isEmpty || isReconcilingPendingStrokes {
+            if !pendingCommitStrokes.isEmpty || isReconcilingPendingStrokes || !liveStrokeIDs.isEmpty {
                 DebugSessionLogger.shared.event("sync", "state_refresh_deferred", fields: ["reason": reason])
                 deferredStateRefreshReason = reason
                 beginPendingStrokeReconciliationIfNeeded()
+                scheduleDeferredStateFetch()
             } else if reason == "initial",
+                      let incomingDocumentID = message.documentId,
+                      let incomingRevision = message.documentRevision,
                       let incomingToken = message.stateToken,
-                      incomingToken == lastAppliedStateToken {
+                      incomingToken == lastAppliedStateToken,
+                      liveStrokeIDs.isEmpty,
+                      incomingDocumentID == lastAppliedDocumentID,
+                      incomingRevision == lastAppliedDocumentRevision {
                 // A campus-Wi-Fi transport reconnect should not automatically
                 // re-download and reapply the complete notebook/PDF when the
-                // server state did not change while the socket was away.
+                // durable document revision did not change while the socket was
+                // away. lastAppliedDocumentRevision only comes from a complete
+                // snapshot or contiguous delta, never a mutation acknowledgement.
                 notice = "Reconnected"
-                DebugSessionLogger.shared.event("sync", "state_fetch_skipped_matching_token", fields: ["stateToken": incomingToken])
+                DebugSessionLogger.shared.event(
+                    "sync",
+                    "state_fetch_skipped_matching_revision",
+                    fields: [
+                        "documentId": incomingDocumentID,
+                        "documentRevision": incomingRevision,
+                        "stateToken": message.stateToken ?? "",
+                    ]
+                )
             } else {
-                fetchNotebookState(reason: reason)
+                if reason == "initial",
+                   let incomingDocumentID = message.documentId,
+                   let incomingRevision = message.documentRevision,
+                   let incomingToken = message.stateToken,
+                   let appliedRevision = lastAppliedDocumentRevision,
+                   incomingDocumentID == lastAppliedDocumentID,
+                   incomingRevision > appliedRevision,
+                   RevisionDeltaSafety.sameServerInstance(incomingToken, lastAppliedStateToken),
+                   liveStrokeIDs.isEmpty {
+                    fetchRevisionChanges(
+                        documentID: incomingDocumentID,
+                        sinceRevision: appliedRevision,
+                        serverToken: incomingToken
+                    )
+                } else {
+                    fetchNotebookState(reason: reason)
+                }
             }
         case "history_state":
             canUndo = message.canUndo ?? false
             canRedo = message.canRedo ?? false
         case "document_changed":
             if let changed = message.document {
+                connectedDocumentID = message.documentId
+                pendingDocumentID = message.documentId
                 document = changed
                 if message.clearStrokes == true {
                     strokes.removeAll()
-                    liveStrokeIDs.removeAll()
+                    liveStrokes.reset()
                     selectedStrokeIDs.removeAll()
                     // Pending commits belong to the previous document. Replaying
                     // them into a newly opened PDF is both incorrect and can keep
@@ -1246,7 +1360,7 @@ final class AppModel: ObservableObject {
             }
         case "stroke_begin":
             if let stroke = message.stroke {
-                liveStrokeIDs.insert(stroke.id)
+                liveStrokes.begin(stroke.id, local: false)
                 insertOrReplace(stroke, committedChange: false)
             }
         case "stroke_points":
@@ -1261,9 +1375,14 @@ final class AppModel: ObservableObject {
             if let id = message.id {
                 let pages = strokeMembership[id] ?? []
                 beginCommitTransition(strokeID: id, pages: pages)
-                liveStrokeIDs.remove(id)
+                liveStrokes.end(id)
                 if let stroke = strokes[id] { insertOrReplace(stroke) }
-                else { invalidatePages(strokeMembership[id] ?? []) }
+                else {
+                    // A reconnect can miss stroke_begin and point frames. Fetch
+                    // the committed stroke instead of leaving an invisible gap.
+                    deferredStateRefreshReason = "missing_remote_stroke"
+                }
+                if liveStrokeIDs.isEmpty { scheduleDeferredStateFetch() }
             }
         case "restore_strokes", "replace_strokes":
             for stroke in message.strokes ?? [] {
@@ -1275,12 +1394,14 @@ final class AppModel: ObservableObject {
             }
         case "clear_strokes":
             strokes.removeAll()
+            liveStrokes.reset()
             pageStrokeIDs.removeAll()
             strokeMembership.removeAll()
             selectedStrokeIDs.removeAll()
             rebuildAllWorkspaceStates()
             invalidateAllPages()
         case "stroke_ack":
+            guard message.documentId == pendingDocumentID else { return }
             let acknowledgedIDs = message.ids ?? []
             for id in acknowledgedIDs {
                 if acknowledgedIDs.count == 1,
@@ -1292,10 +1413,7 @@ final class AppModel: ObservableObject {
                     notice = "Repairing an incomplete stroke after reconnect…"
                     continue
                 }
-                pendingCommitStrokes.removeValue(forKey: id)
-            }
-            if let token = message.stateToken {
-                lastAppliedStateToken = token
+                acknowledgePendingStroke(id)
             }
             if acknowledgedIDs.contains(where: { pendingCommitStrokes[$0] != nil }) {
                 beginPendingStrokeReconciliationIfNeeded()
@@ -1310,12 +1428,11 @@ final class AppModel: ObservableObject {
                     "documentRevision": message.documentRevision ?? 0,
                 ]
             )
+            if pendingCommitStrokes.isEmpty { scheduleDeferredStateFetch() }
         case "reconcile_ack":
+            guard message.documentId == pendingDocumentID else { return }
             for id in message.ids ?? [] {
-                pendingCommitStrokes.removeValue(forKey: id)
-            }
-            if let token = message.stateToken {
-                lastAppliedStateToken = token
+                acknowledgePendingStroke(id)
             }
             isReconcilingPendingStrokes = false
             DebugSessionLogger.shared.event(
@@ -1330,8 +1447,8 @@ final class AppModel: ObservableObject {
             )
             if pendingCommitStrokes.isEmpty {
                 let reason = deferredStateRefreshReason ?? "reconnect_reconciled"
-                deferredStateRefreshReason = nil
-                fetchNotebookState(reason: reason)
+                deferredStateRefreshReason = reason
+                scheduleDeferredStateFetch()
             } else {
                 beginPendingStrokeReconciliationIfNeeded()
             }
@@ -1341,9 +1458,7 @@ final class AppModel: ObservableObject {
             }
             lastError = message.message ?? "Server error"
         case "delete_ack":
-            if let token = message.stateToken {
-                lastAppliedStateToken = token
-            }
+            break
         case "pong":
             break
         default:
@@ -1351,8 +1466,23 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func acknowledgePendingStroke(_ id: String) {
+        do {
+            if let documentID = pendingDocumentID {
+                try pendingJournal.acknowledge(id, documentID: documentID)
+            }
+            pendingCommitStrokes.removeValue(forKey: id)
+        } catch {
+            journalBlocked = true
+            lastError = "Could not update saved offline strokes: \(error.localizedDescription)"
+        }
+    }
+
     private func beginPendingStrokeReconciliationIfNeeded() {
         guard isConnected,
+              !journalBlocked,
+              let documentID = connectedDocumentID,
+              documentID == pendingDocumentID,
               !isReconcilingPendingStrokes,
               !pendingCommitStrokes.isEmpty else { return }
 
@@ -1400,8 +1530,148 @@ final class AppModel: ObservableObject {
             : "Restoring disconnected Pencil progress (\(batch.count) of \(pendingCommitStrokes.count))…"
         client.sendJSONObject([
             "type": "reconcile_strokes",
+            "documentId": documentID,
             "strokes": encoded,
         ])
+    }
+
+    private func fetchRevisionChanges(documentID: String, sinceRevision: Int, serverToken: String) {
+        stateFetchTask?.cancel()
+        stateFetchGeneration &+= 1
+        let generation = stateFetchGeneration
+        let mutationGeneration = syncMutationGeneration
+        DebugSessionLogger.shared.event(
+            "sync", "delta_fetch_started",
+            fields: ["documentId": documentID, "sinceRevision": sinceRevision]
+        )
+        requestRevisionPage(
+            documentID: documentID, baseRevision: sinceRevision, cursor: sinceRevision,
+            serverToken: serverToken,
+            generation: generation, mutationGeneration: mutationGeneration,
+            remainingPages: 8, delta: RevisionDeltaAccumulator<NoteStroke>()
+        )
+    }
+
+    private func requestRevisionPage(
+        documentID: String,
+        baseRevision: Int,
+        cursor: Int,
+        serverToken: String,
+        generation: Int,
+        mutationGeneration: Int,
+        remainingPages: Int,
+        delta: RevisionDeltaAccumulator<NoteStroke>
+    ) {
+        guard let url = endpoint(path: "/api/changes", queryItems: [
+            URLQueryItem(name: "documentId", value: documentID),
+            URLQueryItem(name: "sinceRevision", value: String(cursor)),
+        ]) else {
+            fetchNotebookState(reason: "delta_invalid_url")
+            return
+        }
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.timeoutInterval = 30
+        request.setValue("gzip", forHTTPHeaderField: "Accept-Encoding")
+        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            if (error as NSError?)?.code == NSURLErrorCancelled { return }
+            let page: RevisionDeltaResponse?
+            if error == nil, let http = response as? HTTPURLResponse,
+               (200..<300).contains(http.statusCode), let data {
+                page = try? JSONDecoder().decode(RevisionDeltaResponse.self, from: data)
+            } else {
+                page = nil
+            }
+            Task { @MainActor in
+                guard generation == self.stateFetchGeneration else { return }
+                guard self.connectedDocumentID == documentID,
+                      self.lastAppliedDocumentID == documentID,
+                      self.lastAppliedDocumentRevision == baseRevision,
+                      self.pendingCommitStrokes.isEmpty,
+                      self.liveStrokeIDs.isEmpty,
+                      self.syncMutationGeneration == mutationGeneration else {
+                    self.fallbackRevisionChanges(reason: "local_or_live_edit")
+                    return
+                }
+                guard let page, page.documentId == documentID,
+                      page.fromRevision == cursor,
+                      let nextRevision = page.nextRevision,
+                      nextRevision > cursor,
+                      nextRevision <= page.documentRevision,
+                      let stateToken = page.stateToken,
+                      RevisionDeltaSafety.sameServerInstance(stateToken, serverToken),
+                      let pageUpserts = page.upserts,
+                      let pageDeletes = page.deletes,
+                      (page.status == "more" || page.status == "complete") else {
+                    self.fallbackRevisionChanges(reason: "missing_or_invalid_delta")
+                    return
+                }
+                var merged = delta
+                guard merged.append(upserts: pageUpserts, deletes: pageDeletes) else {
+                    self.fallbackRevisionChanges(reason: "invalid_stroke_delta")
+                    return
+                }
+                if page.status == "more" {
+                    guard nextRevision < page.documentRevision, remainingPages > 1 else {
+                        self.fallbackRevisionChanges(reason: "delta_page_limit")
+                        return
+                    }
+                    self.requestRevisionPage(
+                        documentID: documentID, baseRevision: baseRevision,
+                        cursor: nextRevision, serverToken: serverToken,
+                        generation: generation,
+                        mutationGeneration: mutationGeneration,
+                        remainingPages: remainingPages - 1,
+                        delta: merged
+                    )
+                    return
+                }
+                guard nextRevision == page.documentRevision else {
+                    self.fallbackRevisionChanges(reason: "incomplete_delta")
+                    return
+                }
+                for id in merged.deletes { self.removeStroke(id: id) }
+                for stroke in merged.upserts.values { self.insertOrReplace(stroke) }
+                self.lastAppliedDocumentID = documentID
+                self.lastAppliedDocumentRevision = nextRevision
+                self.lastAppliedStateToken = stateToken
+                self.notice = "Notebook synchronized"
+                self.lastError = nil
+                self.stateFetchTask = nil
+                DebugSessionLogger.shared.event(
+                    "sync", "delta_fetch_completed",
+                    fields: ["documentRevision": nextRevision,
+                             "upsertCount": merged.upserts.count,
+                             "deleteCount": merged.deletes.count]
+                )
+            }
+        }
+        stateFetchTask = task
+        task.resume()
+    }
+
+    private func fallbackRevisionChanges(reason: String) {
+        DebugSessionLogger.shared.event("sync", "delta_fetch_fallback", fields: ["reason": reason])
+        fetchNotebookState(reason: "delta_fallback")
+    }
+
+    private func scheduleDeferredStateFetch() {
+        guard deferredStateRefreshReason != nil else { return }
+        deferredFetchWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.deferredFetchWorkItem = nil
+            guard let reason = self.deferredStateRefreshReason,
+                  self.connectedDocumentID != nil,
+                  self.pendingCommitStrokes.isEmpty,
+                  !self.isReconcilingPendingStrokes,
+                  self.liveStrokeIDs.isEmpty else { return }
+            self.deferredStateRefreshReason = nil
+            self.fetchNotebookState(reason: reason)
+        }
+        deferredFetchWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
     }
 
     private func fetchNotebookState(reason: String) {
@@ -1410,9 +1680,13 @@ final class AppModel: ObservableObject {
             return
         }
 
+        deferredFetchWorkItem?.cancel()
+        deferredFetchWorkItem = nil
+        deferredStateRefreshReason = nil
         stateFetchTask?.cancel()
         stateFetchGeneration &+= 1
         let generation = stateFetchGeneration
+        let mutationGeneration = syncMutationGeneration
         let startedAt = ProcessInfo.processInfo.systemUptime
         DebugSessionLogger.shared.event(
             "sync",
@@ -1455,7 +1729,18 @@ final class AppModel: ObservableObject {
                 let snapshot = try JSONDecoder().decode(NotebookState.self, from: data)
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
-                    self.applySnapshot(snapshot, liveIDs: [])
+                    guard self.syncMutationGeneration == mutationGeneration,
+                          self.liveStrokeIDs.isEmpty,
+                          self.pendingCommitStrokes.isEmpty else {
+                        self.deferredStateRefreshReason = reason
+                        self.scheduleDeferredStateFetch()
+                        DebugSessionLogger.shared.event(
+                            "sync", "state_fetch_deferred_after_edit",
+                            fields: ["reason": reason, "generation": generation]
+                        )
+                        return
+                    }
+                    guard self.applySnapshot(snapshot, liveIDs: []) else { return }
                     DebugSessionLogger.shared.event(
                         "sync",
                         "state_fetch_completed",
@@ -1499,21 +1784,27 @@ final class AppModel: ObservableObject {
         task.resume()
     }
 
-    private func applySnapshot(_ snapshot: NotebookState, liveIDs: Set<String>) {
-        document = snapshot.document
-        if let token = snapshot.stateToken {
-            lastAppliedStateToken = token
+    private func applySnapshot(_ snapshot: NotebookState, liveIDs: Set<String>) -> Bool {
+        if !pendingCommitStrokes.isEmpty, pendingDocumentID != snapshot.documentId {
+            lastError = "Pending strokes belong to another notebook. Reopen that notebook to restore them."
+            return false
         }
+        document = snapshot.document
+        if pendingCommitStrokes.isEmpty { pendingDocumentID = snapshot.documentId }
+        lastAppliedDocumentID = snapshot.documentId
+        lastAppliedDocumentRevision = snapshot.documentRevision
+        lastAppliedStateToken = snapshot.stateToken
         var mergedStrokes = snapshot.strokes
         for (id, stroke) in pendingCommitStrokes {
             mergedStrokes[id] = stroke
         }
         strokes = mergedStrokes
-        liveStrokeIDs = liveIDs
+        liveStrokes.reset(remoteIDs: liveIDs)
         selectedStrokeIDs = Set(selectedStrokeIDs.filter { strokes[$0] != nil })
         rebuildPageIndex()
         rebuildAllWorkspaceStates()
         invalidateAllPages()
+        return true
     }
 
     private func fetchSourcePDF() {
@@ -1647,7 +1938,16 @@ final class AppModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: item)
     }
 
+    private func discardInterruptedRemoteStrokes() {
+        let interrupted = liveStrokes.disconnect()
+        guard !interrupted.isEmpty else { return }
+        for id in interrupted { removeStroke(id: id) }
+        // These previews were not part of a fully applied durable snapshot.
+        lastAppliedDocumentRevision = nil
+    }
+
     private func insertOrReplace(_ stroke: NoteStroke, committedChange: Bool = true) {
+        syncMutationGeneration &+= 1
         let oldPages = strokeMembership[stroke.id] ?? []
         for page in oldPages { pageStrokeIDs[page]?.remove(stroke.id) }
         strokes[stroke.id] = stroke
@@ -1664,9 +1964,10 @@ final class AppModel: ObservableObject {
     }
 
     private func removeStroke(id: String) {
+        syncMutationGeneration &+= 1
         let pages = strokeMembership.removeValue(forKey: id) ?? []
         strokes.removeValue(forKey: id)
-        liveStrokeIDs.remove(id)
+        liveStrokes.end(id)
         pendingPointBatches.removeValue(forKey: id)
         selectedStrokeIDs.remove(id)
         for page in pages { pageStrokeIDs[page]?.remove(id) }

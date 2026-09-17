@@ -160,21 +160,24 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
                   self.withConnectionState({ self.task === task }) else { return }
             switch result {
             case .success(let message):
-                switch message {
-                case .string(let text):
-                    Task { @MainActor in
+                // Apply one frame before receiving the next. Independent Tasks
+                // can otherwise reorder frames or deliver an old socket's frame
+                // after a reconnect has already replaced the notebook.
+                Task { @MainActor [weak self, weak task] in
+                    guard let self, let task,
+                          self.withConnectionState({ self.task === task }) else { return }
+                    switch message {
+                    case .string(let text):
                         self.onTextMessage?(text)
-                    }
-                case .data(let data):
-                    if let text = String(data: data, encoding: .utf8) {
-                        Task { @MainActor in
+                    case .data(let data):
+                        if let text = String(data: data, encoding: .utf8) {
                             self.onTextMessage?(text)
                         }
+                    @unknown default:
+                        break
                     }
-                @unknown default:
-                    break
+                    self.receiveNext(from: task)
                 }
-                self.receiveNext(from: task)
             case .failure(let error):
                 self.failCurrentConnection(task, message: error.localizedDescription)
             }

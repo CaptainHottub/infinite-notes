@@ -1,5 +1,6 @@
 from pathlib import Path
 import importlib.util
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -40,6 +41,11 @@ def _reset_server(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr(server, "STATE_FILE", data_dir / "state.json")
     monkeypatch.setattr(server, "CURRENT_PDF", data_dir / "current.pdf")
     server.state = server.empty_state()
+    store = server.NotebookStore(data_dir / "notebook.sqlite3")
+    store.initialize(server.state)
+    monkeypatch.setattr(server, "notebook_store", store)
+    server.stored_metadata = server.copy.deepcopy({key: value for key, value in server.state.items() if key != "strokes"})
+    server.persistence_failed = False
     server.history.clear()
     server.redo_history.clear()
     server.pending_stroke_history.clear()
@@ -90,6 +96,41 @@ def test_reconcile_is_idempotent(monkeypatch, tmp_path):
 
     assert len(server.state["strokes"]) == 1
     assert len(server.history) == history_count
+
+
+def test_reconcile_rejects_another_document_without_mutation(monkeypatch, tmp_path):
+    _reset_server(monkeypatch, tmp_path)
+    client = TestClient(server.app)
+    with client.websocket_connect("/ws?role=ipad&clientId=native-journal-test") as websocket:
+        summary = websocket.receive_json()
+        websocket.receive_json()
+        websocket.send_json({"type": "reconcile_strokes", "documentId": "another-notebook",
+                             "strokes": [_sample_stroke()]})
+        error = websocket.receive_json()
+        assert error["type"] == "error"
+        assert server.state["strokes"] == {}
+        assert server.history == []
+        assert server.current_document_revision() == summary["documentRevision"]
+        websocket.send_json({"type": "reconcile_strokes", "documentId": summary["documentId"],
+                             "strokes": [_sample_stroke()]})
+        ack = websocket.receive_json()
+        assert ack["type"] == "reconcile_ack"
+        assert ack["documentId"] == summary["documentId"]
+        websocket.receive_json()
+
+
+@pytest.mark.parametrize("kind", ["stroke_begin", "stroke_points", "stroke_end"])
+def test_streamed_stroke_rejects_another_document(monkeypatch, tmp_path, kind):
+    _reset_server(monkeypatch, tmp_path)
+    stroke = _sample_stroke()
+    with TestClient(server.app).websocket_connect("/ws?role=ipad&clientId=native-journal-test") as websocket:
+        websocket.receive_json()
+        websocket.receive_json()
+        websocket.send_json({"type": kind, "documentId": "wrong-document", "id": stroke["id"],
+                             "stroke": stroke, "points": stroke["points"]})
+        assert websocket.receive_json()["type"] == "error"
+    assert server.state["strokes"] == {}
+    assert server.current_document_revision() == 0
 
 
 

@@ -1,5 +1,8 @@
 import copy
+import asyncio
 import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -12,7 +15,7 @@ from server import app, client_kinds, client_roles, clients, history, pending_de
 
 
 @pytest.fixture(autouse=True)
-def isolated_state(monkeypatch):
+def isolated_state(monkeypatch, tmp_path):
     state_backup = copy.deepcopy(state)
     history_backup = copy.deepcopy(history)
     redo_backup = copy.deepcopy(redo_history)
@@ -21,8 +24,13 @@ def isolated_state(monkeypatch):
     client_kinds.clear()
     clients.clear()
     pending_delete_operations.clear()
-    monkeypatch.setattr(server, "save_state_atomic", lambda: None)
     state["strokes"] = {}
+    server.state_revision = 0
+    server.persistence_failed = False
+    server.stored_metadata = {key: copy.deepcopy(value) for key, value in state.items() if key != "strokes"}
+    store = server.NotebookStore(tmp_path / "notebook.sqlite3")
+    store.initialize(copy.deepcopy(state))
+    monkeypatch.setattr(server, "notebook_store", store)
     history.clear()
     redo_history.clear()
     pending_stroke_history.clear()
@@ -37,6 +45,7 @@ def isolated_state(monkeypatch):
     client_kinds.clear()
     clients.clear()
     pending_delete_operations.clear()
+    store.close()
 
 
 def test_root_and_state():
@@ -46,6 +55,210 @@ def test_root_and_state():
     assert response.status_code == 200
     assert "document" in response.json()
     assert "strokes" in response.json()
+
+
+def test_http_state_does_not_advertise_uncommitted_live_stroke():
+    state["strokes"]["still-drawing"] = {"id": "still-drawing", "points": []}
+    pending_stroke_history.add("still-drawing")
+    response = TestClient(app).get("/api/state")
+    assert response.status_code == 200
+    assert "still-drawing" not in response.json()["strokes"]
+    assert "still-drawing" in state["strokes"]
+
+
+def test_repeated_identical_stroke_does_not_commit_or_advance_revision(monkeypatch):
+    calls = []
+    original_commit = server.notebook_store.commit_batch
+
+    def count_commit(operations):
+        calls.append(len(operations))
+        return original_commit(operations)
+
+    monkeypatch.setattr(server.notebook_store, "commit_batch", count_commit)
+    state["strokes"]["same"] = {"id": "same", "points": [{"x": 1, "y": 2}]}
+
+    async def exercise():
+        first = await server.save_state_atomic(upsert_ids={"same"})
+        second = await server.save_state_atomic(upsert_ids={"same"})
+        return first, second
+
+    assert asyncio.run(exercise()) == (1, 1)
+    assert calls == [1]
+    assert server.notebook_store.load()["documentRevision"] == 1
+
+
+def test_explicit_mutation_flushes_without_waiting_for_long_stroke_window(monkeypatch):
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 30.0)
+    state["strokes"]["immediate"] = {"id": "immediate", "points": []}
+
+    async def exercise():
+        return await asyncio.wait_for(
+            server.save_state_atomic(upsert_ids={"immediate"}), timeout=1.0
+        )
+
+    assert asyncio.run(exercise()) == 1
+    assert "immediate" in server.notebook_store.load()["strokes"]
+
+
+@pytest.mark.parametrize("fail_commit", [False, True])
+def test_identical_edit_waits_for_inflight_commit(monkeypatch, fail_commit):
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 30.0)
+    started = threading.Event()
+    release = threading.Event()
+    original = server.notebook_store.commit_batch
+
+    def held_commit(operations):
+        started.set()
+        assert release.wait(5)
+        if fail_commit:
+            raise OSError("held commit failed")
+        original(operations)
+
+    monkeypatch.setattr(server.notebook_store, "commit_batch", held_commit)
+
+    async def exercise():
+        writer = server.notebook_writer()
+        state["strokes"]["duplicate"] = {"id": "duplicate", "points": []}
+        first = writer.enqueue(upsert_ids={"duplicate"})
+        flushing = asyncio.create_task(writer.flush())
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            duplicate = writer.enqueue(upsert_ids={"duplicate"})
+            acknowledged_early = duplicate.done()
+        finally:
+            release.set()
+            await flushing
+        outcomes = await asyncio.gather(first, duplicate, return_exceptions=True)
+        await writer.shutdown()
+        assert not acknowledged_early, "duplicate was acknowledged before its data committed"
+        if fail_commit:
+            assert all(isinstance(outcome, OSError) for outcome in outcomes)
+        else:
+            assert outcomes == [1, 1]
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_waiter_does_not_break_other_commit_completions(monkeypatch):
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 30.0)
+
+    async def exercise():
+        writer = server.notebook_writer()
+        state["strokes"]["a"] = {"id": "a", "points": []}
+        abandoned = writer.enqueue(upsert_ids={"a"})
+        duplicate = writer.enqueue(upsert_ids={"a"})
+        state["strokes"]["b"] = {"id": "b", "points": []}
+        other = writer.enqueue(upsert_ids={"b"})
+        abandoned.cancel()
+        try:
+            await writer.flush()
+            assert await asyncio.wait_for(duplicate, 1) == 1
+            assert await asyncio.wait_for(other, 1) == 2
+            assert set(server.notebook_store.load()["strokes"]) == {"a", "b"}
+        finally:
+            await writer.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_cancelled_flush_keeps_durable_state_and_memory_in_agreement(monkeypatch):
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 30.0)
+    started = threading.Event()
+    release = threading.Event()
+    original = server.notebook_store.commit_batch
+
+    def held_commit(operations):
+        started.set()
+        assert release.wait(5)
+        original(operations)
+
+    monkeypatch.setattr(server.notebook_store, "commit_batch", held_commit)
+
+    async def exercise():
+        writer = server.notebook_writer()
+        state["strokes"]["a"] = {"id": "a", "points": []}
+        committed = writer.enqueue(upsert_ids={"a"})
+        request = asyncio.create_task(writer.flush())
+        try:
+            assert await asyncio.to_thread(started.wait, 2)
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+        finally:
+            release.set()
+        try:
+            assert await asyncio.wait_for(committed, 1) == 1
+            assert server.current_document_revision() == 1
+            assert server.notebook_store.load()["documentRevision"] == 1
+        finally:
+            await writer.shutdown()
+
+    asyncio.run(exercise())
+
+
+def test_batch_deadline_starts_with_first_edit_and_idle_does_not_commit(monkeypatch):
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 5.0)
+    calls = []
+    original_commit = server.notebook_store.commit_batch
+
+    def count_commit(operations):
+        calls.append(len(operations))
+        return original_commit(operations)
+
+    monkeypatch.setattr(server.notebook_store, "commit_batch", count_commit)
+
+    async def exercise():
+        writer = server.notebook_writer()
+        state["strokes"]["a"] = {"id": "a", "points": []}
+        first = writer.enqueue(upsert_ids={"a"})
+        deadline = writer.timer
+        state["strokes"]["b"] = {"id": "b", "points": []}
+        second = writer.enqueue(upsert_ids={"b"})
+        assert writer.timer is deadline
+        await writer.flush()
+        assert await first == 1
+        assert await second == 2
+        await asyncio.sleep(0)
+        assert writer.timer is None
+
+    asyncio.run(exercise())
+    assert calls == [2]
+
+
+def test_large_wal_checkpoint_runs_off_the_event_loop(monkeypatch):
+    monkeypatch.setattr(server, "WAL_CHECKPOINT_MIN_BYTES", 1)
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 0.0)
+    called = []
+    original_checkpoint = server.notebook_store.checkpoint
+
+    def record_checkpoint():
+        called.append(threading.current_thread().name)
+        return original_checkpoint()
+
+    monkeypatch.setattr(server.notebook_store, "checkpoint", record_checkpoint)
+    state["strokes"]["checkpoint"] = {"id": "checkpoint", "points": []}
+
+    async def exercise():
+        await server.save_state_atomic(upsert_ids={"checkpoint"})
+        task = server.notebook_writer().checkpoint_task
+        assert task is not None
+        await task
+
+    asyncio.run(exercise())
+    assert called and called[0].startswith("notebook-writer")
+
+
+def test_graceful_shutdown_drains_accepted_edit(monkeypatch):
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 30.0)
+    with TestClient(app) as client:
+        async def enqueue_without_waiting():
+            state["strokes"]["shutdown-stroke"] = {"id": "shutdown-stroke", "points": []}
+            server.notebook_writer().enqueue(upsert_ids={"shutdown-stroke"})
+
+        assert client.portal is not None
+        client.portal.call(enqueue_without_waiting)
+        assert "shutdown-stroke" not in server.notebook_store.load()["strokes"]
+    assert "shutdown-stroke" in server.notebook_store.load()["strokes"]
 
 
 def test_websocket_snapshot():
@@ -182,6 +395,7 @@ async def test_oversized_native_broadcast_falls_back_to_state_refresh():
         "type": "state_refresh",
         "reason": "oversized_replace_strokes",
         "serverTime": websocket.messages[0]["serverTime"],
+        "documentId": server.current_document_id(),
         "documentRevision": server.current_document_revision(),
     }]
 
@@ -936,12 +1150,158 @@ def test_delete_broadcast_reaches_other_connected_client():
         ipad.receive_json()
         laptop.receive_json()
         laptop.receive_json()
+        time.sleep(0.1)
 
         ipad.send_json({"type": "delete_strokes", "ids": [stroke["id"]], "reliable": True})
+        time.sleep(0.1)
         assert laptop.receive_json() == {"type": "delete_strokes", "ids": [stroke["id"]]}
         assert ipad.receive_json() == {"type": "delete_ack", "ids": [stroke["id"]], "final": True}
         assert laptop.receive_json()["type"] == "history_state"
         assert ipad.receive_json()["type"] == "history_state"
+
+
+def test_one_native_socket_batches_two_completed_strokes_before_ack(monkeypatch):
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 5.0)
+    commits = []
+    original_commit = server.notebook_store.commit_batch
+
+    def record_commit(operations):
+        commits.append(len(operations))
+        return original_commit(operations)
+
+    monkeypatch.setattr(server.notebook_store, "commit_batch", record_commit)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws?role=ipad&clientId=native-batch-test") as websocket:
+            assert websocket.receive_json()["type"] == "state_refresh"
+            assert websocket.receive_json()["type"] == "history_state"
+            for index in range(2):
+                stroke = {
+                    "id": f"batch-stroke-{index}",
+                    "owner": "native-batch-test",
+                    "tool": "pen",
+                    "color": "#111111",
+                    "width": 1,
+                    "opacity": 1,
+                    "smoothing": 0,
+                    "points": [{"x": index, "y": index, "p": 0.5, "t": index}],
+                }
+                websocket.send_json({"type": "stroke_begin", "stroke": stroke})
+                websocket.send_json({"type": "stroke_end", "id": stroke["id"]})
+
+            async def flush_both():
+                async def both_enqueued():
+                    while len(server.notebook_writer().pending) < 2:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(both_enqueued(), timeout=2)
+                await server.notebook_writer().flush()
+
+            assert client.portal is not None
+            client.portal.call(flush_both)
+            acknowledgements = []
+            while len(acknowledgements) < 2:
+                message = websocket.receive_json()
+                if message["type"] == "stroke_ack":
+                    acknowledgements.append(message)
+            assert [ack["documentRevision"] for ack in acknowledgements] == [1, 2]
+            assert [ack["stateToken"].rsplit(":", 1)[1] for ack in acknowledgements] == ["1", "2"]
+    assert commits == [2]
+    assert set(server.notebook_store.load()["strokes"]) == {"batch-stroke-0", "batch-stroke-1"}
+
+
+def test_failed_stroke_commit_sends_error_and_restores_durable_state(monkeypatch):
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 0.0)
+
+    def fail_commit(_operations):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(server.notebook_store, "commit_batch", fail_commit)
+    stroke = {
+        "id": "failed-stroke", "owner": "native-failure", "tool": "pen",
+        "color": "#111111", "width": 1, "opacity": 1, "smoothing": 0,
+        "points": [{"x": 1, "y": 2, "p": 0.5, "t": 0}],
+    }
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws?role=ipad&clientId=native-failure") as websocket:
+            websocket.receive_json()
+            websocket.receive_json()
+            websocket.send_json({"type": "stroke_begin", "stroke": stroke})
+            websocket.send_json({"type": "stroke_end", "id": stroke["id"]})
+            reply = websocket.receive_json()
+            assert reply == {"type": "error", "message": "Notebook save failed"}
+            websocket.send_json({"type": "stroke_begin", "stroke": {**stroke, "id": "later-stroke"}})
+            assert websocket.receive_json() == {
+                "type": "error", "message": "Notebook storage failed; restart the server before editing",
+            }
+
+    assert server.persistence_failed
+    assert "failed-stroke" not in state["strokes"]
+    assert "later-stroke" not in state["strokes"]
+    assert "failed-stroke" not in server.notebook_store.load()["strokes"]
+    assert not history
+
+
+def test_slow_commit_does_not_block_websocket_heartbeat(monkeypatch):
+    monkeypatch.setattr(server, "BATCH_MAX_DELAY_SECONDS", 0.0)
+    commit_started = threading.Event()
+    release_commit = threading.Event()
+    original_commit = server.notebook_store.commit_batch
+
+    def delayed_commit(operations):
+        commit_started.set()
+        assert release_commit.wait(3)
+        return original_commit(operations)
+
+    monkeypatch.setattr(server.notebook_store, "commit_batch", delayed_commit)
+    stroke = {
+        "id": "slow-stroke", "owner": "native-slow", "tool": "pen",
+        "color": "#111111", "width": 1, "opacity": 1, "smoothing": 0,
+        "points": [{"x": 1, "y": 2, "p": 0.5, "t": 0}],
+    }
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws?role=ipad&clientId=native-slow") as websocket:
+            websocket.receive_json()
+            websocket.receive_json()
+            websocket.send_json({"type": "stroke_begin", "stroke": stroke})
+            websocket.send_json({"type": "stroke_end", "id": stroke["id"]})
+            assert commit_started.wait(2)
+            websocket.send_json({"type": "ping", "clientTime": 123})
+            received = []
+            reader = threading.Thread(target=lambda: received.append(websocket.receive_json()), daemon=True)
+            reader.start()
+            try:
+                reader.join(1)
+                responsive = bool(received)
+            finally:
+                release_commit.set()
+                reader.join(3)
+            assert responsive
+            assert received[0] == {"type": "pong", "clientTime": 123}
+
+
+def test_pdf_assets_restore_old_generation_when_database_commit_fails(monkeypatch, tmp_path):
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    server.CURRENT_PDF.write_bytes(b"old-pdf")
+    (server.PDF_PAGES_DIR / "page-0001.svg").write_text("<svg>old</svg>")
+    prepared = tmp_path / "prepared"
+    (prepared / "pdf_pages").mkdir(parents=True)
+    (prepared / "current.pdf").write_bytes(b"new-pdf")
+    (prepared / "pdf_pages" / "page-0001.svg").write_text("<svg>new</svg>")
+    pages = [{"id": "page-1", "pageNumber": 1, "imageUrl": "/pdf-pages/page-0001.svg",
+              "x": 0, "y": 0, "width": 100, "height": 100}]
+    monkeypatch.setattr(server, "prepare_pdf", lambda _content: (prepared, pages))
+
+    def fail_commit(_operations):
+        raise OSError("simulated database failure")
+
+    monkeypatch.setattr(server.notebook_store, "commit_batch", fail_commit)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/api/pdf", files={"file": ("new.pdf", b"%PDF-new", "application/pdf")})
+    assert response.status_code == 500
+    assert server.CURRENT_PDF.read_bytes() == b"old-pdf"
+    assert (server.PDF_PAGES_DIR / "page-0001.svg").read_text() == "<svg>old</svg>"
+    assert not (server.DATA_DIR / "asset-transition").exists()
+    assert server.notebook_store.load()["document"]["filename"] != "new.pdf"
 
 
 def test_static_renderer_uses_single_continuous_capsule_path():

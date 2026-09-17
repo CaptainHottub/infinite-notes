@@ -130,6 +130,7 @@ def protocol_summary(message: Any) -> dict[str, Any]:
 
     for source_key, result_key, limit in (
         ("operationId", "operationId", 128),
+        ("documentId", "documentId", 128),
         ("stateToken", "stateToken", 256),
         ("reason", "reason", 128),
     ):
@@ -165,6 +166,9 @@ def protocol_summary(message: Any) -> dict[str, Any]:
 
     state = message.get("state")
     if isinstance(state, dict):
+        state_document_id = _bounded_string(state.get("documentId"), 128)
+        if state_document_id is not None:
+            summary["documentId"] = state_document_id
         state_strokes = state.get("strokes")
         if isinstance(state_strokes, (list, dict)):
             summary["strokeCount"] = len(state_strokes)

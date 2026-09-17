@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import atexit
 import copy
+import hashlib
 import io
 import json
 import math
@@ -15,6 +16,8 @@ import tempfile
 import time
 import uuid
 import zipfile
+from contextlib import asynccontextmanager
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -27,15 +30,19 @@ from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.middleware.gzip import GZipMiddleware
 
+from asset_persistence import begin_transition, finish_transition, install_asset_set, recover_transition
 from debug_logging import DebugEventLogger
+from persistence import NotebookStore
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
-DATA_DIR = ROOT / "data"
+DATA_DIR = Path(os.environ.get("INFINITE_NOTES_DATA_DIR", str(ROOT / "data")))
 PDF_PAGES_DIR = DATA_DIR / "pdf_pages"
 STATE_FILE = DATA_DIR / "state.json"
+DATABASE_FILE = DATA_DIR / "notebook.sqlite3"
 CURRENT_PDF = DATA_DIR / "current.pdf"
 LOGS_DIR = ROOT / "logs"
+PDF_PAGES_DIR.mkdir(parents=True, exist_ok=True)
 
 MAX_PDF_BYTES = 100 * 1024 * 1024
 MAX_PDF_PAGES = 150
@@ -45,12 +52,28 @@ MAX_PROJECT_STATE_BYTES = 128 * 1024 * 1024
 MAX_PROJECT_STROKES = 50_000
 MAX_PROJECT_POINTS = 2_000_000
 MAX_NATIVE_WS_MESSAGE_BYTES = 2 * 1024 * 1024
+BATCH_MAX_DELAY_SECONDS = 2.5
+BATCH_MAX_OPERATIONS = 64
+BATCH_MAX_BYTES = 2 * 1024 * 1024
+BATCH_QUEUE_MAX_OPERATIONS = 256
+BATCH_QUEUE_MAX_BYTES = 8 * 1024 * 1024
+WAL_CHECKPOINT_MIN_BYTES = 32 * 1024 * 1024
 PROJECT_FORMAT = "infinite-notes-project"
 PROJECT_FORMAT_VERSION = 1
 APP_VERSION = 24
 PAGE_GAP = 0.0
 
-app = FastAPI(title="Infinite Notes Prototype")
+@asynccontextmanager
+async def app_lifespan(_app: FastAPI):
+    try:
+        yield
+    finally:
+        if _notebook_writer is not None and _notebook_writer.loop is asyncio.get_running_loop():
+            await _notebook_writer.shutdown()
+        await drain_completion_tasks()
+
+
+app = FastAPI(title="Infinite Notes Prototype", lifespan=app_lifespan)
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.mount("/pdf-pages", StaticFiles(directory=PDF_PAGES_DIR), name="pdf-pages")
@@ -78,6 +101,7 @@ def debug_protocol(direction: str, message: Any, byte_count: int, **fields: Any)
 def empty_state() -> dict[str, Any]:
     return {
         "version": 1,
+        "documentId": str(uuid.uuid4()),
         "documentRevision": 0,
         "document": {
             "filename": None,
@@ -197,48 +221,64 @@ def normalize_document_revision(value: dict[str, Any]) -> bool:
     return True
 
 
-def write_state_atomic(value: dict[str, Any]) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix="state-", suffix=".json", dir=DATA_DIR)
+def normalize_document_id(value: dict[str, Any]) -> bool:
+    """Ensure every persisted notebook has a stable, canonical UUID."""
+    raw_id = value.get("documentId")
+    if isinstance(raw_id, str):
+        try:
+            canonical_id = str(uuid.UUID(raw_id))
+        except ValueError:
+            canonical_id = ""
+        if canonical_id:
+            if raw_id == canonical_id:
+                return False
+            value["documentId"] = canonical_id
+            return True
+    value["documentId"] = str(uuid.uuid4())
+    return True
+
+
+def load_authoritative_state() -> tuple[NotebookStore, dict[str, Any]]:
+    """Import legacy JSON once, without modifying the migration source."""
+    store = NotebookStore(DATABASE_FILE)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(value, f, ensure_ascii=False, separators=(",", ":"))
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, STATE_FILE)
-    finally:
-        if os.path.exists(tmp_name):
-            os.unlink(tmp_name)
+        if store.initialized():
+            return store, store.load()
+        if store.existed_before_open and not STATE_FILE.exists():
+            raise ValueError(
+                f"Notebook database {DATABASE_FILE} is uninitialized and no legacy state.json exists; "
+                "restore a backup or provide the original state.json"
+            )
+        if STATE_FILE.exists():
+            with STATE_FILE.open("r", encoding="utf-8") as source:
+                candidate = json.load(source)
+            if not isinstance(candidate, dict):
+                raise ValueError("Legacy notebook root is not an object")
+            candidate.setdefault("version", 1)
+            candidate.setdefault("document", {"filename": None, "pages": []})
+            candidate.setdefault("strokes", {})
+            normalize_document_revision(candidate)
+            normalize_document_id(candidate)
+            normalize_state_page_layout(candidate)
+            if not isinstance(candidate["strokes"], dict):
+                raise ValueError("Legacy notebook strokes are not an object")
+        else:
+            candidate = empty_state()
+        store.initialize(candidate)
+        loaded = store.load()
+        if loaded != candidate:
+            raise ValueError("Notebook database migration did not preserve the source state")
+        return store, loaded
+    except Exception:
+        store.close()
+        raise
 
 
-def load_state() -> dict[str, Any]:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PDF_PAGES_DIR.mkdir(parents=True, exist_ok=True)
-    if not STATE_FILE.exists():
-        return empty_state()
-    try:
-        with STATE_FILE.open("r", encoding="utf-8") as f:
-            value = json.load(f)
-        if not isinstance(value, dict):
-            raise ValueError("state root is not an object")
-        value.setdefault("version", 1)
-        value.setdefault("document", {"filename": None, "pages": []})
-        value.setdefault("strokes", {})
-        changed = normalize_document_revision(value)
-        changed = normalize_state_page_layout(value) or changed
-        if changed:
-            write_state_atomic(value)
-        return value
-    except Exception as exc:
-        backup = STATE_FILE.with_suffix(f".broken-{uuid.uuid4().hex[:8]}.json")
-        STATE_FILE.replace(backup)
-        print(f"Warning: state file was invalid and moved to {backup}: {exc}")
-        return empty_state()
-
-
-state: dict[str, Any] = load_state()
+notebook_store, state = load_authoritative_state()
+recover_transition(DATA_DIR, CURRENT_PDF, PDF_PAGES_DIR, int(state["documentRevision"]))
 state_lock = asyncio.Lock()
 clients: set[WebSocket] = set()
+completion_tasks: set[asyncio.Task[None]] = set()
 client_roles: dict[WebSocket, str] = {}
 client_kinds: dict[WebSocket, str] = {}
 client_ids: dict[WebSocket, str] = {}
@@ -264,10 +304,222 @@ DELETE_OPERATION_STALE_SECONDS = 60.0
 # UUID also guarantees a server restart forces one fresh state download.
 SERVER_INSTANCE_ID = uuid.uuid4().hex
 state_revision = 0
+stored_metadata = copy.deepcopy({key: value for key, value in state.items() if key != "strokes"})
+persistence_failed = False
+
+
+def stroke_digest(stroke: dict[str, Any]) -> bytes:
+    encoded = json.dumps(stroke, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).digest()
+
+
+class BatchedNotebookWriter:
+    """Serialize ordered mutations into bounded WAL transactions."""
+
+    def __init__(self, store: NotebookStore, loop: asyncio.AbstractEventLoop) -> None:
+        self.store = store
+        self.loop = loop
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="notebook-writer")
+        self.lock = asyncio.Lock()
+        self.pending: list[dict[str, Any]] = []
+        # Keep the durable completion separate from callers' cancellable waits,
+        # including while a batch has left pending and is writing on the worker.
+        self.commit_tail: asyncio.Future[int] | None = None
+        self.flush_tasks: set[asyncio.Task[None]] = set()
+        self.timer: asyncio.TimerHandle | None = None
+        durable_state = store.load()
+        self.next_revision = int(durable_state["documentRevision"])
+        self.expected_metadata = {
+            key: copy.deepcopy(value) for key, value in durable_state.items() if key != "strokes"
+        }
+        self.expected_hashes = {
+            key: stroke_digest(value) for key, value in durable_state["strokes"].items()
+        }
+        self.pending_bytes = 0
+        self.checkpoint_task: asyncio.Task[None] | None = None
+        self.closed = False
+
+    async def run_storage(self, action: Any, *args: Any) -> Any:
+        return await self.loop.run_in_executor(self.executor, lambda: action(*args))
+
+    def enqueue(
+        self,
+        *,
+        upsert_ids: set[str] | None = None,
+        delete_ids: set[str] | None = None,
+        replace_all: bool = False,
+    ) -> asyncio.Future[int]:
+        if persistence_failed:
+            raise RuntimeError("Notebook storage failed; restart the server before editing")
+        upsert_ids = set(upsert_ids or ())
+        delete_ids = set(delete_ids or ())
+        metadata = copy.deepcopy({key: value for key, value in state.items() if key != "strokes"})
+        metadata.pop("documentRevision", None)
+        upserts: dict[str, dict[str, Any]] = {}
+        if replace_all:
+            upsert_ids = set(state["strokes"])
+            self.expected_hashes.clear()
+        for key in upsert_ids:
+            stroke = state["strokes"][key]
+            digest = stroke_digest(stroke)
+            if replace_all or self.expected_hashes.get(key) != digest:
+                upserts[key] = copy.deepcopy(stroke)
+                self.expected_hashes[key] = digest
+        deletes = {key for key in delete_ids if key in self.expected_hashes}
+        for key in deletes:
+            del self.expected_hashes[key]
+        expected_metadata = copy.deepcopy(self.expected_metadata)
+        expected_metadata.pop("documentRevision", None)
+        result: asyncio.Future[int] = self.loop.create_future()
+        if not replace_all and not upserts and not deletes and metadata == expected_metadata:
+            if self.commit_tail is not None:
+                return asyncio.shield(self.commit_tail)
+            result.set_result(current_document_revision())
+            return result
+        self.next_revision += 1
+        metadata["documentRevision"] = self.next_revision
+        self.expected_metadata = metadata
+        entry = {
+            "upserts": upserts,
+            "deletes": deletes,
+            "replace_all": replace_all,
+            "metadata": metadata,
+            "future": result,
+        }
+        self.pending.append(entry)
+        self.commit_tail = result
+        self.pending_bytes += sum(len(json.dumps(value)) for value in upserts.values())
+        if self.timer is None:
+            self.timer = self.loop.call_later(BATCH_MAX_DELAY_SECONDS, lambda: self.loop.create_task(self.flush()))
+        if len(self.pending) >= BATCH_MAX_OPERATIONS or self.pending_bytes >= BATCH_MAX_BYTES:
+            self.loop.create_task(self.flush())
+        return asyncio.shield(result)
+
+    async def flush(self) -> None:
+        # An HTTP/WebSocket caller may disappear while SQLite is writing. The
+        # owned task must still publish the revision and resolve durable ACKs.
+        task = self.loop.create_task(self._flush())
+        self.flush_tasks.add(task)
+        task.add_done_callback(self.flush_tasks.discard)
+        await asyncio.shield(task)
+
+    async def _flush(self) -> None:
+        global state_revision, stored_metadata, persistence_failed
+        async with self.lock:
+            if self.timer is not None:
+                self.timer.cancel()
+                self.timer = None
+            if not self.pending:
+                return
+            batch, self.pending = self.pending, []
+            self.pending_bytes = 0
+            started = time.perf_counter()
+            try:
+                await self.run_storage(self.store.commit_batch, batch)
+            except Exception as exc:
+                persistence_failed = True
+                try:
+                    durable_state = await self.run_storage(self.store.load)
+                    state.clear()
+                    state.update(durable_state)
+                except Exception as reload_exc:
+                    debug_event("persistence", "reload_failed", errorType=type(reload_exc).__name__)
+                history.clear()
+                redo_history.clear()
+                pending_stroke_history.clear()
+                pending_delete_operations.clear()
+                for entry in batch + self.pending:
+                    if not entry["future"].done():
+                        entry["future"].set_exception(exc)
+                self.pending.clear()
+                debug_event("persistence", "commit_failed", errorType=type(exc).__name__)
+                return
+            state["documentRevision"] = batch[-1]["metadata"]["documentRevision"]
+            stored_metadata = copy.deepcopy(batch[-1]["metadata"])
+            state_revision += len(batch)
+            debug_event(
+                "persistence", "batch_committed",
+                operationCount=len(batch),
+                upsertCount=sum(len(entry["upserts"]) for entry in batch),
+                deleteCount=sum(len(entry["deletes"]) for entry in batch),
+                durationMs=round((time.perf_counter() - started) * 1000, 3),
+                documentRevision=current_document_revision(),
+            )
+            for entry in batch:
+                entry["future"].set_result(entry["metadata"]["documentRevision"])
+            if self.checkpoint_task is None or self.checkpoint_task.done():
+                self.checkpoint_task = self.loop.create_task(self.checkpoint_if_large())
+
+    async def checkpoint_if_large(self) -> None:
+        # PASSIVE avoids waiting on readers. A later idle batch retries if a
+        # reader prevented truncation; no checkpoint is done per small edit.
+        async with self.lock:
+            if self.pending:
+                return
+            wal = self.store.path.with_name(self.store.path.name + "-wal")
+            try:
+                if wal.stat().st_size >= WAL_CHECKPOINT_MIN_BYTES:
+                    await self.run_storage(self.store.checkpoint)
+                    debug_event("persistence", "wal_checkpoint", walBytes=wal.stat().st_size)
+            except FileNotFoundError:
+                return
+            except Exception as exc:
+                debug_event("persistence", "wal_checkpoint_failed", errorType=type(exc).__name__)
+
+    async def shutdown(self) -> None:
+        if self.closed:
+            return
+        await self.drain()
+        if self.checkpoint_task is not None:
+            await self.checkpoint_task
+        await asyncio.to_thread(self.executor.shutdown, True)
+        self.closed = True
+
+    async def drain(self) -> None:
+        while self.pending or self.lock.locked() or self.flush_tasks:
+            if self.flush_tasks:
+                await asyncio.shield(asyncio.gather(*tuple(self.flush_tasks)))
+            await self.flush()
+
+    async def wait_for_capacity(self) -> None:
+        if (len(self.pending) >= BATCH_QUEUE_MAX_OPERATIONS
+                or self.pending_bytes >= BATCH_QUEUE_MAX_BYTES):
+            await self.drain()
+
+
+_notebook_writer: BatchedNotebookWriter | None = None
+
+
+def notebook_writer() -> BatchedNotebookWriter:
+    global _notebook_writer
+    loop = asyncio.get_running_loop()
+    if (_notebook_writer is None or _notebook_writer.closed or _notebook_writer.loop is not loop
+            or _notebook_writer.store is not notebook_store):
+        if _notebook_writer is not None and (
+            _notebook_writer.pending or _notebook_writer.lock.locked() or _notebook_writer.flush_tasks
+        ):
+            raise RuntimeError("Cannot change notebook writer while edits are uncommitted")
+        if _notebook_writer is not None and not _notebook_writer.closed:
+            _notebook_writer.executor.shutdown(wait=False)
+        _notebook_writer = BatchedNotebookWriter(notebook_store, loop)
+    return _notebook_writer
+
+
+async def drain_completion_tasks() -> None:
+    while completion_tasks:
+        await asyncio.gather(*tuple(completion_tasks), return_exceptions=True)
 
 
 def current_state_token() -> str:
     return f"{SERVER_INSTANCE_ID}:{state_revision}"
+
+
+def state_token_for_revision(revision: int) -> str:
+    """Pair an ACK's logical revision with its own point in this session."""
+    distance = current_document_revision() - revision
+    if distance < 0 or distance > state_revision:
+        raise RuntimeError("Committed revision and state token are inconsistent")
+    return f"{SERVER_INSTANCE_ID}:{state_revision - distance}"
 
 
 def current_document_revision() -> int:
@@ -275,52 +527,42 @@ def current_document_revision() -> int:
     return revision if type(revision) is int and revision >= 0 else 0
 
 
+def current_document_id() -> str:
+    document_id = state.get("documentId")
+    return document_id if isinstance(document_id, str) else ""
+
+
+def ensure_storage_healthy() -> None:
+    if persistence_failed:
+        raise HTTPException(status_code=503, detail="Notebook storage failed; restart the server before editing")
+
+
 debug_event(
     "lifecycle",
     "session_started",
     processId=os.getpid(),
+    documentId=current_document_id(),
+    documentRevision=current_document_revision(),
     stateToken=current_state_token(),
 )
 atexit.register(debug_log.close)
 
 
-def save_state_atomic() -> int:
-    global state_revision
-    started = time.perf_counter() if debug_log.enabled else None
-    previous_revision = state.get("documentRevision")
-    next_revision = current_document_revision() + 1
-    state["documentRevision"] = next_revision
-    if debug_log.enabled:
-        debug_event(
-            "persistence",
-            "save_started",
-            stateToken=current_state_token(),
-            strokeCount=len(state.get("strokes", {})),
-        )
-    try:
-        write_state_atomic(state)
-    except Exception:
-        if previous_revision is None:
-            state.pop("documentRevision", None)
-        else:
-            state["documentRevision"] = previous_revision
-        raise
-    state_revision += 1
-    if started is not None:
-        try:
-            byte_count = STATE_FILE.stat().st_size
-        except OSError:
-            byte_count = None
-        debug_event(
-            "persistence",
-            "save_completed",
-            durationMs=round((time.perf_counter() - started) * 1000, 3),
-            byteCount=byte_count,
-            stateToken=current_state_token(),
-            documentRevision=next_revision,
-            strokeCount=len(state.get("strokes", {})),
-        )
-    return next_revision
+async def save_state_atomic(
+    *,
+    upsert_ids: set[str] | None = None,
+    delete_ids: set[str] | None = None,
+    replace_all: bool = False,
+) -> int:
+    """Explicit actions commit promptly; streamed strokes use the batch timer."""
+    writer = notebook_writer()
+    committed = writer.enqueue(
+        upsert_ids=upsert_ids,
+        delete_ids=delete_ids,
+        replace_all=replace_all,
+    )
+    await writer.flush()
+    return await committed
 
 
 def discard_client(websocket: WebSocket) -> None:
@@ -548,12 +790,21 @@ def snapshot_message(*, reason: str = "sync") -> dict[str, Any]:
     }
 
 
+def durable_snapshot() -> dict[str, Any]:
+    """Exclude in-progress Pencil strokes from authoritative HTTP/export data."""
+    snapshot = copy.deepcopy(state)
+    for stroke_id in pending_stroke_history:
+        snapshot["strokes"].pop(stroke_id, None)
+    return snapshot
+
+
 def state_refresh_message(*, reason: str = "sync") -> dict[str, Any]:
     """Small WebSocket notification telling native clients to fetch /api/state."""
     message = {
         "type": "state_refresh",
         "reason": reason,
         "serverTime": datetime.now(timezone.utc).isoformat(),
+        "documentId": current_document_id(),
         "documentRevision": current_document_revision(),
     }
     # The token is only needed for the native initial reconnect handshake.
@@ -838,25 +1089,29 @@ def prepare_pdf(content: bytes) -> tuple[Path, list[dict[str, Any]]]:
     return temp_root, pages
 
 
-def commit_prepared_pdf(temp_root: Path) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PDF_PAGES_DIR.mkdir(parents=True, exist_ok=True)
-
-    for pattern in ("page-*.png", "page-*.svg"):
-        for old in PDF_PAGES_DIR.glob(pattern):
-            old.unlink(missing_ok=True)
-    for rendered in sorted((temp_root / "pdf_pages").glob("page-*.svg")):
-        os.replace(rendered, PDF_PAGES_DIR / rendered.name)
-    os.replace(temp_root / "current.pdf", CURRENT_PDF)
-    shutil.rmtree(temp_root, ignore_errors=True)
-
-
-def clear_document_files() -> None:
-    CURRENT_PDF.unlink(missing_ok=True)
-    PDF_PAGES_DIR.mkdir(parents=True, exist_ok=True)
-    for pattern in ("page-*.png", "page-*.svg"):
-        for old in PDF_PAGES_DIR.glob(pattern):
-            old.unlink(missing_ok=True)
+@asynccontextmanager
+async def staged_document_assets(prepared_root: Path | None):
+    """Keep both PDF generations until the matching DB revision is durable."""
+    transition = await asyncio.to_thread(
+        begin_transition, DATA_DIR, CURRENT_PDF, PDF_PAGES_DIR,
+        prepared_root, current_document_revision() + 1,
+    )
+    try:
+        await asyncio.to_thread(install_asset_set, transition / "new", CURRENT_PDF, PDF_PAGES_DIR)
+        yield
+    except Exception:
+        # If storage is unavailable, leave the marker for startup recovery.
+        try:
+            durable = await asyncio.to_thread(notebook_store.load)
+            await asyncio.to_thread(
+                recover_transition, DATA_DIR, CURRENT_PDF, PDF_PAGES_DIR,
+                int(durable["documentRevision"]),
+            )
+        except Exception as recovery_exc:
+            debug_event("persistence", "asset_recovery_deferred", errorType=type(recovery_exc).__name__)
+        raise
+    else:
+        await asyncio.to_thread(finish_transition, DATA_DIR)
 
 
 def sanitize_project_pages(raw_pages: Any) -> list[dict[str, Any]]:
@@ -929,11 +1184,14 @@ def sanitize_project_state(raw: Any, *, has_pdf: bool) -> dict[str, Any]:
         filename = safe_filename(raw_document.get("filename"), "document.pdf", extension=".pdf")
         source_pages = sanitize_project_pages(raw_document.get("pages", []))
 
-    return {
+    sanitized = {
         "version": 1,
+        "documentId": raw.get("documentId"),
         "document": {"filename": filename, "pages": source_pages},
         "strokes": sanitized_strokes,
     }
+    normalize_document_id(sanitized)
+    return sanitized
 
 
 def read_project_archive(content: bytes) -> tuple[dict[str, Any], bytes | None]:
@@ -1551,7 +1809,8 @@ async def get_state() -> JSONResponse:
     started = time.perf_counter()
     debug_event("sync", "state_fetch_started")
     async with state_lock:
-        snapshot = copy.deepcopy(state)
+        await notebook_writer().drain()
+        snapshot = durable_snapshot()
         snapshot["stateToken"] = current_state_token()
         response = JSONResponse(snapshot)
     debug_event(
@@ -1564,6 +1823,20 @@ async def get_state() -> JSONResponse:
         pageCount=len(snapshot.get("document", {}).get("pages", [])),
     )
     return response
+
+
+@app.get("/api/changes")
+async def get_changes(documentId: str, sinceRevision: int) -> JSONResponse:
+    """A bounded durable stroke delta; callers must snapshot on a history gap."""
+    ensure_storage_healthy()
+    if sinceRevision < 0:
+        raise HTTPException(status_code=400, detail="sinceRevision must be non-negative")
+    async with state_lock:
+        writer = notebook_writer()
+        await writer.drain()
+        result = await writer.run_storage(notebook_store.changes_since, documentId, sinceRevision)
+        result["stateToken"] = current_state_token()
+    return JSONResponse(result)
 
 
 @app.get("/api/pdf/source")
@@ -1592,6 +1865,7 @@ async def get_source_pdf() -> FileResponse:
 
 @app.post("/api/pdf")
 async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
+    ensure_storage_healthy()
     filename = safe_filename(file.filename, "document.pdf", extension=".pdf")
     content = await file.read(MAX_PDF_BYTES + 1)
     if len(content) > MAX_PDF_BYTES:
@@ -1600,20 +1874,29 @@ async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
     temp_root, pages = prepare_pdf(content)
     try:
         async with state_lock:
-            commit_prepared_pdf(temp_root)
-            state["document"] = {"filename": filename, "pages": pages}
-            state["strokes"] = {}
-            history.clear()
-            redo_history.clear()
-            pending_stroke_history.clear()
-            save_state_atomic()
+            await notebook_writer().drain()
+            await drain_completion_tasks()
+            async with staged_document_assets(temp_root):
+                state["documentId"] = str(uuid.uuid4())
+                state["document"] = {"filename": filename, "pages": pages}
+                state["strokes"] = {}
+                history.clear()
+                redo_history.clear()
+                pending_stroke_history.clear()
+                await save_state_atomic(replace_all=True)
             snapshot = copy.deepcopy(state["document"])
+            document_id = current_document_id()
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
-    await broadcast({"type": "document_changed", "document": snapshot, "clearStrokes": True})
+    await broadcast({
+        "type": "document_changed",
+        "document": snapshot,
+        "documentId": document_id,
+        "clearStrokes": True,
+    })
     await broadcast(history_status_message())
-    return JSONResponse({"ok": True, "document": snapshot})
+    return JSONResponse({"ok": True, "document": snapshot, "documentId": document_id})
 
 
 def remap_strokes_after_page_insert(
@@ -1653,6 +1936,7 @@ def remap_strokes_after_page_insert(
 
 @app.post("/api/pages/insert")
 async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
+    ensure_storage_healthy()
     started = time.perf_counter()
     debug_event("page", "insert_started", afterPageNumber=afterPageNumber)
     async with state_lock:
@@ -1688,20 +1972,23 @@ async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
     temp_root, pages = prepare_pdf(updated_pdf)
     try:
         async with state_lock:
+            await notebook_writer().drain()
+            await drain_completion_tasks()
             if state.get("document", {}).get("pages", []) != old_pages:
                 raise HTTPException(status_code=409, detail="The document changed while the page was being inserted")
             updated_strokes = copy.deepcopy(state.get("strokes", {}))
             shifted_strokes = remap_strokes_after_page_insert(
                 updated_strokes, old_pages, pages, afterPageNumber - 1
             )
-            commit_prepared_pdf(temp_root)
-            state["document"] = {"filename": filename, "pages": pages}
-            state["strokes"] = updated_strokes
-            history.clear()
-            redo_history.clear()
-            pending_stroke_history.clear()
-            save_state_atomic()
+            async with staged_document_assets(temp_root):
+                state["document"] = {"filename": filename, "pages": pages}
+                state["strokes"] = updated_strokes
+                history.clear()
+                redo_history.clear()
+                pending_stroke_history.clear()
+                await save_state_atomic(replace_all=True)
             snapshot = copy.deepcopy(state["document"])
+            document_id = current_document_id()
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -1709,6 +1996,7 @@ async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
     message = {
         "type": "document_changed",
         "document": snapshot,
+        "documentId": document_id,
         "clearStrokes": False,
         "focusPageNumber": inserted_page_number,
         "notice": f"Blank page {inserted_page_number} inserted",
@@ -1736,6 +2024,7 @@ async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
 
 @app.post("/api/pages/append")
 async def append_blank_page() -> JSONResponse:
+    ensure_storage_healthy()
     started = time.perf_counter()
     debug_event("page", "append_started")
     async with state_lock:
@@ -1761,10 +2050,13 @@ async def append_blank_page() -> JSONResponse:
     temp_root, pages = prepare_pdf(updated_pdf)
     try:
         async with state_lock:
-            commit_prepared_pdf(temp_root)
-            state["document"] = {"filename": filename, "pages": pages}
-            save_state_atomic()
+            await notebook_writer().drain()
+            await drain_completion_tasks()
+            async with staged_document_assets(temp_root):
+                state["document"] = {"filename": filename, "pages": pages}
+                await save_state_atomic()
             snapshot = copy.deepcopy(state["document"])
+            document_id = current_document_id()
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
@@ -1772,6 +2064,7 @@ async def append_blank_page() -> JSONResponse:
     message = {
         "type": "document_changed",
         "document": snapshot,
+        "documentId": document_id,
         "clearStrokes": False,
         "focusPageNumber": page_number,
         "notice": f"Blank page {page_number} added",
@@ -1793,9 +2086,10 @@ async def pdf_export_info(overflowMargin: float = 0.0) -> JSONResponse:
     if not (0.0 <= overflowMargin <= 200.0):
         raise HTTPException(status_code=422, detail="overflowMargin must be between 0 and 200")
     async with state_lock:
+        await notebook_writer().drain()
         if not CURRENT_PDF.exists() or not state.get("document", {}).get("pages"):
             raise HTTPException(status_code=400, detail="Open a PDF before exporting notes")
-        snapshot = copy.deepcopy(state)
+        snapshot = durable_snapshot()
     return JSONResponse(export_layout_summary(
         build_pdf_export_layout(snapshot, overflow_margin=overflowMargin)
     ))
@@ -1815,9 +2109,10 @@ async def export_flattened_pdf(
         outer_grid_palette(outerGridStyle)
 
     async with state_lock:
+        await notebook_writer().drain()
         if not CURRENT_PDF.exists() or not state.get("document", {}).get("pages"):
             raise HTTPException(status_code=400, detail="Open a PDF before exporting notes")
-        snapshot = copy.deepcopy(state)
+        snapshot = durable_snapshot()
         pdf_content = CURRENT_PDF.read_bytes()
 
     temp_path, _summary = create_flattened_pdf(
@@ -1844,7 +2139,8 @@ async def export_flattened_pdf(
 @app.get("/api/project/export")
 async def export_project() -> FileResponse:
     async with state_lock:
-        snapshot = copy.deepcopy(state)
+        await notebook_writer().drain()
+        snapshot = durable_snapshot()
         pdf_content = CURRENT_PDF.read_bytes() if CURRENT_PDF.exists() else None
 
     document_name = snapshot.get("document", {}).get("filename") or "infinite-notes"
@@ -1880,6 +2176,7 @@ async def export_project() -> FileResponse:
 
 @app.post("/api/project/import")
 async def import_project(file: UploadFile = File(...)) -> JSONResponse:
+    ensure_storage_healthy()
     content = await file.read(MAX_PROJECT_BYTES + 1)
     if len(content) > MAX_PROJECT_BYTES:
         raise HTTPException(status_code=413, detail="Project file is larger than 256 MB")
@@ -1895,21 +2192,19 @@ async def import_project(file: UploadFile = File(...)) -> JSONResponse:
 
     try:
         async with state_lock:
-            if temp_root is not None:
-                commit_prepared_pdf(temp_root)
-            else:
-                clear_document_files()
-
-            previous_document_revision = current_document_revision()
-            state.clear()
-            state.update(imported_state)
-            # Imported archives are content, not synchronization authority. Keep
-            # the local authority's monotonic revision and advance it on save.
-            state["documentRevision"] = previous_document_revision
-            history.clear()
-            redo_history.clear()
-            pending_stroke_history.clear()
-            save_state_atomic()
+            await notebook_writer().drain()
+            await drain_completion_tasks()
+            async with staged_document_assets(temp_root):
+                previous_document_revision = current_document_revision()
+                state.clear()
+                state.update(imported_state)
+                # Imported archives are content, not synchronization authority. Keep
+                # the local authority's monotonic revision and advance it on save.
+                state["documentRevision"] = previous_document_revision
+                history.clear()
+                redo_history.clear()
+                pending_stroke_history.clear()
+                await save_state_atomic(replace_all=True)
             snapshot = copy.deepcopy(state)
     finally:
         if temp_root is not None:
@@ -1938,12 +2233,15 @@ async def import_project(file: UploadFile = File(...)) -> JSONResponse:
 
 @app.post("/api/reset")
 async def reset_canvas() -> JSONResponse:
+    ensure_storage_healthy()
     async with state_lock:
+        await notebook_writer().drain()
+        await drain_completion_tasks()
         deleted = copy.deepcopy(list(state["strokes"].values()))
         state["strokes"] = {}
         if deleted:
             push_history({"type": "delete", "strokes": deleted})
-        save_state_atomic()
+        await save_state_atomic(replace_all=bool(deleted))
     await broadcast({"type": "clear_strokes"})
     await broadcast(history_status_message())
     return JSONResponse({"ok": True})
@@ -1961,6 +2259,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     client_roles[websocket] = role
     client_kinds[websocket] = client_kind
     client_ids[websocket] = client_id
+    reply_tail: asyncio.Task[None] | None = None
+    outstanding_replies: set[asyncio.Task[None]] = set()
     debug_event(
         "connection",
         "connected",
@@ -1971,6 +2271,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     )
     try:
         async with state_lock:
+            await notebook_writer().drain()
             initial_history = history_status_message()
             initial_message = (
                 state_refresh_message(reason="initial")
@@ -1989,6 +2290,12 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
             try:
                 message = json.loads(raw_text)
                 message_type = message.get("type")
+                if persistence_failed and message_type not in {"ping", "sync_request"}:
+                    if not await safe_send_json(websocket, {
+                        "type": "error", "message": "Notebook storage failed; restart the server before editing",
+                    }):
+                        break
+                    continue
                 debug_protocol(
                     "rx",
                     message,
@@ -2001,6 +2308,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 if message_type == "stroke_begin":
                     stroke = sanitize_stroke(message.get("stroke"))
                     async with state_lock:
+                        if "documentId" in message and message["documentId"] != current_document_id():
+                            raise ValueError("stroke belongs to a different document")
                         state["strokes"][stroke["id"]] = stroke
                         pending_stroke_history.add(stroke["id"])
                     await broadcast({"type": "stroke_begin", "stroke": stroke}, exclude=websocket)
@@ -2012,6 +2321,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         raise ValueError("invalid point batch")
                     points = [validate_point(p) for p in points_raw]
                     async with state_lock:
+                        if "documentId" in message and message["documentId"] != current_document_id():
+                            raise ValueError("stroke belongs to a different document")
                         stroke = state["strokes"].get(stroke_id)
                         if stroke is None:
                             continue
@@ -2024,6 +2335,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     )
 
                 elif message_type == "stroke_end":
+                    await notebook_writer().wait_for_capacity()
                     stroke_id = str(message.get("id", ""))[:128]
                     final_raw = message.get("stroke")
                     final_stroke: dict[str, Any] | None = None
@@ -2035,6 +2347,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     replaced_live = False
                     restored_missing = False
                     async with state_lock:
+                        if "documentId" in message and message["documentId"] != current_document_id():
+                            raise ValueError("stroke belongs to a different document")
                         stroke = state["strokes"].get(stroke_id)
                         if stroke is None and final_stroke is not None:
                             # A complete final stroke is authoritative even when
@@ -2054,38 +2368,63 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 pending_stroke_history.discard(stroke_id)
                                 push_history({"type": "add", "strokes": [copy.deepcopy(stroke)]})
                                 history_changed = True
-                        if stroke is not None:
-                            save_state_atomic()
-                    if restored_missing and final_stroke is not None:
-                        await broadcast({"type": "restore_strokes", "strokes": [final_stroke]}, exclude=websocket)
-                    elif replaced_live and final_stroke is not None:
-                        await broadcast({"type": "replace_strokes", "strokes": [final_stroke]}, exclude=websocket)
-                    await broadcast({"type": "stroke_end", "id": stroke_id}, exclude=websocket)
-                    if history_changed:
-                        await broadcast(history_status_message())
-                    # Preserve the existing client contract: history_state is
-                    # delivered first for a newly committed stroke. The native
-                    # reconnect code still receives stroke_ack immediately after.
-                    if stroke is not None and client_kind == "native":
-                        ack_sent = await safe_send_json(websocket, {
-                            "type": "stroke_ack",
-                            "ids": [stroke_id],
-                            "pointCount": len(stroke.get("points", [])),
-                            "stateToken": current_state_token(),
-                            "documentRevision": current_document_revision(),
-                        })
-                        debug_event(
-                            "ack",
-                            "stroke_ack",
-                            clientId=client_id,
-                            strokeId=stroke_id,
-                            pointCount=len(stroke.get("points", [])),
-                            durationMs=round((time.perf_counter() - message_started) * 1000, 3),
-                            delivered=ack_sent,
-                            stateToken=current_state_token(),
+                        commit_future = (
+                            notebook_writer().enqueue(upsert_ids={stroke_id})
+                            if stroke is not None else None
                         )
-                        if not ack_sent:
-                            break
+                    previous_reply = reply_tail
+                    point_count = len(stroke.get("points", [])) if stroke is not None else 0
+                    stroke_document_id = current_document_id()
+
+                    async def finish_stroke(
+                        previous: asyncio.Task[None] | None = previous_reply,
+                        committed: asyncio.Future[int] | None = commit_future,
+                        ended_id: str = stroke_id,
+                        finished_stroke: dict[str, Any] | None = stroke,
+                        final: dict[str, Any] | None = final_stroke,
+                        restored: bool = restored_missing,
+                        replaced: bool = replaced_live,
+                        changed_history: bool = history_changed,
+                        points: int = point_count,
+                        document_id: str = stroke_document_id,
+                        started: float = message_started,
+                    ) -> None:
+                        if previous is not None:
+                            await previous
+                        try:
+                            revision = await committed if committed is not None else current_document_revision()
+                        except Exception as exc:
+                            debug_event("persistence", "commit_failed", strokeId=ended_id, errorType=type(exc).__name__)
+                            await safe_send_json(websocket, {"type": "error", "message": "Notebook save failed"})
+                            return
+                        if restored and final is not None:
+                            await broadcast({"type": "restore_strokes", "strokes": [final]}, exclude=websocket)
+                        elif replaced and final is not None:
+                            await broadcast({"type": "replace_strokes", "strokes": [final]}, exclude=websocket)
+                        await broadcast({"type": "stroke_end", "id": ended_id}, exclude=websocket)
+                        if changed_history:
+                            await broadcast(history_status_message())
+                        if finished_stroke is not None and client_kind == "native":
+                            ack_sent = await safe_send_json(websocket, {
+                                "type": "stroke_ack",
+                                "documentId": document_id,
+                                "ids": [ended_id],
+                                "pointCount": points,
+                                "stateToken": state_token_for_revision(revision),
+                                "documentRevision": revision,
+                            })
+                            debug_event(
+                                "ack", "stroke_ack", clientId=client_id,
+                                strokeId=ended_id, pointCount=points,
+                                durationMs=round((time.perf_counter() - started) * 1000, 3),
+                                delivered=ack_sent, stateToken=current_state_token(),
+                            )
+
+                    reply_tail = asyncio.create_task(finish_stroke())
+                    outstanding_replies.add(reply_tail)
+                    reply_tail.add_done_callback(outstanding_replies.discard)
+                    completion_tasks.add(reply_tail)
+                    reply_tail.add_done_callback(completion_tasks.discard)
 
                 elif message_type == "reconcile_strokes":
                     strokes_raw = message.get("strokes", [])
@@ -2114,6 +2453,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     identical_count = 0
                     history_changed = False
                     async with state_lock:
+                        if "documentId" in message and message["documentId"] != current_document_id():
+                            raise ValueError("reconnect strokes belong to a different document")
                         for final_stroke in reconciled:
                             stroke_id = final_stroke["id"]
                             existing = state["strokes"].get(stroke_id)
@@ -2147,10 +2488,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 identical_count += 1
 
                         if reconciled:
-                            save_state_atomic()
+                            await save_state_atomic(upsert_ids=set(ids))
 
                     reconcile_ack_sent = await safe_send_json(websocket, {
                         "type": "reconcile_ack",
+                        "documentId": current_document_id(),
                         "ids": ids,
                         "stateToken": current_state_token(),
                         "documentRevision": current_document_revision(),
@@ -2194,7 +2536,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             state["strokes"][stroke["id"]] = stroke
                         if strokes:
                             push_history({"type": "add", "strokes": copy.deepcopy(strokes)})
-                        save_state_atomic()
+                        await save_state_atomic(upsert_ids=set(ids))
                     if strokes:
                         await broadcast({"type": "restore_strokes", "strokes": strokes}, exclude=websocket)
                         await broadcast(history_status_message())
@@ -2222,12 +2564,13 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                                 "before": before,
                                 "after": copy.deepcopy(replacements),
                             })
-                        save_state_atomic()
+                        await save_state_atomic(upsert_ids=set(ids))
                     if replacements:
                         await broadcast({"type": "replace_strokes", "strokes": replacements}, exclude=websocket)
                         await broadcast(history_status_message())
 
                 elif message_type == "delete_strokes":
+                    await notebook_writer().wait_for_capacity()
                     ids_raw = message.get("ids", [])
                     if not isinstance(ids_raw, list):
                         raise ValueError("ids must be a list")
@@ -2275,42 +2618,63 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             push_history({"type": "delete", "strokes": copy.deepcopy(deleted)})
                             history_changed = True
 
-                        save_state_atomic()
-                    acknowledgement = {
-                        "type": "delete_ack",
-                        "ids": ids,
-                        "final": final,
-                    }
-                    # Reconnect state tokens are a native-iPad protocol detail.
-                    # Browser/desktop clients keep the original exact ACK shape.
-                    if client_kind == "native":
-                        acknowledgement["stateToken"] = current_state_token()
-                        acknowledgement["documentRevision"] = current_document_revision()
-                    if operation_id:
-                        acknowledgement["operationId"] = operation_id
-                    delete_ack_sent = await safe_send_json(websocket, acknowledgement)
-                    debug_event(
-                        "ack",
-                        "delete_ack",
-                        clientId=client_id,
-                        idCount=len(ids),
-                        deletedCount=len(deleted),
-                        operationId=operation_id or None,
-                        final=final,
-                        durationMs=round((time.perf_counter() - message_started) * 1000, 3),
-                        delivered=delete_ack_sent,
-                        stateToken=current_state_token() if client_kind == "native" else None,
-                    )
-                    if ids:
-                        await broadcast({"type": "delete_strokes", "ids": ids}, exclude=websocket)
-                    if history_changed:
-                        await broadcast(history_status_message())
-                    if not delete_ack_sent:
-                        break
+                        commit_future = notebook_writer().enqueue(
+                            delete_ids={stroke["id"] for stroke in deleted}
+                        )
+                    previous_reply = reply_tail
+
+                    async def finish_delete(
+                        previous: asyncio.Task[None] | None = previous_reply,
+                        committed: asyncio.Future[int] = commit_future,
+                        deleted_ids: list[str] = ids,
+                        deleted_count: int = len(deleted),
+                        grouped_id: str = operation_id,
+                        is_final: bool = final,
+                        changed_history: bool = history_changed,
+                        started: float = message_started,
+                    ) -> None:
+                        try:
+                            if is_final:
+                                await notebook_writer().flush()
+                            if previous is not None:
+                                await previous
+                            revision = await committed
+                        except Exception as exc:
+                            debug_event("persistence", "commit_failed", errorType=type(exc).__name__)
+                            await safe_send_json(websocket, {"type": "error", "message": "Notebook save failed"})
+                            return
+                        acknowledgement = {
+                            "type": "delete_ack", "ids": deleted_ids, "final": is_final,
+                        }
+                        if client_kind == "native":
+                            acknowledgement["stateToken"] = state_token_for_revision(revision)
+                            acknowledgement["documentRevision"] = revision
+                        if grouped_id:
+                            acknowledgement["operationId"] = grouped_id
+                        delivered = await safe_send_json(websocket, acknowledgement)
+                        debug_event(
+                            "ack", "delete_ack", clientId=client_id,
+                            idCount=len(deleted_ids), deletedCount=deleted_count,
+                            operationId=grouped_id or None, final=is_final,
+                            durationMs=round((time.perf_counter() - started) * 1000, 3),
+                            delivered=delivered,
+                            stateToken=current_state_token() if client_kind == "native" else None,
+                        )
+                        if deleted_ids:
+                            await broadcast({"type": "delete_strokes", "ids": deleted_ids}, exclude=websocket)
+                        if changed_history:
+                            await broadcast(history_status_message())
+
+                    reply_tail = asyncio.create_task(finish_delete())
+                    outstanding_replies.add(reply_tail)
+                    reply_tail.add_done_callback(outstanding_replies.discard)
+                    completion_tasks.add(reply_tail)
+                    reply_tail.add_done_callback(completion_tasks.discard)
 
                 elif message_type == "sync_request":
                     debug_event("sync", "request_started", clientId=client_id, clientKind=client_kind)
                     async with state_lock:
+                        await notebook_writer().drain()
                         requested_history = history_status_message()
                         requested_message = (
                             state_refresh_message(reason="manual_sync")
@@ -2332,12 +2696,14 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
 
                 elif message_type == "clear_strokes":
                     async with state_lock:
+                        await notebook_writer().drain()
+                        await drain_completion_tasks()
                         deleted = copy.deepcopy(list(state["strokes"].values()))
                         state["strokes"] = {}
                         pending_stroke_history.clear()
                         if deleted:
                             push_history({"type": "delete", "strokes": deleted})
-                        save_state_atomic()
+                        await save_state_atomic(replace_all=bool(deleted))
                     await broadcast({"type": "clear_strokes"}, exclude=websocket)
                     if deleted:
                         await broadcast(history_status_message())
@@ -2347,11 +2713,16 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     destination = redo_history if message_type == "undo" else history
                     change: dict[str, Any] | None = None
                     async with state_lock:
+                        await notebook_writer().drain()
+                        await drain_completion_tasks()
                         if source:
                             action = source.pop()
                             change = apply_history_action(action, undo=message_type == "undo")
                             destination.append(action)
-                            save_state_atomic()
+                            if change["type"] in {"restore_strokes", "replace_strokes"}:
+                                await save_state_atomic(upsert_ids={stroke["id"] for stroke in change["strokes"]})
+                            elif change["type"] == "delete_strokes":
+                                await save_state_atomic(delete_ids=set(change["ids"]))
                     if change is not None:
                         await broadcast(change)
                     await broadcast(history_status_message())
