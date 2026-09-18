@@ -20,8 +20,8 @@ cd "$ROOT/ipad"
 if command -v swiftc >/dev/null 2>&1; then
   printf '\n== Native sync and journal tests ==\n'
   native_test_dir="$(mktemp -d -t infinite-notes-native-tests.XXXXXX)"
-  trap 'rm -f -- "$native_test_dir/PendingStrokeJournal" "$native_test_dir/RevisionDeltaAccumulator" "$native_test_dir/LiveStrokeTracker" "$native_test_dir/PendingEraseQueue"; rmdir -- "$native_test_dir"' EXIT
-  for native_test in PendingStrokeJournal RevisionDeltaAccumulator LiveStrokeTracker PendingEraseQueue; do
+  trap 'rm -f -- "$native_test_dir/PendingStrokeJournal" "$native_test_dir/RevisionDeltaAccumulator" "$native_test_dir/LiveStrokeTracker" "$native_test_dir/PendingEraseQueue" "$native_test_dir/EraserSpatialIndex"; rmdir -- "$native_test_dir"' EXIT
+  for native_test in PendingStrokeJournal RevisionDeltaAccumulator LiveStrokeTracker PendingEraseQueue EraserSpatialIndex; do
     native_sources=("Sources/InfiniteNotesStrokeLab/$native_test.swift")
     if [[ "$native_test" == PendingEraseQueue ]]; then
       native_sources+=("Sources/InfiniteNotesStrokeLab/PendingStrokeJournal.swift")

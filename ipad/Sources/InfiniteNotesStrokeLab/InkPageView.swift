@@ -217,6 +217,16 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         scheduleCommittedRefresh()
     }
 
+    func removeCommittedStrokes(_ ids: Set<String>) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for id in ids { removeCommittedVectorEntry(id: id) }
+        pendingCommitOverlayIDs.subtract(ids)
+        committedExclusions.subtract(ids)
+        CATransaction.commit()
+        scheduleLiveRefresh()
+    }
+
     func beginCommitTransition(strokeID: String) {
         pendingCommitOverlayIDs.insert(strokeID)
         scheduleLiveRefresh()
@@ -801,7 +811,10 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         switch contactTool {
         case .eraser:
             let samples = event?.coalescedTouches(for: touch) ?? [touch]
-            for sample in samples { erase(with: sample) }
+            if let operation = eraseOperationID {
+                let points = samples.map { worldPoint(from: $0.location(in: self)) }
+                model.erase(along: points, pageIndex: pageIndex, operationID: operation, alreadyDeleted: &erasedIDs)
+            }
             eraserCursorWorld = worldPoint(from: touch.location(in: self))
             scheduleLiveRefresh()
         case .selector:

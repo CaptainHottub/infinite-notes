@@ -167,7 +167,8 @@ def test_native_eraser_uses_rendered_geometry_path():
 
     assert "static func eraserHitTest" in geometry
     assert "polyline(for: stroke, segments: 96)" in geometry
-    assert "GeometryEngine.eraserHitTest" in app_model
+    assert "GeometryEngine.eraserGeometry" in app_model
+    assert "eraserIndex.candidates" in app_model
     assert "Drawing offline — Pencil strokes will upload after reconnecting" in app_model
 
 

@@ -5,7 +5,9 @@
 - A 90-minute lecture had zero observed desync, undo, or queued-stroke problems.
   Preserve this successful longer-session report alongside the earlier short test.
 - Dense-page erasing can drop to 0 FPS. The user suspects eraser/stroke hit testing.
-  Record for later profiling; do not optimize it in the current feature work.
+  Subsequently authorized for optimization; the performance pass is implemented
+  and automated checks pass, but device acceptance remains open. See
+  [eraser performance](docs/eraser-performance.md) for measurements and checks.
 - Offline erasing is still broken on device: with iPad Wi-Fi off, the first hit
   erases one stroke, sometimes resets the viewport, then further erasing stops.
   Explicitly disconnecting also prevents erasing. Reconnection does not reliably
@@ -16,11 +18,11 @@
   further erasing. Proposed direction for discussion: persist every modification,
   then exchange buffered edits and server changes in a reconnect handshake.
   Neither the diagnosis nor a replacement protocol is established yet.
-- Current scope: configurable eraser cursor colours on/off the PDF, eraser
+- Completed feature scope: configurable eraser cursor colours on/off the PDF, eraser
   diameters below 8 pt, and exports beside the imported PDF/project.
-- Explicitly defer offline-erase repairs and dense-page eraser performance work.
-  After these features, discuss offline erasing first, then clarify workspace
-  and whiteboard requirements before implementing them.
+- Current follow-up: dense-page eraser performance. Offline-erase repairs remain
+  deferred; discuss them separately, then clarify workspace and whiteboard
+  requirements before implementing them.
 - Deferred workspace idea: always-visible outer workspace spanning roughly 2–3
   page widths; subtle vertical separators; pan until it fills half the viewport;
   configurable border colour/width appears only when it contains ink.

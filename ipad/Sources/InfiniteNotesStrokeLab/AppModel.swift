@@ -77,6 +77,11 @@ final class AppModel: ObservableObject {
     private var deferredFetchWorkItem: DispatchWorkItem?
     private var strokes: [String: NoteStroke] = [:]
     private var pageStrokeIDs: [Int: Set<String>] = [:]
+    private var eraserIndex = EraserSpatialIndex()
+    private var eraserDirtyIDs: Set<String> = []
+    private var eraserPreviousPoints: [String: CGPoint] = [:]
+    private var deferredEraseWorkspacePages: Set<Int> = []
+    private var eraserPerformance: [String: EraserPerformance] = [:]
     private var strokeMembership: [String: Set<Int>] = [:]
     private var pageWorkspaceStates: [Int: PageWorkspaceState] = [:]
     private var liveStrokes = LiveStrokeTracker()
@@ -955,6 +960,10 @@ final class AppModel: ObservableObject {
     }
 
     private func refreshWorkspaceStates(for pages: Set<Int>) {
+        if !activeEraseOperations.isEmpty {
+            deferredEraseWorkspacePages.formUnion(pages)
+            return
+        }
         var changed = false
         for index in pages where document.pages.indices.contains(index) {
             let next = OffPageWorkspaceGeometry.state(
@@ -1011,7 +1020,13 @@ final class AppModel: ObservableObject {
     }
 
     func liveStrokesForPage(_ index: Int) -> [NoteStroke] {
-        strokesForPage(index).filter { liveStrokeIDs.contains($0.id) }
+        liveStrokeIDs.compactMap { id in
+            strokeMembership[id]?.contains(index) == true ? strokes[id] : nil
+        }.sorted { lhs, rhs in
+            if lhs.tool == "shape", lhs.shapeType == "xy-plane", lhs.isLocked,
+               !(rhs.tool == "shape" && rhs.shapeType == "xy-plane" && rhs.isLocked) { return true }
+            return lhs.id < rhs.id
+        }
     }
 
     func register(pageView: InkPageView, pageIndex: Int) {
@@ -1102,6 +1117,8 @@ final class AppModel: ObservableObject {
         syncMutationGeneration &+= 1
         stroke.points.append(contentsOf: points)
         strokes[strokeID] = stroke
+        eraserIndex.remove(strokeID)
+        eraserDirtyIDs.insert(strokeID)
         let pages = strokeMembership[strokeID] ?? []
         expandWorkspaceStates(for: stroke, pages: pages)
         invalidatePages(pages, committedChange: false)
@@ -1155,24 +1172,43 @@ final class AppModel: ObservableObject {
     func beginEraseOperation() -> String {
         let id = "erase-\(clientID)-\(UUID().uuidString.lowercased())"
         activeEraseOperations.insert(id)
+        eraserPerformance[id] = EraserPerformance()
         return id
     }
 
     func erase(at worldPoint: CGPoint, pageIndex: Int, operationID: String, alreadyDeleted: inout Set<String>) {
+        erase(along: [worldPoint], pageIndex: pageIndex, operationID: operationID, alreadyDeleted: &alreadyDeleted)
+    }
+
+    func erase(along points: [CGPoint], pageIndex: Int, operationID: String, alreadyDeleted: inout Set<String>) {
+        guard let first = points.first, let last = points.last else { return }
         guard !journalBlocked, let documentID = lastAppliedDocumentID ?? pendingDocumentID else { return }
         guard !hasPendingEdits || pendingDocumentID == documentID else {
             lastError = "Pending edits belong to another notebook. Reopen that notebook to restore them."
             return
         }
-        let radius = eraserSize / 2
-        let candidates = pageStrokeIDs[pageIndex] ?? []
+        let started = ProcessInfo.processInfo.systemUptime
+        let sweep = [eraserPreviousPoints[operationID] ?? first] + points
+        eraserPreviousPoints[operationID] = last
+        let radius = CGFloat(eraserSize / 2)
+        // Live/preview strokes are rebuilt only when queried, never on every point frame.
+        for id in eraserDirtyIDs {
+            if let stroke = strokes[id], !stroke.isLocked,
+               let geometry = GeometryEngine.eraserGeometry(stroke) {
+                eraserIndex.update(id: id, geometry: geometry, pages: strokeMembership[id] ?? [])
+            } else { eraserIndex.remove(id) }
+        }
+        eraserDirtyIDs.removeAll(keepingCapacity: true)
+        let candidates = eraserIndex.candidates(sweep: sweep, radius: radius, page: pageIndex)
         var hitIDs: [String] = []
         for id in candidates where !alreadyDeleted.contains(id) {
-            guard let stroke = strokes[id], !stroke.isLocked else { continue }
-            if Self.stroke(stroke, isWithin: radius, of: worldPoint) {
+            if eraserIndex.geometry(for: id)?.intersects(sweep: sweep, radius: radius) == true {
                 hitIDs.append(id)
             }
         }
+        let tested = ProcessInfo.processInfo.systemUptime
+        eraserPerformance[operationID]?.recordQuery(samples: points.count, candidates: candidates.count,
+                                                  hits: hitIDs.count, seconds: tested - started)
         guard !hitIDs.isEmpty else { return }
         do {
             // Save the deletion first, so a crash cannot replay an erased local stroke.
@@ -1187,12 +1223,27 @@ final class AppModel: ObservableObject {
             lastError = "Could not save offline erasing: \(error.localizedDescription)"
             return
         }
+        let saved = ProcessInfo.processInfo.systemUptime
         alreadyDeleted.formUnion(hitIDs)
-        for id in hitIDs { removeStroke(id: id) }
+        removeStrokes(ids: hitIDs)
+        let removed = ProcessInfo.processInfo.systemUptime
+        eraserPerformance[operationID]?.recordMutation(journal: saved - tested, removal: removed - saved,
+                                                      total: removed - started)
     }
 
     func finishEraseOperation(_ operationID: String) {
         activeEraseOperations.remove(operationID)
+        eraserPreviousPoints.removeValue(forKey: operationID)
+        let workspaceStarted = ProcessInfo.processInfo.systemUptime
+        if activeEraseOperations.isEmpty {
+            let pages = deferredEraseWorkspacePages
+            deferredEraseWorkspacePages.removeAll()
+            refreshWorkspaceStates(for: pages)
+        }
+        if let performance = eraserPerformance.removeValue(forKey: operationID) {
+            DebugSessionLogger.shared.event("performance", "erase_gesture", fields:
+                performance.fields(workspaceSeconds: ProcessInfo.processInfo.systemUptime - workspaceStarted))
+        }
         guard let documentID = pendingDocumentID else { return }
         do {
             try pendingErases.finish(operationID, documentID: documentID)
@@ -1394,6 +1445,9 @@ final class AppModel: ObservableObject {
                     pendingCommitStrokes.removeAll()
                     pendingErases.reset()
                     activeEraseOperations.removeAll()
+                    eraserPreviousPoints.removeAll()
+                    eraserPerformance.removeAll()
+                    deferredEraseWorkspacePages.removeAll()
                     eraseBatchInFlight = nil
                     pendingPointBatches.removeAll()
                     isReconcilingPendingStrokes = false
@@ -1417,6 +1471,8 @@ final class AppModel: ObservableObject {
             if let id = message.id, let points = message.points, var stroke = strokes[id] {
                 stroke.points.append(contentsOf: points)
                 strokes[id] = stroke
+                eraserIndex.remove(id)
+                eraserDirtyIDs.insert(id)
                 let pages = strokeMembership[id] ?? []
                 expandWorkspaceStates(for: stroke, pages: pages)
                 invalidatePages(pages, committedChange: false)
@@ -1439,11 +1495,11 @@ final class AppModel: ObservableObject {
                 insertOrReplace(stroke)
             }
         case "delete_strokes":
-            for id in message.ids ?? [] {
-                removeStroke(id: id)
-            }
+            removeStrokes(ids: message.ids ?? [])
         case "clear_strokes":
             strokes.removeAll()
+            eraserIndex = EraserSpatialIndex()
+            eraserDirtyIDs.removeAll()
             liveStrokes.reset()
             pageStrokeIDs.removeAll()
             strokeMembership.removeAll()
@@ -2029,6 +2085,12 @@ final class AppModel: ObservableObject {
         let pages = membership(for: stroke)
         strokeMembership[stroke.id] = pages
         for page in pages { pageStrokeIDs[page, default: []].insert(stroke.id) }
+        if committedChange {
+            updateEraserIndex(stroke, pages: pages)
+        } else {
+            eraserIndex.remove(stroke.id)
+            eraserDirtyIDs.insert(stroke.id)
+        }
         let affectedPages = oldPages.union(pages)
         if committedChange || !oldPages.subtracting(pages).isEmpty {
             refreshWorkspaceStates(for: affectedPages)
@@ -2039,24 +2101,49 @@ final class AppModel: ObservableObject {
     }
 
     private func removeStroke(id: String) {
+        removeStrokes(ids: [id])
+    }
+
+    private func removeStrokes(ids: [String]) {
+        guard !ids.isEmpty else { return }
         syncMutationGeneration &+= 1
-        let pages = strokeMembership.removeValue(forKey: id) ?? []
-        strokes.removeValue(forKey: id)
-        liveStrokes.end(id)
-        pendingPointBatches.removeValue(forKey: id)
-        selectedStrokeIDs.remove(id)
-        for page in pages { pageStrokeIDs[page]?.remove(id) }
+        var pages: Set<Int> = []
+        for id in ids {
+            let membership = strokeMembership.removeValue(forKey: id) ?? []
+            pages.formUnion(membership)
+            strokes.removeValue(forKey: id)
+            eraserIndex.remove(id)
+            eraserDirtyIDs.remove(id)
+            liveStrokes.end(id)
+            pendingPointBatches.removeValue(forKey: id)
+            for page in membership { pageStrokeIDs[page]?.remove(id) }
+        }
+        let removed = Set(ids)
+        if !selectedStrokeIDs.isDisjoint(with: removed) { selectedStrokeIDs.subtract(removed) }
         refreshWorkspaceStates(for: pages)
-        invalidatePages(pages)
+        for page in pages {
+            cleanupWeakViews(pageIndex: page)
+            for view in weakPageViews[page] ?? [] { view.value?.removeCommittedStrokes(removed) }
+        }
+    }
+
+    private func updateEraserIndex(_ stroke: NoteStroke, pages: Set<Int>) {
+        eraserDirtyIDs.remove(stroke.id)
+        if !stroke.isLocked, let geometry = GeometryEngine.eraserGeometry(stroke) {
+            eraserIndex.update(id: stroke.id, geometry: geometry, pages: pages)
+        } else { eraserIndex.remove(stroke.id) }
     }
 
     private func rebuildPageIndex() {
         pageStrokeIDs.removeAll(keepingCapacity: true)
         strokeMembership.removeAll(keepingCapacity: true)
+        eraserIndex = EraserSpatialIndex()
+        eraserDirtyIDs.removeAll()
         for stroke in strokes.values {
             let pages = membership(for: stroke)
             strokeMembership[stroke.id] = pages
             for page in pages { pageStrokeIDs[page, default: []].insert(stroke.id) }
+            updateEraserIndex(stroke, pages: pages)
         }
     }
 
@@ -2166,15 +2253,6 @@ final class AppModel: ObservableObject {
         components.fragment = nil
         return components.url
     }
-
-    private static func stroke(_ stroke: NoteStroke, isWithin radius: Double, of point: CGPoint) -> Bool {
-        GeometryEngine.eraserHitTest(
-            stroke,
-            point: point,
-            radius: CGFloat(max(0.1, radius))
-        )
-    }
-
 
 }
 

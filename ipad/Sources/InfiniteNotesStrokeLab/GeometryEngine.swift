@@ -367,24 +367,13 @@ enum GeometryEngine {
     /// selection/bounding box. This is intentionally separate from selection
     /// hit testing, where clicking inside some closed shapes is useful.
     static func eraserHitTest(_ stroke: NoteStroke, point: CGPoint, radius: CGFloat) -> Bool {
-        let limit = max(0.1, radius) + max(0.05, CGFloat(stroke.width) / 2)
+        eraserGeometry(stroke)?.intersects(sweep: [point], radius: radius) ?? false
+    }
 
-        if isGeometry(stroke) {
-            let path = polyline(for: stroke, segments: 96)
-            guard let first = path.first else { return false }
-            if path.count == 1 {
-                return hypot(point.x - first.x, point.y - first.y) <= limit
-            }
-            let limitSquared = limit * limit
-            for index in 1..<path.count {
-                if segmentDistanceSquared(point, path[index - 1], path[index]) <= limitSquared {
-                    return true
-                }
-            }
-            return false
-        }
-
-        return hitTest(stroke, point: point, threshold: limit) != nil
+    static func eraserGeometry(_ stroke: NoteStroke) -> EraserHitGeometry? {
+        let points = isGeometry(stroke) ? polyline(for: stroke, segments: 96) : stroke.points.map(\.cgPoint)
+        return EraserHitGeometry(points: points, width: CGFloat(stroke.width),
+                                 filled: stroke.tool == "text" && points.count >= 4)
     }
 
     static func segmentDistanceSquared(_ point: CGPoint, _ a: CGPoint, _ b: CGPoint) -> CGFloat {
