@@ -67,8 +67,11 @@ def test_eraser_cursor_has_fill_and_explicit_perimeter():
     end = OVERLAYS.index("static func lasso", start)
     block = OVERLAYS[start:end]
     assert "systemGray.withAlphaComponent" in block
-    assert "label.withAlphaComponent(0.92)" in block
-    assert "lineWidth: 2.0 * inverseZoom" in block
+    assert "settings.resolvedEraserPDFOutlineColor" in block
+    assert "settings.resolvedEraserWorkspaceOutlineColor" in block
+    assert "strokeColor: outline.cgColor" in block
+    assert "lineWidth: min(2.0 * inverseZoom, viewDiameter / 3)" in block
+    assert "sourcePage: model.sourcePageInfo(at: pageIndex)" in INK_VIEW
 
 
 def test_status_pages_are_sorted_numerically_and_current_page_is_bold():

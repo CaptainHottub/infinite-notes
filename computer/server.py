@@ -21,10 +21,11 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote, urlsplit
 
 import fitz  # PyMuPDF
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -32,7 +33,9 @@ from starlette.middleware.gzip import GZipMiddleware
 
 from asset_persistence import begin_transition, finish_transition, install_asset_set, recover_transition
 from debug_logging import DebugEventLogger
+from discovery import ServerAdvertisement
 from persistence import NotebookStore
+import local_files
 
 ROOT = Path(__file__).resolve().parent
 STATIC_DIR = ROOT / "static"
@@ -65,12 +68,24 @@ PAGE_GAP = 0.0
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
+    advertisement = ServerAdvertisement()
     try:
+        # The CLI passes its actual bind settings to the serving/reload process.
+        # Direct ASGI imports (including tests) do not advertise a guessed port.
+        if os.environ.get("INFINITE_NOTES_DISCOVERY_PORT"):
+            await asyncio.to_thread(
+                advertisement.start,
+                os.environ.get("INFINITE_NOTES_DISCOVERY_HOST", "0.0.0.0"),
+                int(os.environ["INFINITE_NOTES_DISCOVERY_PORT"]),
+            )
         yield
     finally:
-        if _notebook_writer is not None and _notebook_writer.loop is asyncio.get_running_loop():
-            await _notebook_writer.shutdown()
-        await drain_completion_tasks()
+        try:
+            if _notebook_writer is not None and _notebook_writer.loop is asyncio.get_running_loop():
+                await _notebook_writer.shutdown()
+            await drain_completion_tasks()
+        finally:
+            await asyncio.to_thread(advertisement.close)
 
 
 app = FastAPI(title="Infinite Notes Prototype", lifespan=app_lifespan)
@@ -1884,6 +1899,7 @@ async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
                 redo_history.clear()
                 pending_stroke_history.clear()
                 await save_state_atomic(replace_all=True)
+                local_files.clear_origin(DATA_DIR)
             snapshot = copy.deepcopy(state["document"])
             document_id = current_document_id()
     finally:
@@ -2097,10 +2113,14 @@ async def pdf_export_info(overflowMargin: float = 0.0) -> JSONResponse:
 
 @app.get("/api/pdf/export")
 async def export_flattened_pdf(
+    request: Request,
     overflowMargin: float = 0.0,
     outerGridStyle: str | None = None,
     outerGridSpacing: float = 20.0,
+    saveBesideSource: bool = False,
 ) -> FileResponse:
+    if saveBesideSource:
+        require_local_desktop(request, write=True)
     if not (0.0 <= overflowMargin <= 200.0):
         raise HTTPException(status_code=422, detail="overflowMargin must be between 0 and 200")
     if not (4.0 <= outerGridSpacing <= 200.0):
@@ -2114,6 +2134,7 @@ async def export_flattened_pdf(
             raise HTTPException(status_code=400, detail="Open a PDF before exporting notes")
         snapshot = durable_snapshot()
         pdf_content = CURRENT_PDF.read_bytes()
+        export_folder = local_files.get_origin(DATA_DIR, current_document_id()) if saveBesideSource else None
 
     temp_path, _summary = create_flattened_pdf(
         snapshot,
@@ -2128,20 +2149,32 @@ async def export_flattened_pdf(
         "infinite-notes.pdf",
         extension=".pdf",
     )
+    headers = {}
+    if export_folder is not None:
+        try:
+            destination = await asyncio.to_thread(local_files.save_export, temp_path, export_folder, export_name)
+            headers["X-Infinite-Notes-Saved-Path"] = quote(str(destination), safe="")
+        except (OSError, ValueError) as exc:
+            temp_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=409, detail=f"Could not save beside the imported file: {exc}") from exc
     return FileResponse(
         temp_path,
         media_type="application/pdf",
         filename=export_name,
+        headers=headers,
         background=BackgroundTask(temp_path.unlink, missing_ok=True),
     )
 
 
 @app.get("/api/project/export")
-async def export_project() -> FileResponse:
+async def export_project(request: Request, saveBesideSource: bool = False) -> FileResponse:
+    if saveBesideSource:
+        require_local_desktop(request, write=True)
     async with state_lock:
         await notebook_writer().drain()
         snapshot = durable_snapshot()
         pdf_content = CURRENT_PDF.read_bytes() if CURRENT_PDF.exists() else None
+        export_folder = local_files.get_origin(DATA_DIR, current_document_id()) if saveBesideSource else None
 
     document_name = snapshot.get("document", {}).get("filename") or "infinite-notes"
     project_name = safe_filename(f"{Path(document_name).stem}.inotes", "infinite-notes.inotes", extension=".inotes")
@@ -2166,10 +2199,19 @@ async def export_project() -> FileResponse:
         Path(temp_name).unlink(missing_ok=True)
         raise
 
+    headers = {}
+    if export_folder is not None:
+        try:
+            destination = await asyncio.to_thread(local_files.save_export, Path(temp_name), export_folder, project_name)
+            headers["X-Infinite-Notes-Saved-Path"] = quote(str(destination), safe="")
+        except (OSError, ValueError) as exc:
+            Path(temp_name).unlink(missing_ok=True)
+            raise HTTPException(status_code=409, detail=f"Could not save beside the imported file: {exc}") from exc
     return FileResponse(
         temp_name,
         media_type="application/vnd.infinite-notes.project+zip",
         filename=project_name,
+        headers=headers,
         background=BackgroundTask(Path(temp_name).unlink, missing_ok=True),
     )
 
@@ -2205,6 +2247,7 @@ async def import_project(file: UploadFile = File(...)) -> JSONResponse:
                 redo_history.clear()
                 pending_stroke_history.clear()
                 await save_state_atomic(replace_all=True)
+                local_files.clear_origin(DATA_DIR)
             snapshot = copy.deepcopy(state)
     finally:
         if temp_root is not None:
@@ -2228,7 +2271,71 @@ async def import_project(file: UploadFile = File(...)) -> JSONResponse:
         "reason": "project_import",
         "strokeCount": len(snapshot.get("strokes", {})),
         "document": snapshot.get("document", {}),
+        "documentId": snapshot.get("documentId"),
     })
+
+
+local_file_dialog_lock = asyncio.Lock()
+
+
+def require_local_desktop(request: Request, *, write: bool = False) -> None:
+    if (request.client is None or request.client.host not in {"127.0.0.1", "::1"}
+            or request.url.hostname not in {"127.0.0.1", "localhost", "::1"}):
+        raise HTTPException(status_code=403, detail="Open the desktop interface at http://127.0.0.1:8000")
+    origin = request.headers.get("origin")
+    if origin and (urlsplit(origin).scheme, urlsplit(origin).netloc) != (request.url.scheme, request.url.netloc):
+        raise HTTPException(status_code=403, detail="Cross-origin desktop file access is not allowed")
+    if write and request.headers.get("X-Infinite-Notes-Local") != "1":
+        raise HTTPException(status_code=403, detail="Desktop file access requires a local application request")
+
+
+@app.get("/api/local-files")
+async def local_file_status(request: Request) -> JSONResponse:
+    require_local_desktop(request)
+    async with state_lock:
+        folder = local_files.get_origin(DATA_DIR, current_document_id())
+        return JSONResponse({"available": bool(local_files.picker_program()), "hasFolder": folder is not None,
+                             "folder": str(folder) if folder else None})
+
+
+@app.post("/api/local-files/{kind}")
+async def select_local_file(kind: str, request: Request) -> JSONResponse:
+    require_local_desktop(request, write=True)
+    if kind not in {"pdf", "project", "folder"}:
+        raise HTTPException(status_code=404, detail="Unknown file operation")
+    if local_file_dialog_lock.locked():
+        raise HTTPException(status_code=409, detail="A desktop file picker is already open")
+    async with local_file_dialog_lock:
+        initial_document_id = current_document_id()
+        try:
+            selected = await local_files.choose_path(kind)
+        except (OSError, RuntimeError, TimeoutError) as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        if selected is None:
+            return JSONResponse({"cancelled": True})
+        if kind == "folder":
+            async with state_lock:
+                if initial_document_id != current_document_id():
+                    raise HTTPException(status_code=409, detail="Notebook changed while selecting a folder; try again")
+                try:
+                    local_files.set_origin(DATA_DIR, current_document_id(), selected)
+                except (OSError, ValueError) as exc:
+                    raise HTTPException(status_code=409, detail=f"Could not remember the export folder: {exc}") from exc
+            return JSONResponse({"folder": str(selected)})
+        if selected.suffix.lower() not in ({".pdf"} if kind == "pdf" else {".inotes", ".zip"}):
+            raise HTTPException(status_code=400, detail="Choose a PDF or Infinite Notes project file")
+        try:
+            with selected.open("rb") as source:
+                upload = UploadFile(filename=selected.name, file=source)
+                response = await (upload_pdf(upload) if kind == "pdf" else import_project(upload))
+            data = json.loads(response.body)
+            async with state_lock:
+                if data["documentId"] != current_document_id():
+                    raise HTTPException(status_code=409, detail="Notebook changed before its export folder could be saved")
+                local_files.set_origin(DATA_DIR, data["documentId"], selected.parent)
+            return response
+        except OSError as exc:
+            raise HTTPException(status_code=400, detail=f"Could not use the selected file: {exc}") from exc
 
 
 @app.post("/api/reset")
@@ -2582,6 +2689,9 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     deleted: list[dict[str, Any]] = []
                     history_changed = False
                     async with state_lock:
+                        if "documentId" in message and message["documentId"] != current_document_id():
+                            raise ValueError("erased strokes belong to a different document")
+                        delete_document_id = current_document_id()
                         now = time.monotonic()
                         stale_ids = [
                             key for key, value in pending_delete_operations.items()
@@ -2629,6 +2739,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                         deleted_ids: list[str] = ids,
                         deleted_count: int = len(deleted),
                         grouped_id: str = operation_id,
+                        document_id: str = delete_document_id,
                         is_final: bool = final,
                         changed_history: bool = history_changed,
                         started: float = message_started,
@@ -2647,6 +2758,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                             "type": "delete_ack", "ids": deleted_ids, "final": is_final,
                         }
                         if client_kind == "native":
+                            acknowledgement["documentId"] = document_id
                             acknowledgement["stateToken"] = state_token_for_revision(revision)
                             acknowledgement["documentRevision"] = revision
                         if grouped_id:
@@ -2801,6 +2913,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    os.environ["INFINITE_NOTES_DISCOVERY_HOST"] = args.host
+    os.environ["INFINITE_NOTES_DISCOVERY_PORT"] = str(args.port)
     if args.debug:
         # Uvicorn imports ``server`` as the application module. Passing debug via
         # the environment gives that serving process exactly one session logger,

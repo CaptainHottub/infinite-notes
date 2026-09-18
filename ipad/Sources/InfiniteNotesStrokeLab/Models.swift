@@ -138,6 +138,12 @@ struct NativeAppConfiguration: Codable, Equatable {
     /// Optional so existing saved settings continue decoding after diagnostics UI additions.
     var showFPSInStatusBar: Bool?
     var showPipelineDiagnosticsSidebar: Bool?
+    // Optional fields preserve previously saved configurations.
+    var eraserPDFOutlineColor: String?
+    var eraserWorkspaceOutlineColor: String?
+
+    var resolvedEraserPDFOutlineColor: String { eraserPDFOutlineColor ?? "#202020" }
+    var resolvedEraserWorkspaceOutlineColor: String { eraserWorkspaceOutlineColor ?? "#FFFFFF" }
 
     // Geometry creation and snapping
     var geometryLineStyle: GeometryLineStyle = .solid

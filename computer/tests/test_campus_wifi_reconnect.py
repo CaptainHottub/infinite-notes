@@ -111,7 +111,9 @@ def test_native_client_source_contains_websocket_heartbeat_and_revision_guard():
     assert 'endpoint(path: "/api/changes"' in app_model
     assert 'RevisionDeltaSafety.sameServerInstance(incomingToken, lastAppliedStateToken)' in app_model
     assert 'fallbackRevisionChanges(reason: "local_or_live_edit")' in app_model
-    assert 'if pendingCommitStrokes.isEmpty { scheduleDeferredStateFetch() }' in app_model
+    stroke_ack = app_model.split('case "stroke_ack":', 1)[1].split('case "reconcile_ack":', 1)[0]
+    assert 'replayPendingErases()' in stroke_ack
+    assert 'scheduleDeferredStateFetch()' in stroke_ack
     assert 'if liveStrokeIDs.isEmpty { scheduleDeferredStateFetch() }' in app_model
     assert 'self.syncMutationGeneration == mutationGeneration' in app_model
     assert 'self.deferredStateRefreshReason = reason' in app_model

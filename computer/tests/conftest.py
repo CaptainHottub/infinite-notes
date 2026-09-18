@@ -14,3 +14,4 @@ sys.path.insert(0, str(COMPUTER_DIR))
 # data-dir override in their shell.
 TEST_DATA_DIR = tempfile.TemporaryDirectory(prefix="infinite-notes-tests-")
 os.environ["INFINITE_NOTES_DATA_DIR"] = TEST_DATA_DIR.name
+os.environ.pop("INFINITE_NOTES_DISCOVERY_PORT", None)

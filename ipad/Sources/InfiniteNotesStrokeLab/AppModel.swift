@@ -89,6 +89,12 @@ final class AppModel: ObservableObject {
     private let pendingJournal = PendingStrokeJournal<NoteStroke>(root:
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("InfiniteNotes/PendingStrokes", isDirectory: true))
+    private var pendingErases = PendingEraseQueue(root:
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("InfiniteNotes/PendingErases", isDirectory: true))
+    private var activeEraseOperations: Set<String> = []
+    private var eraseBatchInFlight: PendingEraseQueue.Batch?
+    private var hasPendingEdits: Bool { !pendingCommitStrokes.isEmpty || !pendingErases.isEmpty }
     private var pendingDocumentID: String?
     private var connectedDocumentID: String?
     private var journalBlocked = false
@@ -178,7 +184,7 @@ final class AppModel: ObservableObject {
         let savedEraserWidths = Self.loadWidthPresets(
             defaults.array(forKey: "native.eraserWidthPresets") as? [Double],
             fallback: [18, 32, 56],
-            range: 8...120
+            range: 1...120
         )
         eraserWidthPresets = savedEraserWidths
 
@@ -230,6 +236,7 @@ final class AppModel: ObservableObject {
                 self.discardInterruptedRemoteStrokes()
                 self.connectedDocumentID = nil
                 self.isReconcilingPendingStrokes = false
+                self.eraseBatchInFlight = nil
                 self.deferredStateRefreshReason = nil
                 self.deferredFetchWorkItem?.cancel()
                 self.deferredFetchWorkItem = nil
@@ -355,7 +362,7 @@ final class AppModel: ObservableObject {
     func updateEraserWidthPreset(_ index: Int, value: Double) {
         guard eraserWidthPresets.indices.contains(index) else { return }
         var updated = eraserWidthPresets
-        updated[index] = max(8, min(120, value))
+        updated[index] = max(1, min(120, value))
         eraserWidthPresets = updated
         activeEraserWidthPresetIndex = index
         eraserSize = updated[index]
@@ -404,6 +411,8 @@ final class AppModel: ObservableObject {
 
     func connect(address: String) {
         discardInterruptedRemoteStrokes()
+        eraseBatchInFlight = nil
+        isReconcilingPendingStrokes = false
         connectedDocumentID = nil
         deferredStateRefreshReason = nil
         reconnectWorkItem?.cancel()
@@ -505,12 +514,12 @@ final class AppModel: ObservableObject {
     }
 
     func undo() {
-        guard canUndo else { return }
+        guard canUndo, isConnected, pendingErases.isEmpty else { return }
         client.sendJSONObject(["type": "undo"])
     }
 
     func redo() {
-        guard canRedo else { return }
+        guard canRedo, isConnected, pendingErases.isEmpty else { return }
         client.sendJSONObject(["type": "redo"])
     }
 
@@ -1144,11 +1153,17 @@ final class AppModel: ObservableObject {
     }
 
     func beginEraseOperation() -> String {
-        "erase-\(clientID)-\(UUID().uuidString.lowercased())"
+        let id = "erase-\(clientID)-\(UUID().uuidString.lowercased())"
+        activeEraseOperations.insert(id)
+        return id
     }
 
     func erase(at worldPoint: CGPoint, pageIndex: Int, operationID: String, alreadyDeleted: inout Set<String>) {
-        guard isConnected else { return }
+        guard !journalBlocked, let documentID = lastAppliedDocumentID ?? pendingDocumentID else { return }
+        guard !hasPendingEdits || pendingDocumentID == documentID else {
+            lastError = "Pending edits belong to another notebook. Reopen that notebook to restore them."
+            return
+        }
         let radius = eraserSize / 2
         let candidates = pageStrokeIDs[pageIndex] ?? []
         var hitIDs: [String] = []
@@ -1156,26 +1171,47 @@ final class AppModel: ObservableObject {
             guard let stroke = strokes[id], !stroke.isLocked else { continue }
             if Self.stroke(stroke, isWithin: radius, of: worldPoint) {
                 hitIDs.append(id)
-                alreadyDeleted.insert(id)
             }
         }
         guard !hitIDs.isEmpty else { return }
+        do {
+            // Save the deletion first, so a crash cannot replay an erased local stroke.
+            try pendingErases.append(hitIDs, operationID: operationID, documentID: documentID)
+            pendingDocumentID = documentID
+            for id in hitIDs where pendingCommitStrokes[id] != nil {
+                try pendingJournal.acknowledge(id, documentID: documentID)
+                pendingCommitStrokes.removeValue(forKey: id)
+            }
+        } catch {
+            journalBlocked = true
+            lastError = "Could not save offline erasing: \(error.localizedDescription)"
+            return
+        }
+        alreadyDeleted.formUnion(hitIDs)
         for id in hitIDs { removeStroke(id: id) }
-        client.sendJSONObject([
-            "type": "delete_strokes",
-            "ids": hitIDs,
-            "operationId": operationID,
-            "final": false,
-        ])
     }
 
     func finishEraseOperation(_ operationID: String) {
-        guard isConnected else { return }
+        activeEraseOperations.remove(operationID)
+        guard let documentID = pendingDocumentID else { return }
+        do {
+            try pendingErases.finish(operationID, documentID: documentID)
+            beginPendingStrokeReconciliationIfNeeded()
+        } catch {
+            journalBlocked = true
+            lastError = "Could not save offline erasing: \(error.localizedDescription)"
+        }
+    }
+
+    private func replayPendingErases() {
+        guard isConnected, !journalBlocked,
+              let documentID = pendingDocumentID, connectedDocumentID == documentID,
+              pendingCommitStrokes.isEmpty, !isReconcilingPendingStrokes,
+              eraseBatchInFlight == nil, let batch = pendingErases.nextBatch() else { return }
+        eraseBatchInFlight = batch
         client.sendJSONObject([
-            "type": "delete_strokes",
-            "ids": [],
-            "operationId": operationID,
-            "final": true,
+            "type": "delete_strokes", "documentId": documentID,
+            "ids": batch.ids, "operationId": batch.operationID, "final": batch.final,
         ])
     }
 
@@ -1247,21 +1283,29 @@ final class AppModel: ObservableObject {
             let reason = message.reason ?? "sync"
             connectedDocumentID = message.documentId
             if let documentID = message.documentId {
-                if !pendingCommitStrokes.isEmpty, let pendingID = pendingDocumentID,
+                if hasPendingEdits, let pendingID = pendingDocumentID,
                    pendingID != documentID {
-                    lastError = "Pending strokes belong to another notebook. Reopen that notebook to restore them."
+                    lastError = "Pending edits belong to another notebook. Reopen that notebook to restore them."
                     return
                 }
                 do {
                     let recovered = try pendingJournal.load(documentID: documentID)
+                    try pendingErases.load(documentID: documentID, activeOperationIDs: activeEraseOperations)
+                    // Erase records win over pending adds, including a crash between
+                    // recording the erase and deleting the completed-stroke record.
+                    for id in pendingErases.erasedIDs {
+                        try pendingJournal.acknowledge(id, documentID: documentID)
+                        pendingCommitStrokes.removeValue(forKey: id)
+                        removeStroke(id: id)
+                    }
                     journalBlocked = false
                     pendingDocumentID = documentID
-                    for (id, stroke) in recovered where pendingCommitStrokes[id] == nil {
+                    for (id, stroke) in recovered where pendingCommitStrokes[id] == nil && !pendingErases.erasedIDs.contains(id) {
                         pendingCommitStrokes[id] = stroke
                     }
                 } catch {
                     journalBlocked = true
-                    lastError = "Could not read saved offline strokes: \(error.localizedDescription)"
+                    lastError = "Could not read saved offline edits: \(error.localizedDescription)"
                     DebugSessionLogger.shared.event(
                         "journal", "load_failed",
                         fields: ["documentId": documentID,
@@ -1282,7 +1326,7 @@ final class AppModel: ObservableObject {
                     "documentRevision": message.documentRevision ?? 0,
                 ]
             )
-            if !pendingCommitStrokes.isEmpty || isReconcilingPendingStrokes || !liveStrokeIDs.isEmpty {
+            if hasPendingEdits || isReconcilingPendingStrokes || !liveStrokeIDs.isEmpty {
                 DebugSessionLogger.shared.event("sync", "state_refresh_deferred", fields: ["reason": reason])
                 deferredStateRefreshReason = reason
                 beginPendingStrokeReconciliationIfNeeded()
@@ -1337,6 +1381,9 @@ final class AppModel: ObservableObject {
                 connectedDocumentID = message.documentId
                 pendingDocumentID = message.documentId
                 document = changed
+                lastAppliedDocumentID = message.documentId
+                lastAppliedDocumentRevision = nil
+                lastAppliedStateToken = nil
                 if message.clearStrokes == true {
                     strokes.removeAll()
                     liveStrokes.reset()
@@ -1345,6 +1392,9 @@ final class AppModel: ObservableObject {
                     // them into a newly opened PDF is both incorrect and can keep
                     // a previously oversized reconnect payload alive forever.
                     pendingCommitStrokes.removeAll()
+                    pendingErases.reset()
+                    activeEraseOperations.removeAll()
+                    eraseBatchInFlight = nil
                     pendingPointBatches.removeAll()
                     isReconcilingPendingStrokes = false
                     deferredStateRefreshReason = nil
@@ -1428,7 +1478,10 @@ final class AppModel: ObservableObject {
                     "documentRevision": message.documentRevision ?? 0,
                 ]
             )
-            if pendingCommitStrokes.isEmpty { scheduleDeferredStateFetch() }
+            if pendingCommitStrokes.isEmpty {
+                replayPendingErases()
+                scheduleDeferredStateFetch()
+            }
         case "reconcile_ack":
             guard message.documentId == pendingDocumentID else { return }
             for id in message.ids ?? [] {
@@ -1446,6 +1499,7 @@ final class AppModel: ObservableObject {
                 ]
             )
             if pendingCommitStrokes.isEmpty {
+                replayPendingErases()
                 let reason = deferredStateRefreshReason ?? "reconnect_reconciled"
                 deferredStateRefreshReason = reason
                 scheduleDeferredStateFetch()
@@ -1453,12 +1507,27 @@ final class AppModel: ObservableObject {
                 beginPendingStrokeReconciliationIfNeeded()
             }
         case "error":
+            eraseBatchInFlight = nil
             if isReconcilingPendingStrokes {
                 isReconcilingPendingStrokes = false
             }
             lastError = message.message ?? "Server error"
         case "delete_ack":
-            break
+            guard message.documentId == pendingDocumentID,
+                  let documentID = pendingDocumentID,
+                  let batch = eraseBatchInFlight,
+                  message.operationId == batch.operationID,
+                  message.final == batch.final,
+                  Set(message.ids ?? []) == Set(batch.ids) else { return }
+            do {
+                try pendingErases.acknowledge(batch, documentID: documentID)
+                eraseBatchInFlight = nil
+                replayPendingErases()
+                scheduleDeferredStateFetch()
+            } catch {
+                journalBlocked = true
+                lastError = "Could not update saved erasing: \(error.localizedDescription)"
+            }
         case "pong":
             break
         default:
@@ -1479,6 +1548,10 @@ final class AppModel: ObservableObject {
     }
 
     private func beginPendingStrokeReconciliationIfNeeded() {
+        if pendingCommitStrokes.isEmpty {
+            replayPendingErases()
+            return
+        }
         guard isConnected,
               !journalBlocked,
               let documentID = connectedDocumentID,
@@ -1588,7 +1661,7 @@ final class AppModel: ObservableObject {
                 guard self.connectedDocumentID == documentID,
                       self.lastAppliedDocumentID == documentID,
                       self.lastAppliedDocumentRevision == baseRevision,
-                      self.pendingCommitStrokes.isEmpty,
+                      !self.hasPendingEdits,
                       self.liveStrokeIDs.isEmpty,
                       self.syncMutationGeneration == mutationGeneration else {
                     self.fallbackRevisionChanges(reason: "local_or_live_edit")
@@ -1664,7 +1737,7 @@ final class AppModel: ObservableObject {
             self.deferredFetchWorkItem = nil
             guard let reason = self.deferredStateRefreshReason,
                   self.connectedDocumentID != nil,
-                  self.pendingCommitStrokes.isEmpty,
+                  !self.hasPendingEdits,
                   !self.isReconcilingPendingStrokes,
                   self.liveStrokeIDs.isEmpty else { return }
             self.deferredStateRefreshReason = nil
@@ -1731,7 +1804,7 @@ final class AppModel: ObservableObject {
                     guard generation == self.stateFetchGeneration else { return }
                     guard self.syncMutationGeneration == mutationGeneration,
                           self.liveStrokeIDs.isEmpty,
-                          self.pendingCommitStrokes.isEmpty else {
+                          !self.hasPendingEdits else {
                         self.deferredStateRefreshReason = reason
                         self.scheduleDeferredStateFetch()
                         DebugSessionLogger.shared.event(
@@ -1785,12 +1858,12 @@ final class AppModel: ObservableObject {
     }
 
     private func applySnapshot(_ snapshot: NotebookState, liveIDs: Set<String>) -> Bool {
-        if !pendingCommitStrokes.isEmpty, pendingDocumentID != snapshot.documentId {
-            lastError = "Pending strokes belong to another notebook. Reopen that notebook to restore them."
+        if hasPendingEdits, pendingDocumentID != snapshot.documentId {
+            lastError = "Pending edits belong to another notebook. Reopen that notebook to restore them."
             return false
         }
         document = snapshot.document
-        if pendingCommitStrokes.isEmpty { pendingDocumentID = snapshot.documentId }
+        if !hasPendingEdits { pendingDocumentID = snapshot.documentId }
         lastAppliedDocumentID = snapshot.documentId
         lastAppliedDocumentRevision = snapshot.documentRevision
         lastAppliedStateToken = snapshot.stateToken
@@ -1798,6 +1871,7 @@ final class AppModel: ObservableObject {
         for (id, stroke) in pendingCommitStrokes {
             mergedStrokes[id] = stroke
         }
+        for id in pendingErases.erasedIDs { mergedStrokes.removeValue(forKey: id) }
         strokes = mergedStrokes
         liveStrokes.reset(remoteIDs: liveIDs)
         selectedStrokeIDs = Set(selectedStrokeIDs.filter { strokes[$0] != nil })
@@ -1947,6 +2021,7 @@ final class AppModel: ObservableObject {
     }
 
     private func insertOrReplace(_ stroke: NoteStroke, committedChange: Bool = true) {
+        guard !pendingErases.erasedIDs.contains(stroke.id) else { return }
         syncMutationGeneration &+= 1
         let oldPages = strokeMembership[stroke.id] ?? []
         for page in oldPages { pageStrokeIDs[page]?.remove(stroke.id) }

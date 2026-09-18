@@ -26,7 +26,11 @@
     </dict>
 
     <key>NSLocalNetworkUsageDescription</key>
-    <string>Infinite Notes connects directly to your laptop to load PDFs and synchronize ink.</string>
+    <string>Infinite Notes discovers and connects to your computers to load PDFs and synchronize ink.</string>
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_infinite-notes._tcp</string>
+    </array>
 
     <key>UILaunchScreen</key>
     <dict/>

@@ -1591,3 +1591,89 @@ def test_lock_flag_is_preserved_for_ink_and_text():
     }
     assert server.sanitize_stroke(pen)["locked"] is True
     assert server.sanitize_stroke(text)["locked"] is True
+
+
+def test_desktop_import_and_both_exports_use_source_folder_without_overwrite(monkeypatch, tmp_path):
+    import fitz
+    from urllib.parse import unquote
+    import local_files
+
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    source_folder = tmp_path / 'Lecture notes — originals'
+    source_folder.mkdir()
+    source = source_folder / 'lecture.pdf'
+    with fitz.open() as pdf:
+        pdf.new_page(width=300, height=400)
+        source.write_bytes(pdf.tobytes())
+    original = source.read_bytes()
+
+    async def choose(kind):
+        assert kind == 'pdf'
+        return source
+
+    monkeypatch.setattr(local_files, 'choose_path', choose)
+    headers = {'X-Infinite-Notes-Local': '1', 'Origin': 'http://127.0.0.1:8000'}
+    with TestClient(app, base_url='http://127.0.0.1:8000', client=('127.0.0.1', 42000)) as client:
+        response = client.post('/api/local-files/pdf', headers=headers)
+        assert response.status_code == 200, response.text
+        assert local_files.get_origin(server.DATA_DIR, response.json()['documentId']) == source_folder
+        for kind in ('pdf', 'project'):
+            response = client.get(f'/api/{kind}/export?saveBesideSource=true', headers=headers)
+            assert response.status_code == 200, response.text
+            exported = Path(unquote(response.headers['X-Infinite-Notes-Saved-Path']))
+            assert exported.parent == source_folder
+            assert exported.read_bytes() == response.content
+            repeated = client.get(f'/api/{kind}/export?saveBesideSource=true', headers=headers)
+            second = Path(unquote(repeated.headers['X-Infinite-Notes-Saved-Path']))
+            assert second != exported
+            assert second.name.endswith(f' (1){exported.suffix}')
+        assert source.read_bytes() == original
+        assert not list(source_folder.glob('.infinite-notes-export-*'))
+        # Choosing an exported project remembers its directory, not its embedded PDF name.
+        project = source_folder / 'lecture.inotes'
+        async def choose_project(kind):
+            assert kind == 'project'
+            return project
+        monkeypatch.setattr(local_files, 'choose_path', choose_project)
+        imported = client.post('/api/local-files/project', headers=headers)
+        assert imported.status_code == 200, imported.text
+        project_bytes = project.read_bytes()
+        response = client.get('/api/project/export?saveBesideSource=true', headers=headers)
+        assert Path(unquote(response.headers['X-Infinite-Notes-Saved-Path'])) != project
+        assert project.read_bytes() == project_bytes
+        # A normal browser upload does not inherit the previous file's folder.
+        response = client.post('/api/pdf', files={'file': ('other.pdf', original, 'application/pdf')})
+        assert response.status_code == 200
+        assert local_files.get_origin(server.DATA_DIR, response.json()['documentId']) is None
+
+
+def test_desktop_file_access_rejects_remote_cross_origin_and_missing_header(monkeypatch, tmp_path):
+    import local_files
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    async def must_not_open(kind):
+        raise AssertionError('Forbidden request opened desktop picker')
+    monkeypatch.setattr(local_files, 'choose_path', must_not_open)
+    with TestClient(app, base_url='http://127.0.0.1:8000', client=('10.0.0.2', 1234)) as client:
+        assert client.post('/api/local-files/pdf', headers={'X-Infinite-Notes-Local': '1'}).status_code == 403
+    with TestClient(app, base_url='http://127.0.0.1:8000', client=('127.0.0.1', 1234)) as client:
+        assert client.post('/api/local-files/pdf').status_code == 403
+        assert client.post('/api/local-files/pdf', headers={
+            'X-Infinite-Notes-Local': '1', 'Origin': 'https://example.com'}).status_code == 403
+        assert client.get('/api/project/export?saveBesideSource=true').status_code == 403
+    with TestClient(app, base_url='http://example.com', client=('127.0.0.1', 1234)) as client:
+        assert client.post('/api/local-files/pdf', headers={'X-Infinite-Notes-Local': '1'}).status_code == 403
+
+
+def test_desktop_picker_cancel_preserves_notebook_and_destination(monkeypatch, tmp_path):
+    import local_files
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    local_files.set_origin(server.DATA_DIR, server.current_document_id(), tmp_path)
+    before = copy.deepcopy(state)
+    async def cancelled(kind):
+        return None
+    monkeypatch.setattr(local_files, 'choose_path', cancelled)
+    with TestClient(app, base_url='http://127.0.0.1', client=('127.0.0.1', 1234)) as client:
+        response = client.post('/api/local-files/pdf', headers={'X-Infinite-Notes-Local': '1'})
+        assert response.json() == {'cancelled': True}
+    assert state == before
+    assert local_files.get_origin(server.DATA_DIR, server.current_document_id()) == tmp_path

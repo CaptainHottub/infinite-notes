@@ -5,6 +5,7 @@ struct SettingsView: View {
     @ObservedObject var strokeSettings: StrokeSettingsStore
     @ObservedObject var appSettings: AppSettingsStore
     @Binding var serverAddress: String
+    @StateObject private var discovery = ServerDiscovery()
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -26,7 +27,26 @@ struct SettingsView: View {
 
     private var connectionTab: some View {
         settingsNavigation(title: "Connection") {
-            Section("Laptop server") {
+            Section("Nearby servers") {
+                ForEach(discovery.servers) { server in
+                    Button {
+                        serverAddress = server.address
+                        model.connect(address: server.address)
+                    } label: {
+                        Label(server.name, systemImage: "desktopcomputer")
+                    }
+                }
+                if discovery.servers.isEmpty {
+                    Text(discovery.message)
+                        .foregroundStyle(.secondary)
+                    Text("Keep the server running on the same network. You can also enter its address below.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                Button("Refresh") { discovery.start() }
+            }
+
+            Section("Server address") {
                 TextField("http://10.42.0.1:8000", text: $serverAddress)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
@@ -60,6 +80,8 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
+        .onAppear { discovery.start() }
+        .onDisappear { discovery.stop() }
     }
 
     private var displayTab: some View {
@@ -153,6 +175,17 @@ struct SettingsView: View {
             }
 
             Section("Eraser") {
+                ColorPicker("Outline on PDF", selection: Binding(
+                    get: { Color(hex: appSettings.configuration.resolvedEraserPDFOutlineColor) },
+                    set: { appSettings.configuration.eraserPDFOutlineColor = $0.noteHex }
+                ), supportsOpacity: false)
+                ColorPicker("Outline outside PDF", selection: Binding(
+                    get: { Color(hex: appSettings.configuration.resolvedEraserWorkspaceOutlineColor) },
+                    set: { appSettings.configuration.eraserWorkspaceOutlineColor = $0.noteHex }
+                ), supportsOpacity: false)
+                Text("The outline colour follows the centre of the eraser: dark on the PDF and white outside by default.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
                 ForEach(model.eraserWidthPresets.indices, id: \.self) { index in
                     valueSlider(
                         "Eraser preset \(index + 1)",
@@ -160,8 +193,8 @@ struct SettingsView: View {
                             get: { model.eraserWidthPresets[index] },
                             set: { model.updateEraserWidthPreset(index, value: $0) }
                         ),
-                        range: 8...120,
-                        step: 2,
+                        range: 1...120,
+                        step: 1,
                         format: "%.0f pt"
                     )
                 }

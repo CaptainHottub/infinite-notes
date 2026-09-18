@@ -1,5 +1,8 @@
 # Synchronization revisions
 
+See [reconnect and crash testing](sync-chaos-testing.md) for the automated
+real-process interruption harness and its coverage limits.
+
 The server persists a UUID `documentId` and a non-negative `documentRevision`
 beside the notebook state. Legacy state files receive a generated identity and
 revision `0` without changing document or stroke content. Each effective
@@ -79,11 +82,50 @@ checks the encoded stroke filename independently of absolute URL spelling.
 Genuinely mismatched records still block replay; the error and debug log name
 the offending file and validation reason without deleting it. This journal covers completed strokes, not a full
 offline notebook cache: restarting the app still requires reconnecting to load
-the notebook. Erases, transforms, page changes, interrupted live strokes, and
+the notebook. Transforms, page changes, interrupted live strokes, and
 conflict resolution against later remote edits are not covered. In particular,
 the existing stroke replay protocol does not yet prevent replay of an unacknowledged
 stroke that another client subsequently deleted. Full operation history and
 duplicate-operation tracking are still required for that guarantee.
+
+## Offline eraser recovery
+
+**Device validation failed (2026-09-17):** the user reports that offline erasing
+stops after the first hit and does not reliably replay on reconnect. The design
+below describes the implementation's intended behavior, not a confirmed fix.
+See [the full device report](../KNOWN-ISSUES.md); repairs are explicitly deferred
+until after the requested eraser appearance/size and export-location features.
+
+The implementation journals eraser gestures while disconnected. Each gesture is saved atomically
+under `InfiniteNotes/PendingErases/<document UUID>/` before its ink disappears
+locally. Erasing a pending new stroke also removes its completed-stroke journal
+record. Recovery loads erases first when deciding which completed strokes to
+replay, so a crash between those two file operations cannot resurrect that ink.
+
+The server receives a gesture after the eraser lifts, in batches of at most
+256 IDs with one batch awaiting acknowledgement at a time. Reconnect replay
+finishes remaining stroke commits, then erases, before accepting a fresh
+snapshot. A matching notebook identity, operation ID, ID set and final flag are
+required before removing the acknowledged erase batch from the journal. The
+server rejects delete requests carrying a different notebook identity. Browser
+clients that omit identity keep their existing ACK format.
+
+An app restart treats interrupted erase gestures as finished and replays them
+after reconnecting to the same notebook. Other notebooks' records stay on disk.
+Pending erases suppress incoming stroke restores until their ACK arrives. Online
+eraser feedback is immediate on the iPad; other clients see the changes after
+the gesture ends. Undo/redo require a connection and wait for pending erases to
+finish. Offline selection deletion and offline undo are not implemented.
+
+Repeated erases are no-ops when the target remains absent. This does not provide
+general conflict resolution: replay after a concurrent remote undo or replacement
+can still delete that restored/replaced stroke. The earlier cross-client
+replay-after-deletion limitation also remains.
+
+Device regression check: disconnect, erase existing ink, draw and erase a new
+stroke, then reconnect. Both views should keep the erased ink absent. Repeat
+with an app restart before reconnecting. Install both updated server and iPad
+builds, because native delete ACKs now include notebook identity.
 
 Storage tests (from the repository root):
 

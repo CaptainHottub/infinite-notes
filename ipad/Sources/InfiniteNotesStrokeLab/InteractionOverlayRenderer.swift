@@ -67,13 +67,22 @@ enum InteractionOverlayRenderer {
         center: CGPoint,
         diameter: Double,
         page: PageInfo,
+        sourcePage: PageInfo?,
+        settings: NativeAppConfiguration,
         bounds: CGRect,
         zoomScale: CGFloat
     ) -> [LiveStrokeLayerDescriptor] {
         let viewCenter = viewPoint(center, page: page, bounds: bounds)
         let width = bounds.width / max(0.001, CGFloat(page.width))
         let height = bounds.height / max(0.001, CGFloat(page.height))
-        let viewDiameter = max(4, CGFloat(diameter) * (width + height) / 2)
+        let viewDiameter = max(0.1, CGFloat(diameter) * (width + height) / 2)
+        let insidePDF = sourcePage.map {
+            center.x >= CGFloat($0.x) && center.x <= CGFloat($0.x + $0.width)
+                && center.y >= CGFloat($0.y) && center.y <= CGFloat($0.y + $0.height)
+        } ?? false
+        let outline = UIColor(noteHex: insidePDF
+            ? settings.resolvedEraserPDFOutlineColor
+            : settings.resolvedEraserWorkspaceOutlineColor)
         let rect = CGRect(
             x: viewCenter.x - viewDiameter / 2,
             y: viewCenter.y - viewDiameter / 2,
@@ -93,8 +102,8 @@ enum InteractionOverlayRenderer {
             LiveStrokeLayerDescriptor(
                 path: path,
                 fillColor: nil,
-                strokeColor: UIColor.label.withAlphaComponent(0.92).cgColor,
-                lineWidth: 2.0 * inverseZoom,
+                strokeColor: outline.cgColor,
+                lineWidth: min(2.0 * inverseZoom, viewDiameter / 3),
                 lineDashPattern: nil
             ),
         ]

@@ -676,6 +676,8 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
                 center: eraserCursorWorld,
                 diameter: model.eraserSize,
                 page: page,
+                sourcePage: model.sourcePageInfo(at: pageIndex),
+                settings: appConfiguration,
                 bounds: bounds,
                 zoomScale: interactionZoomScale
             ))

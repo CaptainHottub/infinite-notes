@@ -4966,6 +4966,58 @@
     markAllDirty();
   });
 
+  let localFilePickerAvailable = false;
+  const exportFolderButton = document.getElementById("exportFolderButton");
+
+  async function chooseLocalFile(kind) {
+    const response = await fetch(`/api/local-files/${kind}`, {
+      method: "POST", headers: { "X-Infinite-Notes-Local": "1" },
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.detail || "Could not open the desktop file picker");
+    return data;
+  }
+
+  async function prepareExportFolder() {
+    if (!localFilePickerAvailable) return true;
+    const response = await fetch("/api/local-files");
+    const status = await response.json();
+    if (!response.ok) throw new Error(status.detail || "Could not check the export folder");
+    if (status.hasFolder) return true;
+    showToast("Choose the folder containing your imported file. Exports will be saved there.", 10000);
+    return !(await chooseLocalFile("folder")).cancelled;
+  }
+
+  if (mode === "desktop" && ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname)) {
+    fetch("/api/local-files").then(response => response.ok ? response.json() : null).then(status => {
+      localFilePickerAvailable = status?.available === true;
+      if (exportFolderButton) exportFolderButton.hidden = !localFilePickerAvailable;
+    }).catch(() => {});
+  }
+  exportFolderButton?.addEventListener("click", async () => {
+    try {
+      const result = await chooseLocalFile("folder");
+      if (!result.cancelled) showToast(`Exports will be saved in ${result.folder}`, 7000);
+    } catch (error) { showToast(error.message, 7000); }
+  });
+
+  for (const [id, kind] of [["pdfInput", "pdf"], ["projectImportInput", "project"]]) {
+    document.getElementById(id)?.addEventListener("click", async event => {
+      if (!localFilePickerAvailable) return;
+      event.preventDefault();
+      if (kind === "project" && !confirm("Import this project? It will replace the currently open PDF and all ink.")) return;
+      try {
+        const result = await chooseLocalFile(kind);
+        if (result.cancelled) return;
+        const response = await fetch(`/api/state?import=${Date.now()}`, { cache: "no-store" });
+        if (!response.ok) throw new Error("File imported, but the notebook could not be refreshed. Press Sync.");
+        handleServerMessage({ type: "snapshot", state: await response.json(), reason: "project_import" });
+        fitPages();
+        showToast("File opened. Exports will be saved in its folder.", 6000);
+      } catch (error) { showToast(error.message || "Import failed", 7000); }
+    });
+  }
+
   document.getElementById("pdfInput")?.addEventListener("change", async event => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -5035,13 +5087,21 @@
       }
 
       showToast("Flattening PDF and ink…", 20000);
-      const response = await fetch("/api/pdf/export");
+      if (!(await prepareExportFolder())) return;
+      const response = await fetch(localFilePickerAvailable ? "/api/pdf/export?saveBesideSource=true" : "/api/pdf/export", {
+        headers: localFilePickerAvailable ? { "X-Infinite-Notes-Local": "1" } : {},
+      });
       if (!response.ok) {
         let message = "PDF export failed";
         try { message = (await response.json()).detail || message; } catch {}
         throw new Error(message);
       }
       const blob = await response.blob();
+      const savedPath = response.headers.get("X-Infinite-Notes-Saved-Path");
+      if (savedPath) {
+        showToast(`Saved notes PDF to ${decodeURIComponent(savedPath)}`, 10000);
+        return;
+      }
       const disposition = response.headers.get("content-disposition") || "";
       const filenameMatch = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
       const fallbackStem = (state.document.filename || "infinite-notes").replace(/\.pdf$/i, "");
@@ -5066,7 +5126,10 @@
     projectExportButton.disabled = true;
     showToast("Preparing project file…", 10000);
     try {
-      const response = await fetch("/api/project/export");
+      if (!(await prepareExportFolder())) return;
+      const response = await fetch(localFilePickerAvailable ? "/api/project/export?saveBesideSource=true" : "/api/project/export", {
+        headers: localFilePickerAvailable ? { "X-Infinite-Notes-Local": "1" } : {},
+      });
       if (!response.ok) {
         let message = "Export failed";
         try {
@@ -5077,6 +5140,11 @@
       }
 
       const blob = await response.blob();
+      const savedPath = response.headers.get("X-Infinite-Notes-Saved-Path");
+      if (savedPath) {
+        showToast(`Saved project to ${decodeURIComponent(savedPath)}`, 10000);
+        return;
+      }
       const disposition = response.headers.get("content-disposition") || "";
       const filenameMatch = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
       const fallbackStem = (state.document.filename || "infinite-notes").replace(/\.pdf$/i, "");

@@ -38,3 +38,11 @@ Use `--no-hotspot` to stay on the current network:
 ```
 
 Runtime notebook data is stored under `computer/data/` and intentionally ignored by Git.
+
+The iPad can find either computer under **Settings → Connection → Nearby
+servers** using Bonjour. See [server discovery](../docs/server-discovery.md)
+for updating dependencies, selecting a computer, and manual-address fallback.
+
+From the local desktop browser, exports can be saved beside the imported file.
+See [eraser and export settings](../docs/eraser-and-export-settings.md) for the
+source-folder workflow and its setup requirements.

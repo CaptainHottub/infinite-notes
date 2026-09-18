@@ -593,7 +593,7 @@ private struct EraserToolSettingsPopover: View {
                         .monospacedDigit()
                         .foregroundStyle(.secondary)
                 }
-                Slider(value: diameterBinding, in: 8...120, step: 2)
+                Slider(value: diameterBinding, in: 1...120, step: 1)
             }
 
             HStack(spacing: 8) {

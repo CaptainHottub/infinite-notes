@@ -3,6 +3,7 @@ import importlib.util
 import pytest
 
 from fastapi.testclient import TestClient
+import uuid
 
 COMPUTER_DIR = Path(__file__).resolve().parents[1]
 (COMPUTER_DIR / "data" / "pdf_pages").mkdir(parents=True, exist_ok=True)
@@ -168,3 +169,67 @@ def test_native_eraser_uses_rendered_geometry_path():
     assert "polyline(for: stroke, segments: 96)" in geometry
     assert "GeometryEngine.eraserHitTest" in app_model
     assert "Drawing offline — Pencil strokes will upload after reconnecting" in app_model
+
+
+def _receive_type(websocket, kind):
+    for _ in range(20):
+        message = websocket.receive_json()
+        if message['type'] == kind:
+            return message
+        assert message['type'] != 'error', message
+    raise AssertionError(f'Missing {kind}')
+
+
+def test_offline_erase_replay_is_durable_grouped_and_noop_on_lost_ack(monkeypatch, tmp_path):
+    _reset_server(monkeypatch, tmp_path)
+    strokes = [_sample_stroke('erase-one'), _sample_stroke('erase-two')]
+    with TestClient(server.app) as client:
+        with client.websocket_connect('/ws?role=ipad&clientId=native-offline-erase') as ws:
+            document_id = ws.receive_json()['documentId']
+            ws.receive_json()
+            ws.send_json({'type': 'reconcile_strokes', 'documentId': document_id, 'strokes': strokes})
+            _receive_type(ws, 'reconcile_ack')
+            ws.send_json({'type': 'delete_strokes', 'documentId': document_id,
+                          'operationId': 'offline-gesture', 'ids': ['erase-one'], 'final': False})
+            first = _receive_type(ws, 'delete_ack')
+            assert first['documentId'] == document_id
+            assert not first['final']
+            ws.send_json({'type': 'delete_strokes', 'documentId': document_id,
+                          'operationId': 'offline-gesture', 'ids': ['erase-two'], 'final': True})
+            ack = _receive_type(ws, 'delete_ack')
+            assert ack['documentId'] == document_id
+            assert ack['final']
+            assert server.notebook_store.load()['strokes'] == {}
+        # Simulate retaining the final batch after losing its ACK, then reconnect.
+        with client.websocket_connect('/ws?role=ipad&clientId=native-offline-erase') as ws:
+            ws.receive_json()
+            ws.receive_json()
+            ws.send_json({'type': 'delete_strokes', 'documentId': document_id,
+                          'operationId': 'offline-gesture', 'ids': ['erase-two'], 'final': True})
+            replay = _receive_type(ws, 'delete_ack')
+            assert replay['ids'] == ['erase-two']
+            assert replay['documentId'] == document_id
+            assert replay['documentRevision'] == ack['documentRevision']
+            ws.send_json({'type': 'undo'})
+            restored = _receive_type(ws, 'restore_strokes')
+            assert {s['id'] for s in restored['strokes']} == {'erase-one', 'erase-two'}
+            assert set(server.notebook_store.load()['strokes']) == {'erase-one', 'erase-two'}
+
+
+def test_offline_erase_rejects_another_notebook_before_mutation(monkeypatch, tmp_path):
+    _reset_server(monkeypatch, tmp_path)
+    with TestClient(server.app) as client:
+        with client.websocket_connect('/ws?role=ipad&clientId=native-offline-erase') as ws:
+            document_id = ws.receive_json()['documentId']
+            ws.receive_json()
+            ws.send_json({'type': 'reconcile_strokes', 'documentId': document_id,
+                          'strokes': [_sample_stroke('preserve')]})
+            _receive_type(ws, 'reconcile_ack')
+            before = server.notebook_store.load()
+            ws.send_json({'type': 'delete_strokes', 'documentId': str(uuid.uuid4()),
+                          'operationId': 'wrong-notebook', 'ids': ['preserve'], 'final': True})
+            error = _receive_type(ws, 'error')
+            assert 'different document' in error['message']
+            assert server.notebook_store.load() == before
+            assert 'preserve' in server.state['strokes']
+            assert 'wrong-notebook' not in server.pending_delete_operations
