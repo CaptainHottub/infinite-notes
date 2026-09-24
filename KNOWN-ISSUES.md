@@ -1,5 +1,16 @@
 # Known issues — iPad experimental branch
 
+## Reconnect viewport reset — 2026-09-23
+
+- User reports that disconnecting and reconnecting the iPad resets its viewport,
+  interrupting writing off to the side of the PDF.
+- Record for future work only, as requested; do not include a viewport repair in
+  the next implementation. Cause and exact triggering conditions are not yet
+  established. This report does not establish that the previous workspace
+  relayout fix covers reconnects.
+- Future acceptance check: pan/zoom to off-page ink, disconnect and reconnect,
+  and verify the same visible position and zoom are retained.
+
 ## Lecture report and requested work — 2026-09-17
 
 - A 90-minute lecture had zero observed desync, undo, or queued-stroke problems.
@@ -20,15 +31,11 @@
   Neither the diagnosis nor a replacement protocol is established yet.
 - Completed feature scope: configurable eraser cursor colours on/off the PDF, eraser
   diameters below 8 pt, and exports beside the imported PDF/project.
-- Current follow-up: dense-page eraser performance. Offline-erase repairs remain
-  deferred; discuss them separately, then clarify workspace and whiteboard
-  requirements before implementing them.
-- Deferred workspace idea: always-visible outer workspace spanning roughly 2–3
-  page widths; subtle vertical separators; pan until it fills half the viewport;
-  configurable border colour/width appears only when it contains ink.
-- Deferred canvas idea: detailed appearance settings; either a configurable export
-  page outline that expands to include outside ink, or a limitless canvas exported
-  as one large PDF page/vector item bounded by content. Requirements remain open.
+- Offline-erase repairs remain deferred. Workspace and whiteboard behavior is
+  implemented in the current worktree but still needs device validation; see
+  [workspace and whiteboard design notes](docs/workspace-and-whiteboard-design.md).
+  Future iPad workspace presets should support custom background colour, grid
+  colour, grid spacing, and grid line thickness.
 
 ## User test notes — 2026-09-17 (preliminary)
 

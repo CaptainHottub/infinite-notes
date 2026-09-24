@@ -124,12 +124,58 @@ enum NotebookBackgroundStyle: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+enum WhiteboardPaperFormat: String, CaseIterable, Identifiable, Codable {
+    case letter, a4, legal, tabloid, a3, a5, custom
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .letter: return "Letter (8.5 × 11 in)"
+        case .a4: return "A4"
+        case .legal: return "Legal"
+        case .tabloid: return "Tabloid"
+        case .a3: return "A3"
+        case .a5: return "A5"
+        case .custom: return "Custom"
+        }
+    }
+    var portraitSize: CGSize {
+        switch self {
+        case .letter, .custom: return CGSize(width: 612, height: 792)
+        case .a4: return CGSize(width: 595.28, height: 841.89)
+        case .legal: return CGSize(width: 612, height: 1008)
+        case .tabloid: return CGSize(width: 792, height: 1224)
+        case .a3: return CGSize(width: 841.89, height: 1190.55)
+        case .a5: return CGSize(width: 419.53, height: 595.28)
+        }
+    }
+}
+
 struct NativeAppConfiguration: Codable, Equatable {
     // Display and page engine
     var backgroundStyle: NotebookBackgroundStyle = .system
     /// Optional so existing saved configurations continue decoding after this experimental feature is added.
     var offPageGridStyle: OffPageGridStyle?
     var offPageGridSpacing: Double?
+    var workspaceInitialLeftSections: Int?
+    var workspaceInitialRightSections: Int?
+    var workspaceExtraSections: Int?
+    var workspaceEmptyOutlineColor: String?
+    var workspaceInkedOutlineColor: String?
+    var workspaceOutlineWidth: Double?
+    var whiteboardPaperFormat: WhiteboardPaperFormat?
+    var whiteboardLandscape: Bool?
+    var whiteboardCustomWidth: Double?
+    var whiteboardCustomHeight: Double?
+    var whiteboardShowOutlines: Bool?
+    var whiteboardUseSystemColors: Bool?
+    var whiteboardHalo: Int?
+    var whiteboardBackgroundColor: String?
+    var whiteboardGridColor: String?
+    var whiteboardGridSpacing: Double?
+    var whiteboardGridThickness: Double?
+    var whiteboardHorizontalOutlineColor: String?
+    var whiteboardVerticalOutlineColor: String?
+    var whiteboardEmptyOutlineColor: String?
     var showPageShadow = true
     var pageGap = 18.0
     var pageWorkingRadius = 2
@@ -180,6 +226,40 @@ struct NativeAppConfiguration: Codable, Equatable {
 
     var resolvedOffPageGridSpacing: Double {
         max(4, min(200, offPageGridSpacing ?? 20))
+    }
+
+    var resolvedWorkspaceInitialLeftSections: Int { max(0, min(20, workspaceInitialLeftSections ?? 1)) }
+    var resolvedWorkspaceInitialRightSections: Int { max(0, min(20, workspaceInitialRightSections ?? 2)) }
+    var resolvedWorkspaceExtraSections: Int { max(0, min(20, workspaceExtraSections ?? 1)) }
+    var resolvedWorkspaceEmptyOutlineColor: String { workspaceEmptyOutlineColor ?? "#5488CC" }
+    var resolvedWorkspaceInkedOutlineColor: String { workspaceInkedOutlineColor ?? "#6EAA78" }
+    var resolvedWorkspaceOutlineWidth: Double { max(0.25, min(4, workspaceOutlineWidth ?? 1)) }
+
+    var resolvedWhiteboardPaperFormat: WhiteboardPaperFormat { whiteboardPaperFormat ?? .letter }
+    var resolvedWhiteboardHalo: Int { max(1, min(10, whiteboardHalo ?? 1)) }
+    var whiteboardSectionSize: CGSize {
+        let base = resolvedWhiteboardPaperFormat == .custom
+            ? CGSize(width: max(72, min(1440, whiteboardCustomWidth ?? 612)),
+                     height: max(72, min(1440, whiteboardCustomHeight ?? 792)))
+            : resolvedWhiteboardPaperFormat.portraitSize
+        return whiteboardLandscape == true
+            ? CGSize(width: base.height, height: base.width) : base
+    }
+    var whiteboardDefaults: WhiteboardInfo {
+        let size = whiteboardSectionSize
+        return WhiteboardInfo(
+            sectionWidth: Double(size.width), sectionHeight: Double(size.height),
+            showOutlines: whiteboardShowOutlines ?? true,
+            useSystemColors: whiteboardUseSystemColors ?? true,
+            halo: resolvedWhiteboardHalo,
+            backgroundColor: whiteboardBackgroundColor ?? "#FFFFFF",
+            gridColor: whiteboardGridColor ?? "#C8C8C8",
+            gridSpacing: max(4, min(200, whiteboardGridSpacing ?? 20)),
+            gridThickness: max(0.1, min(4, whiteboardGridThickness ?? 0.55)),
+            horizontalInkedOutlineColor: whiteboardHorizontalOutlineColor ?? "#587CB6",
+            verticalInkedOutlineColor: whiteboardVerticalOutlineColor ?? "#6EAA78",
+            emptyOutlineColor: whiteboardEmptyOutlineColor ?? "#A0A0A0"
+        )
     }
 
     var resolvedShowFPSInStatusBar: Bool {
@@ -483,8 +563,36 @@ struct PageInfo: Codable, Equatable, Identifiable {
 struct DocumentInfo: Codable, Equatable {
     var filename: String?
     var pages: [PageInfo]
+    var whiteboard: WhiteboardInfo?
 
-    static let empty = DocumentInfo(filename: nil, pages: [])
+    static let empty = DocumentInfo(filename: nil, pages: [], whiteboard: nil)
+}
+
+struct WhiteboardInfo: Codable, Equatable {
+    var sectionWidth: Double
+    var sectionHeight: Double
+    var showOutlines: Bool
+    var useSystemColors: Bool
+    var halo: Int
+    var backgroundColor: String
+    var gridColor: String
+    var gridSpacing: Double
+    var gridThickness: Double
+    var horizontalInkedOutlineColor: String
+    var verticalInkedOutlineColor: String
+    var emptyOutlineColor: String
+}
+
+struct SavedNotebook: Decodable, Identifiable {
+    var documentId: String
+    var name: String
+    var kind: String
+    var active: Bool
+    var id: String { documentId }
+}
+
+struct SavedNotebookList: Decodable {
+    var notebooks: [SavedNotebook]
 }
 
 struct NotebookState: Codable {

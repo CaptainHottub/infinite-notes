@@ -1104,6 +1104,42 @@ def prepare_pdf(content: bytes) -> tuple[Path, list[dict[str, Any]]]:
     return temp_root, pages
 
 
+def archive_current_notebook(snapshot: dict[str, Any]) -> None:
+    """Keep a restorable project before replacing the single active document."""
+    if not snapshot.get("document", {}).get("pages"):
+        return
+    document_id = str(uuid.UUID(snapshot["documentId"]))
+    if not CURRENT_PDF.exists():
+        raise RuntimeError("Active notebook PDF is missing; refusing to switch documents")
+    library = DATA_DIR / "notebooks"
+    library.mkdir(parents=True, exist_ok=True)
+    target = library / f"{document_id}.inotes"
+    fd, temporary = tempfile.mkstemp(prefix=f".{document_id}-", suffix=".tmp", dir=library)
+    try:
+        with os.fdopen(fd, "wb") as output:
+            with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+                manifest = {
+                    "format": PROJECT_FORMAT, "formatVersion": PROJECT_FORMAT_VERSION,
+                    "appVersion": APP_VERSION, "documentId": document_id,
+                    "documentName": snapshot["document"].get("filename") or "Notebook",
+                    "kind": "whiteboard" if snapshot["document"].get("whiteboard") else "pdf",
+                }
+                archive.writestr("manifest.json", json.dumps(manifest))
+                archive.writestr("state.json", json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")))
+                archive.write(CURRENT_PDF, "document.pdf")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+        directory = os.open(library, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 @asynccontextmanager
 async def staged_document_assets(prepared_root: Path | None):
     """Keep both PDF generations until the matching DB revision is durable."""
@@ -1160,6 +1196,46 @@ def sanitize_project_pages(raw_pages: Any) -> list[dict[str, Any]]:
     return pages
 
 
+def sanitize_whiteboard_settings(raw: Any, page: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="Whiteboard settings are invalid")
+    width = float(page["width"])
+    height = float(page["height"])
+    if not (72 <= width <= 1440 and 72 <= height <= 1440):
+        raise HTTPException(status_code=400, detail="Whiteboard section size is out of range")
+
+    def colour(key: str, fallback: str) -> str:
+        value = raw.get(key, fallback)
+        if not isinstance(value, str) or re.fullmatch(r"#[0-9A-Fa-f]{6}", value) is None:
+            raise HTTPException(status_code=400, detail=f"Invalid whiteboard {key}")
+        return value.upper()
+
+    try:
+        halo = int(raw.get("halo", 1))
+        spacing = float(raw.get("gridSpacing", 20))
+        thickness = float(raw.get("gridThickness", 0.55))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid whiteboard grid settings") from exc
+    if not (1 <= halo <= 10 and 4 <= spacing <= 200 and 0.1 <= thickness <= 4):
+        raise HTTPException(status_code=400, detail="Whiteboard settings are out of range")
+    show_outlines = raw.get("showOutlines", True)
+    use_system_colors = raw.get("useSystemColors", True)
+    if not isinstance(show_outlines, bool) or not isinstance(use_system_colors, bool):
+        raise HTTPException(status_code=400, detail="Invalid whiteboard display setting")
+    return {
+        "sectionWidth": width, "sectionHeight": height,
+        "showOutlines": show_outlines,
+        "useSystemColors": use_system_colors,
+        "halo": halo,
+        "backgroundColor": colour("backgroundColor", "#FFFFFF"),
+        "gridColor": colour("gridColor", "#C8C8C8"),
+        "gridSpacing": spacing, "gridThickness": thickness,
+        "horizontalInkedOutlineColor": colour("horizontalInkedOutlineColor", "#587CB6"),
+        "verticalInkedOutlineColor": colour("verticalInkedOutlineColor", "#6EAA78"),
+        "emptyOutlineColor": colour("emptyOutlineColor", "#A0A0A0"),
+    }
+
+
 def sanitize_project_state(raw: Any, *, has_pdf: bool) -> dict[str, Any]:
     if not isinstance(raw, dict):
         raise HTTPException(status_code=400, detail="Project state must be an object")
@@ -1196,13 +1272,22 @@ def sanitize_project_state(raw: Any, *, has_pdf: bool) -> dict[str, Any]:
     filename = None
     source_pages: list[dict[str, Any]] = []
     if has_pdf:
-        filename = safe_filename(raw_document.get("filename"), "document.pdf", extension=".pdf")
+        if raw_document.get("whiteboard"):
+            filename = safe_filename(raw_document.get("filename"), "Whiteboard")
+        else:
+            filename = safe_filename(raw_document.get("filename"), "document.pdf", extension=".pdf")
         source_pages = sanitize_project_pages(raw_document.get("pages", []))
+
+    whiteboard = raw_document.get("whiteboard")
+    if whiteboard is not None:
+        if not has_pdf or len(source_pages) != 1:
+            raise HTTPException(status_code=400, detail="Whiteboard project is missing its base page")
+        whiteboard = sanitize_whiteboard_settings(whiteboard, source_pages[0])
 
     sanitized = {
         "version": 1,
         "documentId": raw.get("documentId"),
-        "document": {"filename": filename, "pages": source_pages},
+        "document": {"filename": filename, "pages": source_pages, **({"whiteboard": whiteboard} if whiteboard else {})},
         "strokes": sanitized_strokes,
     }
     normalize_document_id(sanitized)
@@ -1814,6 +1899,132 @@ def create_flattened_pdf(
         source.close()
 
 
+def whiteboard_ink_bounds(snapshot: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    bounds = [stroke_world_bounds(stroke) for stroke in snapshot.get("strokes", {}).values()]
+    bounds = [item for item in bounds if item is not None]
+    if not bounds:
+        return None
+    return (
+        min(item[0] for item in bounds), min(item[1] for item in bounds),
+        max(item[2] for item in bounds), max(item[3] for item in bounds),
+    )
+
+
+def whiteboard_export_rects(
+    snapshot: dict[str, Any], mode: str, bounds_mode: str, margin: float,
+) -> list[tuple[float, float, float, float]]:
+    board = snapshot["document"]["whiteboard"]
+    width, height = board["sectionWidth"], board["sectionHeight"]
+    ink = whiteboard_ink_bounds(snapshot)
+    if ink is None:
+        return [(0.0, 0.0, width, height)]
+    min_col = math.floor(ink[0] / width)
+    max_col = math.floor(ink[2] / width)
+    min_row = math.floor(ink[1] / height)
+    max_row = math.floor(ink[3] / height)
+    if mode == "paged":
+        # Every page shares one horizontal origin and the widest row's width.
+        left = min_col * width
+        right = (max_col + 1) * width
+        return [(left, row * height, right, (row + 1) * height)
+                for row in range(min_row, max_row + 1)]
+    if bounds_mode == "ink":
+        return [(ink[0] - margin, ink[1] - margin, ink[2] + margin, ink[3] + margin)]
+    return [(
+        min_col * width - margin, min_row * height - margin,
+        (max_col + 1) * width + margin, (max_row + 1) * height + margin,
+    )]
+
+
+def whiteboard_paged_export_info(snapshot: dict[str, Any]) -> dict[str, Any]:
+    rects = whiteboard_export_rects(snapshot, "paged", "sections", 0)
+    if len(rects) > MAX_PDF_PAGES:
+        raise HTTPException(status_code=422, detail=f"Paged export exceeds {MAX_PDF_PAGES} pages")
+    pages = []
+    for index, (left, top, right, bottom) in enumerate(rects):
+        count = 0
+        length = 0.0
+        for stroke in snapshot["strokes"].values():
+            bounds = stroke_world_bounds(stroke)
+            if bounds is None or bounds[3] < top or bounds[1] > bottom:
+                continue
+            count += 1
+            points = stroke.get("points", [])
+            for first, second in zip(points, points[1:]):
+                x1, y1 = float(first["x"]), float(first["y"])
+                x2, y2 = float(second["x"]), float(second["y"])
+                if y1 == y2:
+                    fraction = 1.0 if top <= y1 <= bottom else 0.0
+                else:
+                    crossings = sorted(((top - y1) / (y2 - y1), (bottom - y1) / (y2 - y1)))
+                    low = max(0.0, min(1.0, crossings[0]))
+                    high = max(0.0, min(1.0, crossings[1]))
+                    fraction = max(0.0, high - low)
+                length += math.hypot(x2 - x1, y2 - y1) * fraction
+        pages.append({
+            "pageNumber": index + 1, "strokeCount": count,
+            "strokeLength": round(length, 2),
+            "sparse": count == 0 or (count <= 1 and length < 30),
+        })
+    return {"pageCount": len(pages), "pages": pages,
+            "sparsePages": [page["pageNumber"] for page in pages if page["sparse"]]}
+
+
+def create_whiteboard_pdf(
+    snapshot: dict[str, Any], *, mode: str, bounds_mode: str,
+    margin: float, background_color: str, grid_color: str,
+    include_grid: bool,
+) -> Path:
+    if mode not in {"paged", "single"} or bounds_mode not in {"ink", "sections"}:
+        raise HTTPException(status_code=422, detail="Unsupported whiteboard export layout")
+    if not (0 <= margin <= 500):
+        raise HTTPException(status_code=422, detail="Border buffer must be 0–500 pt")
+    for value in (background_color, grid_color):
+        if re.fullmatch(r"#[0-9A-Fa-f]{6}", value) is None:
+            raise HTTPException(status_code=422, detail="Invalid export colour")
+    board = snapshot["document"]["whiteboard"]
+    rects = whiteboard_export_rects(snapshot, mode, bounds_mode, margin)
+    if len(rects) > MAX_PDF_PAGES:
+        raise HTTPException(status_code=422, detail=f"Paged export exceeds {MAX_PDF_PAGES} pages")
+    for left, top, right, bottom in rects:
+        page_width, page_height = right - left, bottom - top
+        if not (math.isfinite(page_width) and math.isfinite(page_height)
+                and 1 <= page_width <= 50_000 and 1 <= page_height <= 50_000):
+            raise HTTPException(status_code=422, detail="Exported PDF page is too large")
+        if include_grid and (page_width + page_height) / board["gridSpacing"] > 10_000:
+            raise HTTPException(status_code=422, detail="Export grid would contain too many lines")
+    output = fitz.open()
+    try:
+        for left, top, right, bottom in rects:
+            page = output.new_page(width=right - left, height=bottom - top)
+            page.draw_rect(page.rect, color=None, fill=color_to_pdf(background_color), overlay=False)
+            if include_grid:
+                spacing = board["gridSpacing"]
+                colour = color_to_pdf(grid_color)
+                thickness = board["gridThickness"]
+                first_x = math.floor(left / spacing) * spacing
+                first_y = math.floor(top / spacing) * spacing
+                for index in range(math.ceil((right - first_x) / spacing) + 1):
+                    x = first_x + index * spacing - left
+                    page.draw_line((x, 0), (x, bottom - top), color=colour, width=thickness, overlay=True)
+                for index in range(math.ceil((bottom - first_y) / spacing) + 1):
+                    y = first_y + index * spacing - top
+                    page.draw_line((0, y), (right - left, y), color=colour, width=thickness, overlay=True)
+            source_page = {"x": 0.0, "y": 0.0}
+            for stroke in snapshot["strokes"].values():
+                bounds = stroke_world_bounds(stroke)
+                if bounds is None or bounds[2] < left or bounds[0] > right or bounds[3] < top or bounds[1] > bottom:
+                    continue
+                draw_stroke_on_pdf_page(page, stroke, source_page, -left, -top)
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix="whiteboard-export-", suffix=".pdf", dir=DATA_DIR)
+        os.close(fd)
+        output.save(name, garbage=4, deflate=True)
+        return Path(name)
+    finally:
+        output.close()
+
+
 @app.get("/")
 async def root() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -1891,6 +2102,7 @@ async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
         async with state_lock:
             await notebook_writer().drain()
             await drain_completion_tasks()
+            await asyncio.to_thread(archive_current_notebook, durable_snapshot())
             async with staged_document_assets(temp_root):
                 state["documentId"] = str(uuid.uuid4())
                 state["document"] = {"filename": filename, "pages": pages}
@@ -1910,6 +2122,162 @@ async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
         "document": snapshot,
         "documentId": document_id,
         "clearStrokes": True,
+    })
+    await broadcast(history_status_message())
+    return JSONResponse({"ok": True, "document": snapshot, "documentId": document_id})
+
+
+@app.post("/api/whiteboard")
+async def create_whiteboard(request: Request) -> JSONResponse:
+    ensure_storage_healthy()
+    raw = await request.json()
+    if not isinstance(raw, dict):
+        raise HTTPException(status_code=400, detail="Whiteboard settings are invalid")
+    try:
+        width = float(raw.get("sectionWidth", 612))
+        height = float(raw.get("sectionHeight", 792))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid whiteboard section size") from exc
+    page_info = {"width": width, "height": height}
+    settings = sanitize_whiteboard_settings(raw, page_info)
+    name = safe_filename(raw.get("name"), "Whiteboard")
+    blank = fitz.open()
+    try:
+        blank.new_page(width=width, height=height)
+        content = blank.tobytes()
+    finally:
+        blank.close()
+    temp_root, pages = prepare_pdf(content)
+    try:
+        async with state_lock:
+            await notebook_writer().drain()
+            await drain_completion_tasks()
+            if pending_stroke_history or pending_delete_operations:
+                raise HTTPException(status_code=409, detail="Finish active strokes or erasing before switching notebooks")
+            await asyncio.to_thread(archive_current_notebook, durable_snapshot())
+            async with staged_document_assets(temp_root):
+                state["documentId"] = str(uuid.uuid4())
+                state["document"] = {
+                    "filename": name, "pages": pages,
+                    "whiteboard": settings,
+                }
+                state["strokes"] = {}
+                history.clear()
+                redo_history.clear()
+                pending_stroke_history.clear()
+                await save_state_atomic(replace_all=True)
+                local_files.clear_origin(DATA_DIR)
+            snapshot = copy.deepcopy(state["document"])
+            document_id = current_document_id()
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+    await broadcast({
+        "type": "document_changed", "document": snapshot,
+        "documentId": document_id, "clearStrokes": True,
+    })
+    await broadcast(history_status_message())
+    return JSONResponse({"ok": True, "document": snapshot, "documentId": document_id})
+
+
+@app.post("/api/whiteboard/settings")
+async def update_whiteboard_settings(request: Request) -> JSONResponse:
+    ensure_storage_healthy()
+    raw = await request.json()
+    async with state_lock:
+        await notebook_writer().drain()
+        document = state.get("document", {})
+        if "whiteboard" not in document or len(document.get("pages", [])) != 1:
+            raise HTTPException(status_code=400, detail="Open a whiteboard first")
+        if not isinstance(raw, dict):
+            raise HTTPException(status_code=400, detail="Whiteboard settings are invalid")
+        if raw.get("documentId") != current_document_id():
+            raise HTTPException(status_code=409, detail="The active whiteboard changed")
+        settings = sanitize_whiteboard_settings(raw, document["pages"][0])
+        document["whiteboard"] = settings
+        await save_state_atomic()
+        snapshot = copy.deepcopy(document)
+        document_id = current_document_id()
+    await broadcast({
+        "type": "document_changed", "document": snapshot,
+        "documentId": document_id, "clearStrokes": False,
+    })
+    return JSONResponse({"ok": True, "document": snapshot, "documentId": document_id})
+
+
+@app.get("/api/notebooks")
+async def list_notebooks() -> JSONResponse:
+    entries: dict[str, dict[str, Any]] = {}
+    library = DATA_DIR / "notebooks"
+    if library.exists():
+        for path in library.glob("*.inotes"):
+            try:
+                with zipfile.ZipFile(path) as archive:
+                    manifest = json.loads(archive.read("manifest.json"))
+                document_id = str(uuid.UUID(manifest["documentId"]))
+                entries[document_id] = {
+                    "documentId": document_id,
+                    "name": manifest.get("documentName", "Notebook"),
+                    "kind": manifest.get("kind", "pdf"), "active": False,
+                }
+            except (OSError, ValueError, KeyError, zipfile.BadZipFile, json.JSONDecodeError):
+                continue
+    async with state_lock:
+        active_id = current_document_id()
+        document = state.get("document", {})
+        if document.get("pages"):
+            entries[active_id] = {
+                "documentId": active_id,
+                "name": document.get("filename") or "Notebook",
+                "kind": "whiteboard" if document.get("whiteboard") else "pdf",
+                "active": True,
+            }
+    return JSONResponse({"notebooks": sorted(entries.values(), key=lambda item: (not item["active"], item["name"]))})
+
+
+@app.post("/api/notebooks/{document_id}/open")
+async def open_saved_notebook(document_id: str) -> JSONResponse:
+    ensure_storage_healthy()
+    try:
+        document_id = str(uuid.UUID(document_id))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid notebook ID") from exc
+    if document_id == current_document_id():
+        return JSONResponse({"ok": True, "documentId": document_id})
+    path = DATA_DIR / "notebooks" / f"{document_id}.inotes"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Saved notebook not found")
+    imported_state, pdf_content = read_project_archive(path.read_bytes())
+    if imported_state["documentId"] != document_id or pdf_content is None:
+        raise HTTPException(status_code=400, detail="Saved notebook identity or PDF is invalid")
+    temp_root, pages = prepare_pdf(pdf_content)
+    try:
+        source_pages = imported_state["document"].get("pages", [])
+        reflow_strokes_between_page_layouts(imported_state["strokes"], source_pages, pages)
+        imported_state["document"]["pages"] = pages
+        async with state_lock:
+            await notebook_writer().drain()
+            await drain_completion_tasks()
+            if document_id == current_document_id():
+                return JSONResponse({"ok": True, "documentId": document_id})
+            if pending_stroke_history or pending_delete_operations:
+                raise HTTPException(status_code=409, detail="Finish active strokes or erasing before switching notebooks")
+            await asyncio.to_thread(archive_current_notebook, durable_snapshot())
+            async with staged_document_assets(temp_root):
+                previous_revision = current_document_revision()
+                state.clear()
+                state.update(imported_state)
+                state["documentRevision"] = previous_revision
+                history.clear()
+                redo_history.clear()
+                pending_stroke_history.clear()
+                await save_state_atomic(replace_all=True)
+                local_files.clear_origin(DATA_DIR)
+            snapshot = copy.deepcopy(state["document"])
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+    await broadcast({
+        "type": "document_changed", "document": snapshot,
+        "documentId": document_id, "clearStrokes": True,
     })
     await broadcast(history_status_message())
     return JSONResponse({"ok": True, "document": snapshot, "documentId": document_id})
@@ -2166,6 +2534,40 @@ async def export_flattened_pdf(
     )
 
 
+@app.get("/api/whiteboard/export")
+async def export_whiteboard(
+    mode: str = "paged", bounds: str = "sections", margin: float = 0,
+    backgroundColor: str | None = None, gridColor: str | None = None,
+    includeGrid: bool = True,
+) -> FileResponse:
+    async with state_lock:
+        await notebook_writer().drain()
+        snapshot = durable_snapshot()
+        board = snapshot.get("document", {}).get("whiteboard")
+        if board is None:
+            raise HTTPException(status_code=400, detail="Open a whiteboard first")
+    temp_path = await asyncio.to_thread(
+        create_whiteboard_pdf,
+        snapshot, mode=mode, bounds_mode=bounds, margin=margin,
+        background_color=backgroundColor or board["backgroundColor"],
+        grid_color=gridColor or board["gridColor"], include_grid=includeGrid,
+    )
+    return FileResponse(
+        temp_path, media_type="application/pdf", filename="whiteboard.pdf",
+        background=BackgroundTask(temp_path.unlink, missing_ok=True),
+    )
+
+
+@app.get("/api/whiteboard/export-info")
+async def whiteboard_export_info() -> JSONResponse:
+    async with state_lock:
+        await notebook_writer().drain()
+        snapshot = durable_snapshot()
+        if snapshot.get("document", {}).get("whiteboard") is None:
+            raise HTTPException(status_code=400, detail="Open a whiteboard first")
+    return JSONResponse(await asyncio.to_thread(whiteboard_paged_export_info, snapshot))
+
+
 @app.get("/api/project/export")
 async def export_project(request: Request, saveBesideSource: bool = False) -> FileResponse:
     if saveBesideSource:
@@ -2236,6 +2638,7 @@ async def import_project(file: UploadFile = File(...)) -> JSONResponse:
         async with state_lock:
             await notebook_writer().drain()
             await drain_completion_tasks()
+            await asyncio.to_thread(archive_current_notebook, durable_snapshot())
             async with staged_document_assets(temp_root):
                 previous_document_revision = current_document_revision()
                 state.clear()

@@ -6,6 +6,8 @@ struct SettingsView: View {
     @ObservedObject var appSettings: AppSettingsStore
     @Binding var serverAddress: String
     @StateObject private var discovery = ServerDiscovery()
+    @State private var whiteboardDraft: WhiteboardInfo?
+    @State private var newWhiteboardName = "Whiteboard"
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
@@ -14,6 +16,8 @@ struct SettingsView: View {
                 .tabItem { Label("Connection", systemImage: "network") }
             displayTab
                 .tabItem { Label("Display", systemImage: "display") }
+            whiteboardTab
+                .tabItem { Label("Whiteboard", systemImage: "square.grid.3x3") }
             strokeTab
                 .tabItem { Label("Stroke", systemImage: "pencil.tip") }
             geometryTab
@@ -100,6 +104,21 @@ struct SettingsView: View {
             }
 
             Section("Outer workspace") {
+                Stepper("Left sections: \(appSettings.configuration.resolvedWorkspaceInitialLeftSections)",
+                        value: Binding(
+                            get: { appSettings.configuration.resolvedWorkspaceInitialLeftSections },
+                            set: { appSettings.configuration.workspaceInitialLeftSections = $0 }
+                        ), in: 0...20)
+                Stepper("Right sections: \(appSettings.configuration.resolvedWorkspaceInitialRightSections)",
+                        value: Binding(
+                            get: { appSettings.configuration.resolvedWorkspaceInitialRightSections },
+                            set: { appSettings.configuration.workspaceInitialRightSections = $0 }
+                        ), in: 0...20)
+                Stepper("Extra sections beyond ink: \(appSettings.configuration.resolvedWorkspaceExtraSections)",
+                        value: Binding(
+                            get: { appSettings.configuration.resolvedWorkspaceExtraSections },
+                            set: { appSettings.configuration.workspaceExtraSections = $0 }
+                        ), in: 0...20)
                 Picker(
                     "Grid style",
                     selection: Binding(
@@ -121,7 +140,19 @@ struct SettingsView: View {
                     step: 2,
                     format: "%.0f pt"
                 )
-                Text("Each page starts with one PDF width of writing space on both sides. The grid appears only after an item crosses a PDF edge.")
+                ColorPicker("Outline without ink", selection: Binding(
+                    get: { Color(hex: appSettings.configuration.resolvedWorkspaceEmptyOutlineColor) },
+                    set: { appSettings.configuration.workspaceEmptyOutlineColor = $0.noteHex }
+                ))
+                ColorPicker("Outline with ink", selection: Binding(
+                    get: { Color(hex: appSettings.configuration.resolvedWorkspaceInkedOutlineColor) },
+                    set: { appSettings.configuration.workspaceInkedOutlineColor = $0.noteHex }
+                ))
+                valueSlider("Outline width", value: Binding(
+                    get: { appSettings.configuration.resolvedWorkspaceOutlineWidth },
+                    set: { appSettings.configuration.workspaceOutlineWidth = $0 }
+                ), range: 0.25...4, step: 0.25, format: "%.2f pt")
+                Text("Workspace remains visible beside each PDF page. Each section is one PDF-page width; extra sections follow ink as it expands.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -133,6 +164,126 @@ struct SettingsView: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+
+    private var whiteboardDefaultBinding: Binding<WhiteboardInfo> {
+        Binding(
+            get: { appSettings.configuration.whiteboardDefaults },
+            set: { updated in
+                var configuration = appSettings.configuration
+                configuration.whiteboardShowOutlines = updated.showOutlines
+                configuration.whiteboardUseSystemColors = updated.useSystemColors
+                configuration.whiteboardHalo = updated.halo
+                configuration.whiteboardBackgroundColor = updated.backgroundColor
+                configuration.whiteboardGridColor = updated.gridColor
+                configuration.whiteboardGridSpacing = updated.gridSpacing
+                configuration.whiteboardGridThickness = updated.gridThickness
+                configuration.whiteboardHorizontalOutlineColor = updated.horizontalInkedOutlineColor
+                configuration.whiteboardVerticalOutlineColor = updated.verticalInkedOutlineColor
+                configuration.whiteboardEmptyOutlineColor = updated.emptyOutlineColor
+                appSettings.configuration = configuration
+            }
+        )
+    }
+
+    private var currentWhiteboardBinding: Binding<WhiteboardInfo> {
+        Binding(
+            get: { whiteboardDraft ?? model.document.whiteboard ?? appSettings.configuration.whiteboardDefaults },
+            set: { whiteboardDraft = $0 }
+        )
+    }
+
+    private var whiteboardTab: some View {
+        settingsNavigation(title: "Whiteboard") {
+            Section("New whiteboards") {
+                TextField("Name", text: $newWhiteboardName)
+                Picker("Section format", selection: Binding(
+                    get: { appSettings.configuration.resolvedWhiteboardPaperFormat },
+                    set: { appSettings.configuration.whiteboardPaperFormat = $0 }
+                )) {
+                    ForEach(WhiteboardPaperFormat.allCases) { format in
+                        Text(format.title).tag(format)
+                    }
+                }
+                Toggle("Landscape", isOn: Binding(
+                    get: { appSettings.configuration.whiteboardLandscape ?? false },
+                    set: { appSettings.configuration.whiteboardLandscape = $0 }
+                ))
+                if appSettings.configuration.resolvedWhiteboardPaperFormat == .custom {
+                    Stepper("Width: \(String(format: "%.1f", (appSettings.configuration.whiteboardCustomWidth ?? 612) / 72)) in",
+                            value: Binding(
+                                get: { (appSettings.configuration.whiteboardCustomWidth ?? 612) / 72 },
+                                set: { appSettings.configuration.whiteboardCustomWidth = $0 * 72 }
+                            ), in: 1...20, step: 0.1)
+                    Stepper("Height: \(String(format: "%.1f", (appSettings.configuration.whiteboardCustomHeight ?? 792) / 72)) in",
+                            value: Binding(
+                                get: { (appSettings.configuration.whiteboardCustomHeight ?? 792) / 72 },
+                                set: { appSettings.configuration.whiteboardCustomHeight = $0 * 72 }
+                            ), in: 1...20, step: 0.1)
+                }
+                whiteboardAppearanceControls(whiteboardDefaultBinding)
+                Button("Create whiteboard") { model.createWhiteboard(name: newWhiteboardName) }
+                    .disabled(!model.isConnected)
+                Text("Section size is fixed when a whiteboard is created. Appearance and halo can be changed later.")
+                    .font(.footnote).foregroundStyle(.secondary)
+            }
+
+            if model.document.whiteboard != nil {
+                Section("Current whiteboard") {
+                    whiteboardAppearanceControls(currentWhiteboardBinding)
+                    Button("Save whiteboard settings") {
+                        if let whiteboardDraft { model.updateWhiteboardSettings(whiteboardDraft) }
+                    }
+                    .disabled(!model.isConnected || whiteboardDraft == model.document.whiteboard)
+                }
+            }
+
+            Section("Saved notebooks") {
+                Button("Refresh list") { model.refreshSavedNotebooks() }
+                ForEach(model.savedNotebooks) { notebook in
+                    Button {
+                        model.openSavedNotebook(notebook)
+                    } label: {
+                        Label(notebook.name, systemImage: notebook.kind == "whiteboard" ? "square.grid.3x3" : "doc")
+                    }
+                    .disabled(notebook.active || !model.isConnected)
+                }
+            }
+        }
+        .onAppear {
+            whiteboardDraft = model.document.whiteboard
+            model.refreshSavedNotebooks()
+        }
+        .onChange(of: model.document.whiteboard) { whiteboardDraft = $0 }
+    }
+
+    @ViewBuilder
+    private func whiteboardAppearanceControls(_ values: Binding<WhiteboardInfo>) -> some View {
+        Toggle("Show section outlines", isOn: values.showOutlines)
+        Toggle("Use system colours on iPad", isOn: values.useSystemColors)
+        Stepper("Writing halo: \(values.wrappedValue.halo) sections", value: values.halo, in: 1...10)
+        ColorPicker(values.wrappedValue.useSystemColors ? "Export background" : "Background", selection: Binding(
+            get: { Color(hex: values.wrappedValue.backgroundColor) },
+            set: { values.wrappedValue.backgroundColor = $0.noteHex ?? "#FFFFFF" }
+        ))
+        ColorPicker(values.wrappedValue.useSystemColors ? "Export grid lines" : "Grid lines", selection: Binding(
+            get: { Color(hex: values.wrappedValue.gridColor) },
+            set: { values.wrappedValue.gridColor = $0.noteHex ?? "#C8C8C8" }
+        ))
+        valueSlider("Grid spacing", value: values.gridSpacing, range: 4...200, step: 2, format: "%.0f pt")
+        valueSlider("Grid thickness", value: values.gridThickness, range: 0.1...4, step: 0.1, format: "%.1f pt")
+        ColorPicker("Top/bottom inked boundary", selection: Binding(
+            get: { Color(hex: values.wrappedValue.horizontalInkedOutlineColor) },
+            set: { values.wrappedValue.horizontalInkedOutlineColor = $0.noteHex ?? "#587CB6" }
+        ))
+        ColorPicker("Left/right inked boundary", selection: Binding(
+            get: { Color(hex: values.wrappedValue.verticalInkedOutlineColor) },
+            set: { values.wrappedValue.verticalInkedOutlineColor = $0.noteHex ?? "#6EAA78" }
+        ))
+        ColorPicker("Empty-neighbour boundary", selection: Binding(
+            get: { Color(hex: values.wrappedValue.emptyOutlineColor) },
+            set: { values.wrappedValue.emptyOutlineColor = $0.noteHex ?? "#A0A0A0" }
+        ))
     }
 
     private var strokeTab: some View {

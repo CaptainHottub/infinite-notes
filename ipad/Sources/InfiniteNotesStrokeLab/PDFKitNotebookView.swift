@@ -300,6 +300,13 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
         guard !isRebuildingPageLayout else { return }
         updateWorkingSet()
+        if model.document.whiteboard != nil, pdfFrames.indices.contains(0), zoomScale > 0 {
+            let center = viewportCenterInDocumentCoordinates()
+            model.extendWhiteboardView(near: CGPoint(
+                x: center.x - pdfFrames[0].minX,
+                y: center.y - pdfFrames[0].minY
+            ))
+        }
     }
 
     func scrollViewDidZoom(_ scrollView: UIScrollView) {
@@ -392,14 +399,16 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         for (index, size) in pageSizes.enumerated() {
             let state = model.workspaceState(at: index)
             let pageWidth = max(1, size.width)
+            let pageHeight = max(1, size.height)
             let workspaceWidth = workspaceWidths[index]
             let workspaceX = horizontalMargin + (maximumWorkspaceWidth - workspaceWidth) / 2
-            let workspace = CGRect(x: workspaceX, y: y, width: workspaceWidth, height: max(1, size.height))
+            let workspaceHeight = CGFloat(state.topPageHeights + 1 + state.bottomPageHeights) * pageHeight
+            let workspace = CGRect(x: workspaceX, y: y, width: workspaceWidth, height: workspaceHeight)
             let pdf = CGRect(
                 x: workspace.minX + CGFloat(state.leftPageWidths) * pageWidth,
-                y: workspace.minY,
+                y: workspace.minY + CGFloat(state.topPageHeights) * pageHeight,
                 width: pageWidth,
-                height: max(1, size.height)
+                height: pageHeight
             )
             workspaceFrames.append(workspace)
             pdfFrames.append(pdf)
@@ -581,10 +590,17 @@ private final class VectorPDFPageContainer: UIView {
         guard let model else { return }
         let settings = model.appSettings.configuration
         let state = model.workspaceState(at: pageIndex)
+        gridView.whiteboard = model.document.whiteboard
+        gridView.occupiedSections = state.occupiedSections
         gridView.sourcePDFFrame = sourcePDFFrame
-        gridView.isGridActive = state.hasOffPageContent
+        gridView.hasLeftContent = state.hasLeftContent
+        gridView.hasRightContent = state.hasRightContent
+        gridView.emptyOutlineColor = UIColor(Color(hex: settings.resolvedWorkspaceEmptyOutlineColor))
+        gridView.inkedOutlineColor = UIColor(Color(hex: settings.resolvedWorkspaceInkedOutlineColor))
+        gridView.outlineWidth = CGFloat(settings.resolvedWorkspaceOutlineWidth)
         gridView.gridStyle = settings.resolvedOffPageGridStyle
         gridView.gridSpacing = CGFloat(settings.resolvedOffPageGridSpacing)
+        pdfSurface.isHidden = model.document.whiteboard != nil
 
         pdfSurface.layer.shadowColor = UIColor.black.cgColor
         pdfSurface.layer.shadowOpacity = settings.showPageShadow ? 0.16 : 0

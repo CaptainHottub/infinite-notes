@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var didAutoConnect = false
     @State private var editingColorIndex: Int?
     @State private var showingToolSettings = false
+    @State private var showingWhiteboardExport = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -41,6 +42,9 @@ struct ContentView: View {
                 appSettings: model.appSettings,
                 serverAddress: $serverAddress
             )
+        }
+        .sheet(isPresented: $showingWhiteboardExport) {
+            WhiteboardExportSheet(model: model)
         }
         .sheet(isPresented: Binding(
             get: { model.exportedPDFURL != nil },
@@ -136,22 +140,31 @@ struct ContentView: View {
                     .accessibilityLabel("Fit page")
 
                     Menu {
-                        Button(action: model.addPageBelowCurrent) {
-                            Label("Add page below current", systemImage: "rectangle.badge.plus")
-                        }
-                        .disabled(!model.isConnected || model.currentPageNumber == 0)
+                        if model.document.whiteboard != nil {
+                            Button {
+                                showingWhiteboardExport = true
+                            } label: {
+                                Label("Export whiteboard", systemImage: "square.and.arrow.up")
+                            }
+                            .disabled(!model.isConnected)
+                        } else {
+                            Button(action: model.addPageBelowCurrent) {
+                                Label("Add page below current", systemImage: "rectangle.badge.plus")
+                            }
+                            .disabled(!model.isConnected || model.currentPageNumber == 0)
 
-                        Button(action: model.addPageAtEnd) {
-                            Label("Add page at end", systemImage: "doc.badge.plus")
-                        }
-                        .disabled(!model.isConnected || model.pageCount == 0)
+                            Button(action: model.addPageAtEnd) {
+                                Label("Add page at end", systemImage: "doc.badge.plus")
+                            }
+                            .disabled(!model.isConnected || model.pageCount == 0)
 
-                        Divider()
+                            Divider()
 
-                        Button(action: model.exportFlattenedPDF) {
-                            Label("Export PDF", systemImage: "square.and.arrow.up")
+                            Button(action: model.exportFlattenedPDF) {
+                                Label("Export PDF", systemImage: "square.and.arrow.up")
+                            }
+                            .disabled(!model.isConnected || model.pageCount == 0)
                         }
-                        .disabled(!model.isConnected || model.pageCount == 0)
                     } label: {
                         Image(systemName: "doc.badge.plus")
                     }
@@ -716,6 +729,95 @@ private struct ToolButton: View {
         }
         .buttonStyle(.plain)
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+private struct WhiteboardExportSheet: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var layout = "paged"
+    @State private var bounds = "sections"
+    @State private var borderBufferMM = 5.0
+    @State private var includeGrid = true
+    @State private var backgroundColor = "#FFFFFF"
+    @State private var gridColor = "#C8C8C8"
+    @State private var sparsePageNumbers: [Int] = []
+    @State private var showingSparseWarning = false
+
+    private func startExport() {
+        model.exportWhiteboardPDF(
+            mode: layout, bounds: bounds,
+            margin: layout == "single" ? borderBufferMM * 72 / 25.4 : 0,
+            backgroundColor: backgroundColor, gridColor: gridColor,
+            includeGrid: includeGrid
+        )
+        dismiss()
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("PDF layout") {
+                    Picker("Export as", selection: $layout) {
+                        Text("Paged PDF").tag("paged")
+                        Text("One large page").tag("single")
+                    }
+                    if layout == "single" {
+                        Picker("Page bounds", selection: $bounds) {
+                            Text("Sections containing ink").tag("sections")
+                            Text("Tight around ink").tag("ink")
+                        }
+                        Stepper("Border buffer: \(Int(borderBufferMM)) mm",
+                                value: $borderBufferMM, in: 0...100, step: 1)
+                    }
+                }
+                Section("Export appearance") {
+                    ColorPicker("Background", selection: Binding(
+                        get: { Color(hex: backgroundColor) },
+                        set: { backgroundColor = $0.noteHex ?? "#FFFFFF" }
+                    ))
+                    Toggle("Include grid", isOn: $includeGrid)
+                    if includeGrid {
+                        ColorPicker("Grid lines", selection: Binding(
+                            get: { Color(hex: gridColor) },
+                            set: { gridColor = $0.noteHex ?? "#C8C8C8" }
+                        ))
+                    }
+                    Text("Section outlines appear only on the iPad, never in the exported PDF.")
+                        .font(.footnote).foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Export whiteboard")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Export") {
+                        if layout == "paged" {
+                            model.checkWhiteboardPagedExport { pages in
+                                sparsePageNumbers = pages
+                                if pages.isEmpty { startExport() }
+                                else { showingSparseWarning = true }
+                            }
+                        } else { startExport() }
+                    }
+                    .disabled(!model.isConnected)
+                }
+            }
+        }
+        .alert("Sparse whiteboard pages", isPresented: $showingSparseWarning) {
+            Button("Export anyway") { startExport() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Pages \(sparsePageNumbers.map(String.init).joined(separator: ", ")) are empty or have very little ink. Export them?")
+        }
+        .onAppear {
+            if let board = model.document.whiteboard {
+                backgroundColor = board.backgroundColor
+                gridColor = board.gridColor
+            }
+        }
     }
 }
 

@@ -1,16 +1,28 @@
 import CoreGraphics
+import SwiftUI
 import UIKit
+
+struct WhiteboardSection: Hashable {
+    let column: Int
+    let row: Int
+}
 
 struct PageWorkspaceState: Equatable {
     var leftPageWidths: Int = 1
-    var rightPageWidths: Int = 1
-    var hasOffPageContent = false
+    var rightPageWidths: Int = 2
+    var topPageHeights: Int = 0
+    var bottomPageHeights: Int = 0
+    var hasLeftContent = false
+    var hasRightContent = false
+    var occupiedSections: Set<WhiteboardSection> = []
 
     func workspacePage(from source: PageInfo) -> PageInfo {
         let pageWidth = max(1, source.width)
         var result = source
         result.x = source.x - Double(leftPageWidths) * pageWidth
+        result.y = source.y - Double(topPageHeights) * max(1, source.height)
         result.width = Double(leftPageWidths + 1 + rightPageWidths) * pageWidth
+        result.height = Double(topPageHeights + 1 + bottomPageHeights) * max(1, source.height)
         return result
     }
 
@@ -25,7 +37,69 @@ struct PageWorkspaceState: Equatable {
 }
 
 enum OffPageWorkspaceGeometry {
-    static func state(sourcePage: PageInfo, strokes: [NoteStroke]) -> PageWorkspaceState {
+    static func whiteboardState(sourcePage: PageInfo, strokes: [NoteStroke],
+                                visibleLeft: Int, visibleRight: Int,
+                                visibleTop: Int, visibleBottom: Int) -> PageWorkspaceState {
+        let width = max(1, sourcePage.width)
+        let height = max(1, sourcePage.height)
+        var result = PageWorkspaceState(
+            leftPageWidths: visibleLeft, rightPageWidths: visibleRight,
+            topPageHeights: visibleTop, bottomPageHeights: visibleBottom
+        )
+        for stroke in strokes {
+            guard let bounds = strokeWorldBounds(stroke) else { continue }
+            let firstColumn = Int(floor((Double(bounds.minX) - sourcePage.x) / width))
+            let lastColumn = Int(floor((Double(bounds.maxX) - sourcePage.x) / width))
+            let firstRow = Int(floor((Double(bounds.minY) - sourcePage.y) / height))
+            let lastRow = Int(floor((Double(bounds.maxY) - sourcePage.y) / height))
+            result.leftPageWidths = max(result.leftPageWidths, -firstColumn + 2)
+            result.rightPageWidths = max(result.rightPageWidths, lastColumn + 2)
+            result.topPageHeights = max(result.topPageHeights, -firstRow + 2)
+            result.bottomPageHeights = max(result.bottomPageHeights, lastRow + 2)
+            result.occupiedSections.formUnion(
+                occupiedWhiteboardSections(stroke, sourcePage: sourcePage)
+            )
+        }
+        return result
+    }
+
+    static func occupiedWhiteboardSections(_ stroke: NoteStroke, sourcePage: PageInfo) -> Set<WhiteboardSection> {
+        let width = max(1, sourcePage.width)
+        let height = max(1, sourcePage.height)
+        let geometryPoints = GeometryEngine.isGeometry(stroke)
+            ? GeometryEngine.polyline(for: stroke, segments: 72) : []
+        let points = geometryPoints.isEmpty ? stroke.points.map(\.cgPoint) : geometryPoints
+        guard let first = points.first else { return [] }
+        let radius = max(0.75, stroke.width * 0.6)
+        var result: Set<WhiteboardSection> = []
+        func include(_ point: CGPoint) {
+            for x in [Double(point.x) - radius, Double(point.x) + radius] {
+                for y in [Double(point.y) - radius, Double(point.y) + radius] {
+                    result.insert(WhiteboardSection(
+                        column: Int(floor((x - sourcePage.x) / width)),
+                        row: Int(floor((y - sourcePage.y) / height))
+                    ))
+                }
+            }
+        }
+        include(first)
+        var previous = first
+        for point in points.dropFirst() {
+            let deltaX = abs(Double(point.x - previous.x)) / width
+            let deltaY = abs(Double(point.y - previous.y)) / height
+            let steps = max(1, min(8192, Int(ceil(max(deltaX, deltaY) * 4))))
+            for step in 1...steps {
+                let t = CGFloat(step) / CGFloat(steps)
+                include(CGPoint(x: previous.x + (point.x - previous.x) * t,
+                                y: previous.y + (point.y - previous.y) * t))
+            }
+            previous = point
+        }
+        return result
+    }
+
+    static func state(sourcePage: PageInfo, strokes: [NoteStroke],
+                      initialLeft: Int, initialRight: Int, extra: Int) -> PageWorkspaceState {
         let sourceRect = sourcePage.worldRect
         let pageWidth = max(1, sourceRect.width)
         var contentBounds: CGRect?
@@ -35,14 +109,19 @@ enum OffPageWorkspaceGeometry {
             contentBounds = contentBounds.map { $0.union(bounds) } ?? bounds
         }
 
-        guard let bounds = contentBounds else { return PageWorkspaceState() }
+        guard let bounds = contentBounds else {
+            return PageWorkspaceState(leftPageWidths: initialLeft, rightPageWidths: initialRight)
+        }
 
         let leftOverflow = max(0, sourceRect.minX - bounds.minX)
         let rightOverflow = max(0, bounds.maxX - sourceRect.maxX)
+        let hasLeft = leftOverflow > 0.01
+        let hasRight = rightOverflow > 0.01
         return PageWorkspaceState(
-            leftPageWidths: max(1, Int(ceil(leftOverflow / pageWidth))),
-            rightPageWidths: max(1, Int(ceil(rightOverflow / pageWidth))),
-            hasOffPageContent: leftOverflow > 0.01 || rightOverflow > 0.01
+            leftPageWidths: max(initialLeft, hasLeft ? Int(ceil(leftOverflow / pageWidth)) + extra : 0),
+            rightPageWidths: max(initialRight, hasRight ? Int(ceil(rightOverflow / pageWidth)) + extra : 0),
+            hasLeftContent: hasLeft,
+            hasRightContent: hasRight
         )
     }
 
@@ -85,12 +164,16 @@ enum OffPageWorkspaceGeometry {
 
 @MainActor
 final class OffPageGridView: UIView {
+    var whiteboard: WhiteboardInfo? { didSet { setNeedsDisplay() } }
+    var occupiedSections: Set<WhiteboardSection> = [] { didSet { setNeedsDisplay() } }
     var sourcePDFFrame: CGRect = .zero {
         didSet { setNeedsDisplay() }
     }
-    var isGridActive = false {
-        didSet { setNeedsDisplay() }
-    }
+    var hasLeftContent = false { didSet { setNeedsDisplay() } }
+    var hasRightContent = false { didSet { setNeedsDisplay() } }
+    var emptyOutlineColor = UIColor(red: 0.33, green: 0.53, blue: 0.80, alpha: 1) { didSet { setNeedsDisplay() } }
+    var inkedOutlineColor = UIColor(red: 0.43, green: 0.67, blue: 0.47, alpha: 1) { didSet { setNeedsDisplay() } }
+    var outlineWidth: CGFloat = 1 { didSet { setNeedsDisplay() } }
     var gridStyle: OffPageGridStyle = .system {
         didSet { setNeedsDisplay() }
     }
@@ -112,14 +195,17 @@ final class OffPageGridView: UIView {
 
     override func traitCollectionDidChange(_ previousTraitCollection: UITraitCollection?) {
         super.traitCollectionDidChange(previousTraitCollection)
-        if gridStyle == .system { setNeedsDisplay() }
+        if gridStyle == .system || whiteboard?.useSystemColors == true { setNeedsDisplay() }
     }
 
     override func draw(_ rect: CGRect) {
-        guard isGridActive,
-              let context = UIGraphicsGetCurrentContext(),
+        guard let context = UIGraphicsGetCurrentContext(),
               bounds.width > 0,
               bounds.height > 0 else { return }
+        if let whiteboard {
+            drawWhiteboard(rect, context: context, settings: whiteboard)
+            return
+        }
 
         let palette = Self.palette(for: gridStyle, traits: traitCollection)
         let sideRects = [
@@ -154,6 +240,80 @@ final class OffPageGridView: UIView {
             }
             context.strokePath()
             context.restoreGState()
+        }
+        for side in sideRects {
+            let isLeft = side.maxX <= sourcePDFFrame.minX + 0.01
+            let colour = (isLeft ? hasLeftContent : hasRightContent)
+                ? inkedOutlineColor : emptyOutlineColor
+            context.setStrokeColor(colour.cgColor)
+            context.setLineWidth(max(0.25, outlineWidth))
+            context.stroke(side.insetBy(dx: outlineWidth / 2, dy: outlineWidth / 2))
+        }
+        context.restoreGState()
+    }
+
+    private func drawWhiteboard(_ rect: CGRect, context: CGContext, settings: WhiteboardInfo) {
+        context.saveGState()
+        context.clip(to: rect)
+        let background = settings.useSystemColors
+            ? UIColor.secondarySystemBackground.resolvedColor(with: traitCollection)
+            : UIColor(Color(hex: settings.backgroundColor))
+        let grid = settings.useSystemColors
+            ? UIColor.separator.resolvedColor(with: traitCollection).withAlphaComponent(0.42)
+            : UIColor(Color(hex: settings.gridColor))
+        context.setFillColor(background.cgColor)
+        context.fill(rect)
+        let origin = sourcePDFFrame.origin
+        let spacing = CGFloat(settings.gridSpacing)
+        context.setStrokeColor(grid.cgColor)
+        context.setLineWidth(CGFloat(settings.gridThickness))
+        var x = origin.x + floor((rect.minX - origin.x) / spacing) * spacing
+        while x <= rect.maxX {
+            context.move(to: CGPoint(x: x, y: rect.minY))
+            context.addLine(to: CGPoint(x: x, y: rect.maxY))
+            x += spacing
+        }
+        var y = origin.y + floor((rect.minY - origin.y) / spacing) * spacing
+        while y <= rect.maxY {
+            context.move(to: CGPoint(x: rect.minX, y: y))
+            context.addLine(to: CGPoint(x: rect.maxX, y: y))
+            y += spacing
+        }
+        context.strokePath()
+
+        if settings.showOutlines {
+            let width = CGFloat(settings.sectionWidth)
+            let height = CGFloat(settings.sectionHeight)
+            let leftColumn = Int(floor((rect.minX - origin.x) / width))
+            let rightColumn = Int(ceil((rect.maxX - origin.x) / width))
+            let topRow = Int(floor((rect.minY - origin.y) / height))
+            let bottomRow = Int(ceil((rect.maxY - origin.y) / height))
+            let empty = UIColor(Color(hex: settings.emptyOutlineColor)).cgColor
+            let vertical = UIColor(Color(hex: settings.verticalInkedOutlineColor)).cgColor
+            let horizontal = UIColor(Color(hex: settings.horizontalInkedOutlineColor)).cgColor
+            context.setLineWidth(1)
+            for column in leftColumn...rightColumn {
+                let boundaryX = origin.x + CGFloat(column) * width
+                for row in topRow..<bottomRow {
+                    let both = occupiedSections.contains(WhiteboardSection(column: column - 1, row: row))
+                        && occupiedSections.contains(WhiteboardSection(column: column, row: row))
+                    context.setStrokeColor(both ? vertical : empty)
+                    context.move(to: CGPoint(x: boundaryX, y: origin.y + CGFloat(row) * height))
+                    context.addLine(to: CGPoint(x: boundaryX, y: origin.y + CGFloat(row + 1) * height))
+                    context.strokePath()
+                }
+            }
+            for row in topRow...bottomRow {
+                let boundaryY = origin.y + CGFloat(row) * height
+                for column in leftColumn..<rightColumn {
+                    let both = occupiedSections.contains(WhiteboardSection(column: column, row: row - 1))
+                        && occupiedSections.contains(WhiteboardSection(column: column, row: row))
+                    context.setStrokeColor(both ? horizontal : empty)
+                    context.move(to: CGPoint(x: origin.x + CGFloat(column) * width, y: boundaryY))
+                    context.addLine(to: CGPoint(x: origin.x + CGFloat(column + 1) * width, y: boundaryY))
+                    context.strokePath()
+                }
+            }
         }
         context.restoreGState()
     }

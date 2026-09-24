@@ -21,6 +21,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var settingsRevision = 0
     @Published private(set) var workspaceRevision = 0
     @Published var exportedPDFURL: URL?
+    @Published private(set) var savedNotebooks: [SavedNotebook] = []
     @Published private(set) var displayFPS = 0.0
 
     @Published var selectedTool: NoteTool {
@@ -84,6 +85,8 @@ final class AppModel: ObservableObject {
     private var eraserPerformance: [String: EraserPerformance] = [:]
     private var strokeMembership: [String: Set<Int>] = [:]
     private var pageWorkspaceStates: [Int: PageWorkspaceState] = [:]
+    private var workspaceSettingsSignature: [Int] = []
+    private var whiteboardVisibleSections = (left: 2, right: 2, top: 2, bottom: 2)
     private var liveStrokes = LiveStrokeTracker()
     private var liveStrokeIDs: Set<String> { liveStrokes.ids }
     // Completed local strokes remain here until the server acknowledges them.
@@ -216,11 +219,26 @@ final class AppModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        workspaceSettingsSignature = [
+            appSettings.configuration.resolvedWorkspaceInitialLeftSections,
+            appSettings.configuration.resolvedWorkspaceInitialRightSections,
+            appSettings.configuration.resolvedWorkspaceExtraSections,
+        ]
         appSettings.$configuration
             .dropFirst()
-            .sink { [weak self] _ in
-                self?.settingsRevision &+= 1
-                self?.invalidateAllPages()
+            .sink { [weak self] configuration in
+                guard let self else { return }
+                let signature = [
+                    configuration.resolvedWorkspaceInitialLeftSections,
+                    configuration.resolvedWorkspaceInitialRightSections,
+                    configuration.resolvedWorkspaceExtraSections,
+                ]
+                if signature != self.workspaceSettingsSignature {
+                    self.workspaceSettingsSignature = signature
+                    self.rebuildAllWorkspaceStates(settings: configuration)
+                }
+                self.settingsRevision &+= 1
+                self.invalidateAllPages()
             }
             .store(in: &cancellables)
 
@@ -475,14 +493,133 @@ final class AppModel: ObservableObject {
     }
 
     func exportFlattenedPDF() {
-        guard let url = endpoint(
-            path: "/api/pdf/export",
-            queryItems: [
+        downloadPDF(path: "/api/pdf/export", queryItems: [
                 URLQueryItem(name: "overflowMargin", value: "20"),
                 URLQueryItem(name: "outerGridStyle", value: appSettings.configuration.resolvedOffPageGridStyle.rawValue),
                 URLQueryItem(name: "outerGridSpacing", value: String(appSettings.configuration.resolvedOffPageGridSpacing)),
-            ]
-        ) else {
+            ])
+    }
+
+    func createWhiteboard(name: String) {
+        guard isConnected, !hasPendingEdits else {
+            lastError = "Connect and synchronize pending edits before creating a whiteboard"
+            return
+        }
+        postWhiteboard(path: "/api/whiteboard", settings: appSettings.configuration.whiteboardDefaults,
+                       documentID: nil, name: name)
+    }
+
+    func updateWhiteboardSettings(_ settings: WhiteboardInfo) {
+        guard isConnected, document.whiteboard != nil, let documentID = lastAppliedDocumentID else {
+            lastError = "Connect to the whiteboard before saving its settings"
+            return
+        }
+        postWhiteboard(path: "/api/whiteboard/settings", settings: settings, documentID: documentID, name: nil)
+    }
+
+    func refreshSavedNotebooks() {
+        guard let url = endpoint(path: "/api/notebooks") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+            guard let self else { return }
+            guard error == nil, let data,
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  let decoded = try? JSONDecoder().decode(SavedNotebookList.self, from: data) else { return }
+            Task { @MainActor in self.savedNotebooks = decoded.notebooks }
+        }.resume()
+    }
+
+    func openSavedNotebook(_ notebook: SavedNotebook) {
+        guard isConnected, !hasPendingEdits,
+              let url = endpoint(path: "/api/notebooks/\(notebook.documentId)/open") else {
+            lastError = "Connect and synchronize pending edits before switching notebooks"
+            return
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 120
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else { return }
+            Task { @MainActor in
+                if let error {
+                    self.lastError = "Could not open notebook: \(error.localizedDescription)"
+                } else if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                    let detail = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["detail"] as? String
+                    self.lastError = detail ?? "Could not open notebook (HTTP \(http.statusCode))"
+                } else {
+                    self.notice = "Opened \(notebook.name)"
+                    self.refreshSavedNotebooks()
+                }
+            }
+        }.resume()
+    }
+
+    private func postWhiteboard(path: String, settings: WhiteboardInfo, documentID: String?, name: String?) {
+        guard let url = endpoint(path: path) else {
+            lastError = "The computer server address is invalid"
+            return
+        }
+        do {
+            let encoded = try JSONEncoder().encode(settings)
+            var object = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] ?? [:]
+            if let documentID { object["documentId"] = documentID }
+            if let name { object["name"] = name }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: object)
+            request.timeoutInterval = 120
+            URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+                guard let self else { return }
+                Task { @MainActor in
+                    if let error {
+                        self.lastError = "Whiteboard update failed: \(error.localizedDescription)"
+                    } else if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                        let detail = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["detail"] as? String
+                        self.lastError = detail ?? "Whiteboard update failed (HTTP \(http.statusCode))"
+                    } else {
+                        self.notice = documentID == nil ? "Whiteboard ready" : "Whiteboard settings saved"
+                        self.refreshSavedNotebooks()
+                    }
+                }
+            }.resume()
+        } catch {
+            lastError = "Could not prepare whiteboard settings: \(error.localizedDescription)"
+        }
+    }
+
+    func exportWhiteboardPDF(mode: String, bounds: String, margin: Double,
+                             backgroundColor: String, gridColor: String, includeGrid: Bool) {
+        guard document.whiteboard != nil else { return }
+        downloadPDF(path: "/api/whiteboard/export", queryItems: [
+            URLQueryItem(name: "mode", value: mode),
+            URLQueryItem(name: "bounds", value: bounds),
+            URLQueryItem(name: "margin", value: String(margin)),
+            URLQueryItem(name: "backgroundColor", value: backgroundColor),
+            URLQueryItem(name: "gridColor", value: gridColor),
+            URLQueryItem(name: "includeGrid", value: includeGrid ? "true" : "false"),
+        ])
+    }
+
+    func checkWhiteboardPagedExport(_ completion: @escaping ([Int]) -> Void) {
+        guard let url = endpoint(path: "/api/whiteboard/export-info") else {
+            lastError = "The computer server address is invalid"
+            return
+        }
+        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+            guard let self else { return }
+            guard error == nil, let data,
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  let value = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let pages = value["sparsePages"] as? [Int] else {
+                Task { @MainActor in self.lastError = "Could not check whiteboard pages before export" }
+                return
+            }
+            Task { @MainActor in completion(pages) }
+        }.resume()
+    }
+
+    private func downloadPDF(path: String, queryItems: [URLQueryItem]) {
+        guard let url = endpoint(path: path, queryItems: queryItems) else {
             lastError = "The computer server address is invalid"
             return
         }
@@ -496,8 +633,14 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in self.lastError = "PDF export failed: \(error.localizedDescription)" }
                 return
             }
-            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode), let temporaryURL else {
-                Task { @MainActor in self.lastError = "The computer could not export the PDF" }
+            guard let http = response as? HTTPURLResponse else {
+                Task { @MainActor in self.lastError = "The computer did not return an export response" }
+                return
+            }
+            guard (200..<300).contains(http.statusCode), let temporaryURL else {
+                let detail = temporaryURL.flatMap { try? Data(contentsOf: $0) }
+                    .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["detail"] as? String
+                Task { @MainActor in self.lastError = detail ?? "The computer could not export the PDF" }
                 return
             }
             do {
@@ -753,6 +896,14 @@ final class AppModel: ObservableObject {
             notice = "Adding items requires a server connection"
             return false
         }
+        if document.whiteboard != nil,
+           newStrokes.contains(where: { stroke in
+               guard let firstPoint = stroke.points.first else { return true }
+               return !mayStartWhiteboardStroke(firstPoint)
+           }) {
+            notice = "Move closer to existing ink to add an item"
+            return false
+        }
         for stroke in newStrokes { insertOrReplace(stroke) }
         do {
             let objects = try JSONHelpers.object(from: newStrokes)
@@ -935,6 +1086,62 @@ final class AppModel: ObservableObject {
         pageWorkspaceStates[index] ?? PageWorkspaceState()
     }
 
+    private func calculatedWorkspaceState(at index: Int, strokes values: [NoteStroke],
+                                          settings: NativeAppConfiguration) -> PageWorkspaceState {
+        let source = document.pages[index]
+        if document.whiteboard != nil {
+            return OffPageWorkspaceGeometry.whiteboardState(
+                sourcePage: source, strokes: values,
+                visibleLeft: whiteboardVisibleSections.left,
+                visibleRight: whiteboardVisibleSections.right,
+                visibleTop: whiteboardVisibleSections.top,
+                visibleBottom: whiteboardVisibleSections.bottom
+            )
+        }
+        return OffPageWorkspaceGeometry.state(
+            sourcePage: source, strokes: values,
+            initialLeft: settings.resolvedWorkspaceInitialLeftSections,
+            initialRight: settings.resolvedWorkspaceInitialRightSections,
+            extra: settings.resolvedWorkspaceExtraSections
+        )
+    }
+
+    func extendWhiteboardView(near center: CGPoint) {
+        guard let board = document.whiteboard, let source = document.pages.first else { return }
+        let state = workspaceState(at: 0)
+        let column = Int(floor((Double(center.x) - source.x) / board.sectionWidth))
+        let row = Int(floor((Double(center.y) - source.y) / board.sectionHeight))
+        var changed = false
+        if column <= -state.leftPageWidths + 1 {
+            whiteboardVisibleSections.left = max(whiteboardVisibleSections.left, -column + 5)
+            changed = true
+        }
+        if column >= state.rightPageWidths - 1 {
+            whiteboardVisibleSections.right = max(whiteboardVisibleSections.right, column + 5)
+            changed = true
+        }
+        if row <= -state.topPageHeights + 1 {
+            whiteboardVisibleSections.top = max(whiteboardVisibleSections.top, -row + 5)
+            changed = true
+        }
+        if row >= state.bottomPageHeights - 1 {
+            whiteboardVisibleSections.bottom = max(whiteboardVisibleSections.bottom, row + 5)
+            changed = true
+        }
+        if changed { rebuildAllWorkspaceStates() }
+    }
+
+    private func mayStartWhiteboardStroke(_ point: NotePoint) -> Bool {
+        guard let board = document.whiteboard else { return true }
+        let column = Int(floor(point.x / board.sectionWidth))
+        let row = Int(floor(point.y / board.sectionHeight))
+        let halo = max(1, min(10, board.halo))
+        if max(abs(column), abs(row)) <= halo { return true }
+        return workspaceState(at: 0).occupiedSections.contains { section in
+            max(abs(column - section.column), abs(row - section.row)) <= halo
+        }
+    }
+
     func pageInfo(at index: Int) -> PageInfo? {
         guard let source = sourcePageInfo(at: index) else { return nil }
         return workspaceState(at: index).workspacePage(from: source)
@@ -945,14 +1152,12 @@ final class AppModel: ObservableObject {
         return workspaceState(at: index).sourcePDFFrame(source: source, workspace: workspace)
     }
 
-    func rebuildAllWorkspaceStates() {
+    func rebuildAllWorkspaceStates(settings override: NativeAppConfiguration? = nil) {
         var rebuilt: [Int: PageWorkspaceState] = [:]
         rebuilt.reserveCapacity(document.pages.count)
+        let settings = override ?? appSettings.configuration
         for index in document.pages.indices {
-            rebuilt[index] = OffPageWorkspaceGeometry.state(
-                sourcePage: document.pages[index],
-                strokes: strokesForPage(index)
-            )
+            rebuilt[index] = calculatedWorkspaceState(at: index, strokes: strokesForPage(index), settings: settings)
         }
         guard rebuilt != pageWorkspaceStates else { return }
         pageWorkspaceStates = rebuilt
@@ -965,11 +1170,9 @@ final class AppModel: ObservableObject {
             return
         }
         var changed = false
+        let settings = appSettings.configuration
         for index in pages where document.pages.indices.contains(index) {
-            let next = OffPageWorkspaceGeometry.state(
-                sourcePage: document.pages[index],
-                strokes: strokesForPage(index)
-            )
+            let next = calculatedWorkspaceState(at: index, strokes: strokesForPage(index), settings: settings)
             if pageWorkspaceStates[index] != next {
                 pageWorkspaceStates[index] = next
                 changed = true
@@ -985,16 +1188,18 @@ final class AppModel: ObservableObject {
 
     private func expandWorkspaceStates(for stroke: NoteStroke, pages: Set<Int>) {
         var changed = false
+        let settings = appSettings.configuration
         for index in pages where document.pages.indices.contains(index) {
-            let required = OffPageWorkspaceGeometry.state(
-                sourcePage: document.pages[index],
-                strokes: [stroke]
-            )
+            let required = calculatedWorkspaceState(at: index, strokes: [stroke], settings: settings)
             let current = workspaceState(at: index)
             let expanded = PageWorkspaceState(
                 leftPageWidths: max(current.leftPageWidths, required.leftPageWidths),
                 rightPageWidths: max(current.rightPageWidths, required.rightPageWidths),
-                hasOffPageContent: current.hasOffPageContent || required.hasOffPageContent
+                topPageHeights: max(current.topPageHeights, required.topPageHeights),
+                bottomPageHeights: max(current.bottomPageHeights, required.bottomPageHeights),
+                hasLeftContent: current.hasLeftContent || required.hasLeftContent,
+                hasRightContent: current.hasRightContent || required.hasRightContent,
+                occupiedSections: current.occupiedSections.union(required.occupiedSections)
             )
             if expanded != current {
                 pageWorkspaceStates[index] = expanded
@@ -1062,6 +1267,10 @@ final class AppModel: ObservableObject {
             notice = "Drawing offline — Pencil strokes will upload after reconnecting"
         }
         guard document.pages.indices.contains(pageIndex) else { return nil }
+        guard mayStartWhiteboardStroke(firstPoint) else {
+            notice = "Move closer to existing ink to start a stroke"
+            return nil
+        }
         let drawingTool = contactTool ?? selectedTool
         guard drawingTool != .eraser else { return nil }
 
@@ -1436,6 +1645,7 @@ final class AppModel: ObservableObject {
                 lastAppliedDocumentRevision = nil
                 lastAppliedStateToken = nil
                 if message.clearStrokes == true {
+                    whiteboardVisibleSections = (left: 2, right: 2, top: 2, bottom: 2)
                     strokes.removeAll()
                     liveStrokes.reset()
                     selectedStrokeIDs.removeAll()
@@ -1917,6 +2127,9 @@ final class AppModel: ObservableObject {
         if hasPendingEdits, pendingDocumentID != snapshot.documentId {
             lastError = "Pending edits belong to another notebook. Reopen that notebook to restore them."
             return false
+        }
+        if lastAppliedDocumentID != snapshot.documentId {
+            whiteboardVisibleSections = (left: 2, right: 2, top: 2, bottom: 2)
         }
         document = snapshot.document
         if !hasPendingEdits { pendingDocumentID = snapshot.documentId }
