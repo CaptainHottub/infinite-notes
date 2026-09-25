@@ -2,6 +2,12 @@ import SwiftUI
 import UIKit
 
 struct ContentView: View {
+    private static let syncClockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+
     @StateObject private var model = AppModel()
     @StateObject private var navigator = PDFNavigator()
     @AppStorage("native.serverAddress") private var serverAddress = "http://10.42.0.1:8000"
@@ -402,42 +408,69 @@ struct ContentView: View {
     }
 
     private var statusBar: some View {
-        HStack(spacing: 8) {
-            Circle()
-                .fill(model.isConnected ? Color.green : Color.orange)
-                .frame(width: 8, height: 8)
-            Text(model.connectionLabel)
-            if let filename = model.document.filename {
-                Text("•")
-                Text(filename).lineLimit(1)
-            }
-            Text("• Native 0.5.3 • Vector PDF • stable ink hand-off")
-                .foregroundStyle(.secondary)
-            if model.appSettings.configuration.resolvedShowFPSInStatusBar {
-                Text("• \(Int(model.displayFPS.rounded())) FPS")
-                    .font(.caption.monospacedDigit().weight(.semibold))
-            }
-            Spacer()
-            if !model.mountedPageIndices.isEmpty {
-                let sortedPages = model.mountedPageIndices.sorted()
-                HStack(spacing: 0) {
-                    Text("Pages: ")
-                    ForEach(sortedPages.indices, id: \.self) { offset in
-                        let index = sortedPages[offset]
-                        Text("\(index + 1)")
-                            .fontWeight(index + 1 == model.currentPageNumber ? .bold : .regular)
-                        if offset < sortedPages.count - 1 {
-                            Text(", ")
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 8) {
+                Circle()
+                    .fill(model.isConnected ? Color.green : Color.orange)
+                    .frame(width: 8, height: 8)
+                Text(model.connectionLabel)
+                if let filename = model.document.filename {
+                    Text("•")
+                    Text(filename).lineLimit(1).truncationMode(.middle)
+                }
+                Text("• Native 0.5.4")
+                    .foregroundStyle(.secondary)
+                if model.appSettings.configuration.resolvedShowFPSInStatusBar {
+                    Text("• \(Int(model.displayFPS.rounded())) FPS")
+                        .font(.caption.monospacedDigit().weight(.semibold))
+                }
+                Spacer()
+                if !model.mountedPageIndices.isEmpty {
+                    let sortedPages = model.mountedPageIndices.sorted()
+                    HStack(spacing: 0) {
+                        Text("Pages: ")
+                        ForEach(sortedPages.indices, id: \.self) { offset in
+                            let index = sortedPages[offset]
+                            Text("\(index + 1)")
+                                .fontWeight(index + 1 == model.currentPageNumber ? .bold : .regular)
+                            if offset < sortedPages.count - 1 {
+                                Text(", ")
+                            }
                         }
                     }
+                    .foregroundStyle(.secondary)
                 }
-                .foregroundStyle(.secondary)
             }
+            HStack(spacing: 8) {
+                Text("Sync \(syncTimeLabel)")
+                    .fontWeight(model.syncReadout.isActive ? .semibold : .regular)
+                if model.syncReadout.showCounts {
+                    Text("• \(model.syncReadout.stage)")
+                    Text("• Bytes \(syncByteLabel(model.syncReadout.receivedBytes)) / \(model.syncReadout.totalBytes.map(syncByteLabel) ?? "—")")
+                    Text("• Pages \(model.syncReadout.receivedPages) / \(model.syncReadout.totalPages.map(String.init) ?? "—")")
+                    Text("• Ink \(model.syncReadout.receivedInk) / \(model.syncReadout.totalInk.map(String.init) ?? "—")")
+                }
+                Spacer(minLength: 0)
+            }
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
         }
         .font(.caption)
         .padding(.horizontal, 12)
         .padding(.vertical, 5)
         .background(Color(uiColor: .secondarySystemBackground))
+    }
+
+    private var syncTimeLabel: String {
+        if model.syncReadout.isActive { return "NOW" }
+        guard let date = model.syncReadout.lastCompletedAt else { return "—" }
+        return Self.syncClockFormatter.string(from: date)
+    }
+
+    private func syncByteLabel(_ count: Int64) -> String {
+        if count == 0 { return "0 B" }
+        return ByteCountFormatter.string(fromByteCount: count, countStyle: .file)
     }
 
     private var errorIsPresented: Binding<Bool> {

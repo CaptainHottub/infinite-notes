@@ -27,7 +27,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
     private let stateLock = NSLock()
     private var heartbeatTimer: DispatchSourceTimer?
     private var explicitlyDisconnected = false
-    private static let heartbeatInterval: TimeInterval = 8
+    private static let heartbeatInterval: TimeInterval = 1
 
     override init() {
         super.init()

@@ -1828,6 +1828,14 @@ async def get_state() -> JSONResponse:
         snapshot = durable_snapshot()
         snapshot["stateToken"] = current_state_token()
         response = JSONResponse(snapshot)
+        try:
+            source_pdf_bytes = CURRENT_PDF.stat().st_size
+        except OSError:
+            source_pdf_bytes = 0
+        response.headers["X-Infinite-Notes-State-Bytes"] = str(len(response.body))
+        response.headers["X-Infinite-Notes-Page-Count"] = str(len(snapshot.get("document", {}).get("pages", [])))
+        response.headers["X-Infinite-Notes-Ink-Count"] = str(len(snapshot.get("strokes", {})))
+        response.headers["X-Infinite-Notes-Source-PDF-Bytes"] = str(source_pdf_bytes)
     debug_event(
         "sync",
         "state_fetch_completed",

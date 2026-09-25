@@ -496,6 +496,19 @@ struct NotebookState: Codable {
     var stateToken: String?
 }
 
+struct SyncReadout {
+    var lastCompletedAt: Date?
+    var isActive = false
+    var showCounts = false
+    var stage = ""
+    var receivedBytes: Int64 = 0
+    var totalBytes: Int64?
+    var receivedPages = 0
+    var totalPages: Int?
+    var receivedInk = 0
+    var totalInk: Int?
+}
+
 struct RevisionDeltaResponse: Decodable {
     var status: String
     var documentId: String

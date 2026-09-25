@@ -55,6 +55,22 @@ def test_root_and_state():
     assert response.status_code == 200
     assert "document" in response.json()
     assert "strokes" in response.json()
+    assert int(response.headers["x-infinite-notes-state-bytes"]) == len(response.content)
+    assert int(response.headers["x-infinite-notes-page-count"]) == len(response.json()["document"]["pages"])
+    assert int(response.headers["x-infinite-notes-ink-count"]) == len(response.json()["strokes"])
+
+
+def test_state_progress_headers_survive_gzip(monkeypatch, tmp_path):
+    source_pdf = tmp_path / "source.pdf"
+    source_pdf.write_bytes(b"%PDF-test")
+    monkeypatch.setattr(server, "CURRENT_PDF", source_pdf)
+    for index in range(200):
+        state["strokes"][f"ink-{index}"] = {"id": f"ink-{index}", "points": [{"x": index, "y": 2}]}
+    response = TestClient(app).get("/api/state", headers={"Accept-Encoding": "gzip"})
+    assert response.status_code == 200
+    assert int(response.headers["x-infinite-notes-state-bytes"]) == len(response.content)
+    assert int(response.headers["x-infinite-notes-ink-count"]) == 200
+    assert int(response.headers["x-infinite-notes-source-pdf-bytes"]) == len(b"%PDF-test")
 
 
 def test_http_state_does_not_advertise_uncommitted_live_stroke():

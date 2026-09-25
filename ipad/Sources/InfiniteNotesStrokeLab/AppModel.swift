@@ -22,6 +22,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var workspaceRevision = 0
     @Published var exportedPDFURL: URL?
     @Published private(set) var displayFPS = 0.0
+    @Published private(set) var syncReadout = SyncReadout()
 
     @Published var selectedTool: NoteTool {
         didSet { UserDefaults.standard.set(selectedTool.rawValue, forKey: "native.selectedTool") }
@@ -72,6 +73,13 @@ final class AppModel: ObservableObject {
     private var shouldReconnect = false
     private var reconnectWorkItem: DispatchWorkItem?
     private var stateFetchTask: URLSessionDataTask?
+    private var stateHTTPTransfer: HTTPProgressTransfer?
+    private var sourcePDFTransfer: HTTPProgressTransfer?
+    private var sourcePDFFetchTask: URLSessionDataTask?
+    private var stateBytesDelivered: Int64 = 0
+    private var stateBytesExpected: Int64?
+    private var sourcePDFBytesExpected: Int64?
+    private var syncReadoutGeneration = 0
     private var stateFetchGeneration = 0
     private var syncMutationGeneration = 0
     private var deferredFetchWorkItem: DispatchWorkItem?
@@ -111,6 +119,11 @@ final class AppModel: ObservableObject {
     private var lastAppliedDocumentID: String?
     private var lastAppliedDocumentRevision: Int?
     private var lastAppliedStateToken: String?
+    // A stroke-only state refresh does not change the source PDF. Reinstalling
+    // the same PDF resets the scroll view to its initial page fit.
+    private var loadedPDFDocumentID: String?
+    private var loadedPDFDocument: DocumentInfo?
+    private var sourcePDFFetchGeneration = 0
     // Keep reconnect payloads comfortably below common WebSocket frame limits.
     // Sending the entire offline queue in one JSON message can create a permanent
     // reconnect loop: the peer closes the oversized socket, then the client sends
@@ -247,7 +260,10 @@ final class AppModel: ObservableObject {
                 self.deferredFetchWorkItem = nil
                 self.stateFetchTask?.cancel()
                 self.stateFetchTask = nil
+                self.stateHTTPTransfer = nil
                 self.stateFetchGeneration &+= 1
+                self.cancelSourcePDFTransfer()
+                self.finishSyncReadout(success: false, stage: "Interrupted")
                 if self.shouldReconnect { self.scheduleReconnect() }
             case .connecting:
                 break
@@ -424,7 +440,10 @@ final class AppModel: ObservableObject {
         reconnectWorkItem = nil
         stateFetchTask?.cancel()
         stateFetchTask = nil
+        stateHTTPTransfer = nil
         stateFetchGeneration &+= 1
+        cancelSourcePDFTransfer()
+        finishSyncReadout(success: false, stage: "Interrupted")
         deferredFetchWorkItem?.cancel()
         deferredFetchWorkItem = nil
         guard let normalized = Self.normalizedBaseURL(address) else {
@@ -443,7 +462,10 @@ final class AppModel: ObservableObject {
         reconnectWorkItem = nil
         stateFetchTask?.cancel()
         stateFetchTask = nil
+        stateHTTPTransfer = nil
         stateFetchGeneration &+= 1
+        cancelSourcePDFTransfer()
+        finishSyncReadout(success: false, stage: "Interrupted")
         deferredFetchWorkItem?.cancel()
         deferredFetchWorkItem = nil
         client.disconnect()
@@ -456,6 +478,43 @@ final class AppModel: ObservableObject {
         }
         notice = "Synchronizing notebook…"
         fetchNotebookState(reason: "manual_sync")
+    }
+
+    private func beginSyncReadout(stage: String) {
+        syncReadoutGeneration &+= 1
+        stateBytesDelivered = 0
+        stateBytesExpected = nil
+        sourcePDFBytesExpected = nil
+        syncReadout = SyncReadout(
+            lastCompletedAt: syncReadout.lastCompletedAt,
+            isActive: true, showCounts: true, stage: stage
+        )
+    }
+
+    private func finishSyncReadout(success: Bool, stage: String = "Complete") {
+        guard syncReadout.isActive else { return }
+        syncReadoutGeneration &+= 1
+        let generation = syncReadoutGeneration
+        syncReadout.isActive = false
+        syncReadout.stage = stage
+        if success { syncReadout.lastCompletedAt = Date() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.syncReadoutGeneration == generation,
+                  !self.syncReadout.isActive else { return }
+            self.syncReadout.showCounts = false
+        }
+    }
+
+    private static func positiveByteHeader(_ name: String, from response: HTTPURLResponse) -> Int64? {
+        guard let value = response.value(forHTTPHeaderField: name),
+              let count = Int64(value), count >= 0 else { return nil }
+        return count
+    }
+
+    private static func countHeader(_ name: String, from response: HTTPURLResponse) -> Int? {
+        guard let value = response.value(forHTTPHeaderField: name),
+              let count = Int(value), count >= 0 else { return nil }
+        return count
     }
 
     func addPageAtEnd() {
@@ -1378,6 +1437,8 @@ final class AppModel: ObservableObject {
                 ]
             )
             if hasPendingEdits || isReconcilingPendingStrokes || !liveStrokeIDs.isEmpty {
+                if !syncReadout.isActive { beginSyncReadout(stage: "Reconciling edits") }
+                else { syncReadout.stage = "Reconciling edits" }
                 DebugSessionLogger.shared.event("sync", "state_refresh_deferred", fields: ["reason": reason])
                 deferredStateRefreshReason = reason
                 beginPendingStrokeReconciliationIfNeeded()
@@ -1665,7 +1726,9 @@ final class AppModel: ObservableObject {
     }
 
     private func fetchRevisionChanges(documentID: String, sinceRevision: Int, serverToken: String) {
+        beginSyncReadout(stage: "Receiving changes")
         stateFetchTask?.cancel()
+        stateHTTPTransfer = nil
         stateFetchGeneration &+= 1
         let generation = stateFetchGeneration
         let mutationGeneration = syncMutationGeneration
@@ -1736,6 +1799,7 @@ final class AppModel: ObservableObject {
                     self.fallbackRevisionChanges(reason: "missing_or_invalid_delta")
                     return
                 }
+                self.syncReadout.receivedBytes += Int64(data?.count ?? 0)
                 var merged = delta
                 guard merged.append(upserts: pageUpserts, deletes: pageDeletes) else {
                     self.fallbackRevisionChanges(reason: "invalid_stroke_delta")
@@ -1768,6 +1832,12 @@ final class AppModel: ObservableObject {
                 self.notice = "Notebook synchronized"
                 self.lastError = nil
                 self.stateFetchTask = nil
+                self.syncReadout.receivedPages = self.document.pages.count
+                self.syncReadout.totalPages = self.document.pages.count
+                self.syncReadout.receivedInk = self.strokes.count
+                self.syncReadout.totalInk = self.strokes.count
+                self.syncReadout.totalBytes = self.syncReadout.receivedBytes
+                self.finishSyncReadout(success: true)
                 DebugSessionLogger.shared.event(
                     "sync", "delta_fetch_completed",
                     fields: ["documentRevision": nextRevision,
@@ -1813,6 +1883,8 @@ final class AppModel: ObservableObject {
         deferredFetchWorkItem = nil
         deferredStateRefreshReason = nil
         stateFetchTask?.cancel()
+        stateHTTPTransfer = nil
+        beginSyncReadout(stage: "Receiving notebook")
         stateFetchGeneration &+= 1
         let generation = stateFetchGeneration
         let mutationGeneration = syncMutationGeneration
@@ -1828,12 +1900,32 @@ final class AppModel: ObservableObject {
         request.timeoutInterval = 120
         request.setValue("gzip", forHTTPHeaderField: "Accept-Encoding")
 
-        let task = URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        let transfer = HTTPProgressTransfer(onProgress: { [weak self] received, http in
+            guard let self else { return }
+            Task { @MainActor in
+                guard generation == self.stateFetchGeneration,
+                      self.syncReadout.isActive,
+                      self.syncReadout.stage == "Receiving notebook" else { return }
+                self.stateBytesDelivered = received
+                self.stateBytesExpected = Self.positiveByteHeader("X-Infinite-Notes-State-Bytes", from: http)
+                self.sourcePDFBytesExpected = Self.positiveByteHeader("X-Infinite-Notes-Source-PDF-Bytes", from: http)
+                self.syncReadout.receivedBytes = received
+                let expectsPDF = self.pdfDocument == nil || self.pdfFileURL == nil
+                    || self.loadedPDFDocumentID != self.lastAppliedDocumentID
+                if let stateTotal = self.stateBytesExpected {
+                    self.syncReadout.totalBytes = stateTotal + (expectsPDF ? self.sourcePDFBytesExpected ?? 0 : 0)
+                }
+                self.syncReadout.totalPages = Self.countHeader("X-Infinite-Notes-Page-Count", from: http)
+                self.syncReadout.totalInk = Self.countHeader("X-Infinite-Notes-Ink-Count", from: http)
+            }
+        }, onCompletion: { [weak self] data, response, error in
             guard let self else { return }
             if let error {
                 if (error as NSError).code == NSURLErrorCancelled { return }
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
+                    self.stateHTTPTransfer = nil
+                    self.finishSyncReadout(success: false, stage: "Failed")
                     DebugSessionLogger.shared.event(
                         "sync",
                         "state_fetch_failed",
@@ -1848,19 +1940,31 @@ final class AppModel: ObservableObject {
                   let data else {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
+                    self.stateHTTPTransfer = nil
+                    self.finishSyncReadout(success: false, stage: "Failed")
                     DebugSessionLogger.shared.event("sync", "state_fetch_failed", fields: ["reason": reason, "generation": generation])
                     self.lastError = "The computer did not return the notebook state"
                 }
                 return
             }
 
+            Task { @MainActor in
+                guard generation == self.stateFetchGeneration,
+                      self.syncReadout.isActive,
+                      self.syncReadout.stage == "Receiving notebook" else { return }
+                self.syncReadout.stage = "Applying notebook"
+                self.stateBytesDelivered = Int64(data.count)
+                self.syncReadout.receivedBytes = Int64(data.count)
+            }
             do {
                 let snapshot = try JSONDecoder().decode(NotebookState.self, from: data)
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
+                    self.stateHTTPTransfer = nil
                     guard self.syncMutationGeneration == mutationGeneration,
                           self.liveStrokeIDs.isEmpty,
                           !self.hasPendingEdits else {
+                        self.syncReadout.stage = "Waiting for edits"
                         self.deferredStateRefreshReason = reason
                         self.scheduleDeferredStateFetch()
                         DebugSessionLogger.shared.event(
@@ -1869,7 +1973,16 @@ final class AppModel: ObservableObject {
                         )
                         return
                     }
-                    guard self.applySnapshot(snapshot, liveIDs: []) else { return }
+                    guard self.applySnapshot(snapshot, liveIDs: []) else {
+                        self.finishSyncReadout(success: false, stage: "Blocked")
+                        return
+                    }
+                    self.stateBytesDelivered = Int64(data.count)
+                    self.syncReadout.receivedBytes = Int64(data.count)
+                    self.syncReadout.receivedPages = snapshot.document.pages.count
+                    self.syncReadout.totalPages = snapshot.document.pages.count
+                    self.syncReadout.receivedInk = snapshot.strokes.count
+                    self.syncReadout.totalInk = snapshot.strokes.count
                     DebugSessionLogger.shared.event(
                         "sync",
                         "state_fetch_completed",
@@ -1894,12 +2007,33 @@ final class AppModel: ObservableObject {
                     }
                     self.lastError = nil
                     if !snapshot.document.pages.isEmpty {
-                        self.fetchSourcePDF()
+                        if self.pdfDocument == nil || self.pdfFileURL == nil
+                            || self.loadedPDFDocumentID != snapshot.documentId
+                            || self.loadedPDFDocument != snapshot.document {
+                            self.syncReadout.stage = "Receiving PDF"
+                            if let stateTotal = self.stateBytesExpected,
+                               let pdfTotal = self.sourcePDFBytesExpected {
+                                self.syncReadout.totalBytes = stateTotal + pdfTotal
+                            }
+                            self.fetchSourcePDF()
+                        } else {
+                            self.syncReadout.totalBytes = self.stateBytesDelivered
+                            DebugSessionLogger.shared.event(
+                                "sync", "source_pdf_reused",
+                                fields: ["reason": reason, "documentId": snapshot.documentId ?? ""]
+                            )
+                            self.finishSyncReadout(success: true)
+                        }
+                    } else {
+                        self.syncReadout.totalBytes = self.stateBytesDelivered
+                        self.finishSyncReadout(success: true)
                     }
                 }
             } catch {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
+                    self.stateHTTPTransfer = nil
+                    self.finishSyncReadout(success: false, stage: "Failed")
                     DebugSessionLogger.shared.event(
                         "sync",
                         "state_decode_failed",
@@ -1908,9 +2042,9 @@ final class AppModel: ObservableObject {
                     self.lastError = "Could not decode the notebook state: \(error.localizedDescription)"
                 }
             }
-        }
-        stateFetchTask = task
-        task.resume()
+        })
+        stateHTTPTransfer = transfer
+        stateFetchTask = transfer.start(request)
     }
 
     private func applySnapshot(_ snapshot: NotebookState, liveIDs: Set<String>) -> Bool {
@@ -1938,24 +2072,67 @@ final class AppModel: ObservableObject {
     }
 
     private func fetchSourcePDF() {
-        guard let sourceURL = endpoint(path: "/api/pdf/source") else { return }
+        guard let sourceURL = endpoint(path: "/api/pdf/source") else {
+            finishSyncReadout(success: false, stage: "Failed")
+            return
+        }
+        if !syncReadout.isActive { beginSyncReadout(stage: "Receiving PDF") }
+        cancelSourcePDFTransfer()
+        let generation = sourcePDFFetchGeneration
+        let requestedDocumentID = lastAppliedDocumentID
+        let requestedDocument = document
         var request = URLRequest(url: sourceURL)
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         request.timeoutInterval = 30
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+        let transfer = HTTPProgressTransfer(onProgress: { [weak self] received, http in
+            guard let self else { return }
+            Task { @MainActor in
+                guard generation == self.sourcePDFFetchGeneration,
+                      self.syncReadout.isActive,
+                      self.syncReadout.stage == "Receiving PDF" else { return }
+                let pdfTotal = http.expectedContentLength >= 0
+                    ? http.expectedContentLength : self.sourcePDFBytesExpected
+                self.syncReadout.stage = "Receiving PDF"
+                self.syncReadout.receivedBytes = self.stateBytesDelivered + received
+                if let pdfTotal {
+                    self.sourcePDFBytesExpected = pdfTotal
+                    self.syncReadout.totalBytes = (self.stateBytesExpected ?? 0) + pdfTotal
+                }
+            }
+        }, onCompletion: { [weak self] data, response, error in
             guard let self else { return }
             if let error {
-                Task { @MainActor in self.lastError = "PDF download failed: \(error.localizedDescription)" }
+                if (error as NSError).code == NSURLErrorCancelled { return }
+                Task { @MainActor in
+                    guard generation == self.sourcePDFFetchGeneration else { return }
+                    self.sourcePDFTransfer = nil
+                    self.sourcePDFFetchTask = nil
+                    self.finishSyncReadout(success: false, stage: "Failed")
+                    self.lastError = "PDF download failed: \(error.localizedDescription)"
+                }
                 return
             }
             guard let http = response as? HTTPURLResponse,
                   (200..<300).contains(http.statusCode),
                   let data,
                   data.starts(with: Data("%PDF-".utf8)) else {
-                Task { @MainActor in self.lastError = "The laptop did not return the original PDF file" }
+                Task { @MainActor in
+                    guard generation == self.sourcePDFFetchGeneration else { return }
+                    self.sourcePDFTransfer = nil
+                    self.sourcePDFFetchTask = nil
+                    self.finishSyncReadout(success: false, stage: "Failed")
+                    self.lastError = "The laptop did not return the original PDF file"
+                }
                 return
             }
 
+            Task { @MainActor in
+                guard generation == self.sourcePDFFetchGeneration,
+                      self.syncReadout.isActive,
+                      self.syncReadout.stage == "Receiving PDF" else { return }
+                self.syncReadout.stage = "Opening PDF"
+            }
             do {
                 let root = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
                     .appendingPathComponent("InfiniteNotesNative/PDF", isDirectory: true)
@@ -1964,14 +2141,28 @@ final class AppModel: ObservableObject {
                 try data.write(to: localURL, options: .atomic)
 
                 Task { @MainActor in
+                    guard self.sourcePDFFetchGeneration == generation,
+                          self.lastAppliedDocumentID == requestedDocumentID,
+                          self.document == requestedDocument else {
+                        try? FileManager.default.removeItem(at: localURL)
+                        return
+                    }
+                    self.sourcePDFTransfer = nil
+                    self.sourcePDFFetchTask = nil
                     guard let pdf = PDFDocument(url: localURL) else {
                         try? FileManager.default.removeItem(at: localURL)
+                        self.finishSyncReadout(success: false, stage: "Failed")
                         self.lastError = "PDFKit could not open the downloaded source PDF"
                         return
                     }
                     let previousURL = self.pdfFileURL
                     self.pdfFileURL = localURL
                     self.pdfDocument = pdf
+                    self.loadedPDFDocumentID = requestedDocumentID
+                    self.loadedPDFDocument = requestedDocument
+                    self.syncReadout.receivedBytes = self.stateBytesDelivered + Int64(data.count)
+                    self.syncReadout.totalBytes = self.syncReadout.receivedBytes
+                    self.finishSyncReadout(success: true)
                     if let previousURL, previousURL != localURL {
                         try? FileManager.default.removeItem(at: previousURL)
                     }
@@ -1982,9 +2173,24 @@ final class AppModel: ObservableObject {
                     }
                 }
             } catch {
-                Task { @MainActor in self.lastError = "Could not cache the source PDF: \(error.localizedDescription)" }
+                Task { @MainActor in
+                    guard generation == self.sourcePDFFetchGeneration else { return }
+                    self.sourcePDFTransfer = nil
+                    self.sourcePDFFetchTask = nil
+                    self.finishSyncReadout(success: false, stage: "Failed")
+                    self.lastError = "Could not cache the source PDF: \(error.localizedDescription)"
+                }
             }
-        }.resume()
+        })
+        sourcePDFTransfer = transfer
+        sourcePDFFetchTask = transfer.start(request)
+    }
+
+    private func cancelSourcePDFTransfer() {
+        sourcePDFFetchTask?.cancel()
+        sourcePDFFetchTask = nil
+        sourcePDFTransfer = nil
+        sourcePDFFetchGeneration &+= 1
     }
 
     private func endpoint(path: String, queryItems: [URLQueryItem] = []) -> URL? {

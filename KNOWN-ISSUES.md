@@ -1,5 +1,15 @@
 # Known issues — iPad experimental branch
 
+## Reconnect viewport reset — fix under test, 2026-09-25
+
+- The iPad can lose its WebSocket heartbeat and reconnect while writing. After
+  pending edits reconcile, the full-state fetch previously downloaded the same
+  source PDF again. Installing it reset the PDF viewer to its initial page fit.
+- The client now reuses an already-loaded source PDF when the notebook identity
+  and page metadata match, and ignores stale PDF downloads. Verify on-device
+  that reconnecting keeps the current pan and zoom; the heartbeat abort itself
+  is a separate connection issue and is not claimed fixed here.
+
 ## Lecture report and requested work — 2026-09-17
 
 - A 90-minute lecture had zero observed desync, undo, or queued-stroke problems.
