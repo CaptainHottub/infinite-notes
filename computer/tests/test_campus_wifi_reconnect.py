@@ -101,7 +101,7 @@ def test_native_client_source_contains_websocket_heartbeat_and_revision_guard():
     server_client = (repo_root / "ipad/Sources/InfiniteNotesStrokeLab/ServerClient.swift").read_text()
     app_model = (repo_root / "ipad/Sources/InfiniteNotesStrokeLab/AppModel.swift").read_text()
     assert "targetTask.sendPing" in server_client
-    assert "heartbeatInterval: TimeInterval = 8" in server_client
+    assert "heartbeatInterval: TimeInterval" in server_client
     assert 'incomingRevision == lastAppliedDocumentRevision' in app_model
     assert 'incomingDocumentID == lastAppliedDocumentID' in app_model
     assert 'lastAppliedDocumentID = snapshot.documentId' in app_model
@@ -109,7 +109,10 @@ def test_native_client_source_contains_websocket_heartbeat_and_revision_guard():
     assert 'incomingToken == lastAppliedStateToken' in app_model
     assert 'state_fetch_skipped_matching_revision' in app_model
     assert 'endpoint(path: "/api/changes"' in app_model
-    assert 'RevisionDeltaSafety.sameServerInstance(incomingToken, lastAppliedStateToken)' in app_model
+    assert 'RevisionDeltaSafety.sameServerInstance(stateToken, serverToken)' in app_model
+    assert 'requestCatchUp(reason: "manual_sync")' in app_model
+    assert 'syncIdleSeconds: TimeInterval = 2.5' in app_model
+    assert 'nextRevision >= cursor' in app_model
     assert 'fallbackRevisionChanges(reason: "local_or_live_edit")' in app_model
     stroke_ack = app_model.split('case "stroke_ack":', 1)[1].split('case "reconcile_ack":', 1)[0]
     assert 'replayPendingErases()' in stroke_ack

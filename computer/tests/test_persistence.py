@@ -140,9 +140,35 @@ def test_revision_feed_is_contiguous_bounded_and_survives_reopen(tmp_path):
     second = store.changes_since(original["documentId"], first["nextRevision"])
     assert second["status"] == "complete"
     assert second["nextRevision"] == 23
-    assert store.changes_since(original["documentId"], 23)["upserts"] == {}
+    no_changes = store.changes_since(original["documentId"], 23)
+    assert no_changes["status"] == "complete"
+    assert no_changes["nextRevision"] == 23
+    assert no_changes["upserts"] == {}
     assert store.changes_since("different", 19)["status"] == "snapshot_required"
     assert store.changes_since(original["documentId"], 24)["status"] == "snapshot_required"
+    store.close()
+
+
+def test_revision_feed_splits_large_delta_before_byte_limit(tmp_path):
+    store = NotebookStore(tmp_path / "notebook.sqlite3")
+    original = sample_state()
+    store.initialize(original)
+    for revision in (20, 21):
+        stroke_id = f"large-{revision}"
+        stroke = {"id": stroke_id, "points": [{"data": "x" * 100}]}
+        metadata = {key: copy.deepcopy(value) for key, value in original.items() if key != "strokes"}
+        metadata["documentRevision"] = revision
+        store.commit_batch([{"replace_all": False, "deletes": set(),
+                             "upserts": {stroke_id: stroke}, "metadata": metadata}])
+    store.CHANGE_BYTE_LIMIT = len(json.dumps(stroke, separators=(",", ":")).encode()) + len(stroke_id) + 8
+    first = store.changes_since(original["documentId"], 19)
+    assert first["status"] == "more"
+    assert first["nextRevision"] == 20
+    assert set(first["upserts"]) == {"large-20"}
+    second = store.changes_since(original["documentId"], first["nextRevision"])
+    assert second["status"] == "complete"
+    assert second["nextRevision"] == 21
+    assert set(second["upserts"]) == {"large-21"}
     store.close()
 
 

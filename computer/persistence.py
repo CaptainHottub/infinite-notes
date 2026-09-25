@@ -13,7 +13,7 @@ from typing import Any
 
 
 class NotebookStore:
-    CHANGE_RETENTION = 512
+    CHANGE_RETENTION = 8192
     CHANGE_PAGE_LIMIT = 64
     CHANGE_BYTE_LIMIT = 512 * 1024
     CHANGE_ID_LIMIT = 128
@@ -165,6 +165,8 @@ class NotebookStore:
             (since_revision, self.CHANGE_PAGE_LIMIT + 1),
         ).fetchall()
         touched_ids: set[str] = set()
+        stroke_rows: dict[str, str | None] = {}
+        byte_count = 0
         expected_revision = since_revision + 1
         for revision, encoded in rows[:self.CHANGE_PAGE_LIMIT]:
             if revision != expected_revision:
@@ -174,26 +176,38 @@ class NotebookStore:
                 if expected_revision == since_revision + 1:
                     return {**result, "status": "snapshot_required"}
                 break
-            touched_ids.update(change["upsertIds"])
-            touched_ids.update(change["deletes"])
+            revision_ids = set(change["upsertIds"]) | set(change["deletes"])
+            new_ids = revision_ids - touched_ids
+            new_rows = {
+                stroke_id: self.connection.execute(
+                    "SELECT value FROM strokes WHERE id=?", (stroke_id,)
+                ).fetchone()
+                for stroke_id in new_ids
+            }
+            revision_bytes = sum(
+                len(stroke_id.encode("utf-8")) +
+                (len(row[0].encode("utf-8")) if row is not None else 0) + 8
+                for stroke_id, row in new_rows.items()
+            )
+            if byte_count + revision_bytes > self.CHANGE_BYTE_LIMIT:
+                if expected_revision == since_revision + 1:
+                    return {**result, "status": "snapshot_required"}
+                break
+            touched_ids.update(revision_ids)
+            stroke_rows.update({stroke_id: row[0] if row is not None else None
+                                for stroke_id, row in new_rows.items()})
+            byte_count += revision_bytes
             expected_revision += 1
         if expected_revision == since_revision + 1:
             return {**result, "status": "snapshot_required"}
         upserts: dict[str, dict[str, Any]] = {}
         deletes: list[str] = []
-        byte_count = 0
         for stroke_id in sorted(touched_ids):
-            row = self.connection.execute(
-                "SELECT value FROM strokes WHERE id=?", (stroke_id,)
-            ).fetchone()
-            if row is None:
+            value = stroke_rows[stroke_id]
+            if value is None:
                 deletes.append(stroke_id)
-                byte_count += len(stroke_id.encode("utf-8")) + 4
             else:
-                upserts[stroke_id] = json.loads(row[0])
-                byte_count += len(stroke_id.encode("utf-8")) + len(row[0].encode("utf-8")) + 8
-            if byte_count > self.CHANGE_BYTE_LIMIT:
-                return {**result, "status": "snapshot_required"}
+                upserts[stroke_id] = json.loads(value)
         next_revision = expected_revision - 1
         return {
             **result, "status": "complete" if next_revision == current else "more",

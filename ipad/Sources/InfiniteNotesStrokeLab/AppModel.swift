@@ -113,6 +113,9 @@ final class AppModel: ObservableObject {
     private var journalBlocked = false
     private var isReconcilingPendingStrokes = false
     private var deferredStateRefreshReason: String?
+    private var deferredRequiresFullSnapshot = false
+    private var lastLocalEditAt: TimeInterval = 0
+    private static let syncIdleSeconds: TimeInterval = 2.5
     // Only a fully applied snapshot or a complete, contiguous revision delta
     // may advance this value. An operation ACK alone cannot prove that all
     // concurrent remote edits through its revision reached this client.
@@ -256,6 +259,7 @@ final class AppModel: ObservableObject {
                 self.isReconcilingPendingStrokes = false
                 self.eraseBatchInFlight = nil
                 self.deferredStateRefreshReason = nil
+                self.deferredRequiresFullSnapshot = false
                 self.deferredFetchWorkItem?.cancel()
                 self.deferredFetchWorkItem = nil
                 self.stateFetchTask?.cancel()
@@ -436,6 +440,7 @@ final class AppModel: ObservableObject {
         isReconcilingPendingStrokes = false
         connectedDocumentID = nil
         deferredStateRefreshReason = nil
+        deferredRequiresFullSnapshot = false
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
         stateFetchTask?.cancel()
@@ -458,6 +463,7 @@ final class AppModel: ObservableObject {
     func disconnect() {
         shouldReconnect = false
         deferredStateRefreshReason = nil
+        deferredRequiresFullSnapshot = false
         reconnectWorkItem?.cancel()
         reconnectWorkItem = nil
         stateFetchTask?.cancel()
@@ -476,8 +482,43 @@ final class AppModel: ObservableObject {
             lastError = "Connect to the computer before synchronizing"
             return
         }
+        guard stateFetchTask == nil, sourcePDFFetchTask == nil else {
+            notice = "Synchronization is already in progress"
+            return
+        }
         notice = "Synchronizing notebook…"
-        fetchNotebookState(reason: "manual_sync")
+        requestCatchUp(reason: "manual_sync")
+    }
+
+    private func requestCatchUp(reason: String, requiresFullSnapshot: Bool = false) {
+        if stateFetchTask != nil || sourcePDFFetchTask != nil {
+            deferredStateRefreshReason = reason
+            deferredRequiresFullSnapshot = deferredRequiresFullSnapshot || requiresFullSnapshot
+            scheduleDeferredStateFetch()
+            return
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        let recentlyWriting = lastLocalEditAt > 0 && now - lastLocalEditAt < Self.syncIdleSeconds
+        if hasPendingEdits || isReconcilingPendingStrokes || !liveStrokeIDs.isEmpty
+            || !activeEraseOperations.isEmpty || recentlyWriting {
+            deferredStateRefreshReason = reason
+            deferredRequiresFullSnapshot = deferredRequiresFullSnapshot || requiresFullSnapshot
+            if !syncReadout.isActive { beginSyncReadout(stage: "Waiting for writing pause") }
+            else { syncReadout.stage = "Waiting for writing pause" }
+            scheduleDeferredStateFetch()
+            return
+        }
+        let mustFetchFull = requiresFullSnapshot || deferredRequiresFullSnapshot
+        deferredRequiresFullSnapshot = false
+        guard !mustFetchFull,
+              let documentID = lastAppliedDocumentID,
+              documentID == connectedDocumentID,
+              let revision = lastAppliedDocumentRevision,
+              let token = lastAppliedStateToken else {
+            fetchNotebookState(reason: reason)
+            return
+        }
+        fetchRevisionChanges(documentID: documentID, sinceRevision: revision, serverToken: token)
     }
 
     private func beginSyncReadout(stage: String) {
@@ -489,6 +530,10 @@ final class AppModel: ObservableObject {
             lastCompletedAt: syncReadout.lastCompletedAt,
             isActive: true, showCounts: true, stage: stage
         )
+    }
+
+    private func noteLocalEdit() {
+        lastLocalEditAt = ProcessInfo.processInfo.systemUptime
     }
 
     private func finishSyncReadout(success: Bool, stage: String = "Complete") {
@@ -1123,6 +1168,7 @@ final class AppModel: ObservableObject {
         guard document.pages.indices.contains(pageIndex) else { return nil }
         let drawingTool = contactTool ?? selectedTool
         guard drawingTool != .eraser else { return nil }
+        noteLocalEdit()
 
         let pipelineConfiguration = strokeSettings.configuration
         let storedTool: String
@@ -1173,6 +1219,7 @@ final class AppModel: ObservableObject {
 
     func appendPoints(strokeID: String, points: [NotePoint]) {
         guard !points.isEmpty, var stroke = strokes[strokeID] else { return }
+        noteLocalEdit()
         syncMutationGeneration &+= 1
         stroke.points.append(contentsOf: points)
         strokes[strokeID] = stroke
@@ -1191,6 +1238,8 @@ final class AppModel: ObservableObject {
     }
 
     func endStroke(strokeID: String) {
+        noteLocalEdit()
+        defer { scheduleDeferredStateFetch() }
         flushPendingPoints(strokeID: strokeID)
         let pages = strokeMembership[strokeID] ?? []
         beginCommitTransition(strokeID: strokeID, pages: pages)
@@ -1229,6 +1278,7 @@ final class AppModel: ObservableObject {
     }
 
     func beginEraseOperation() -> String {
+        noteLocalEdit()
         let id = "erase-\(clientID)-\(UUID().uuidString.lowercased())"
         activeEraseOperations.insert(id)
         eraserPerformance[id] = EraserPerformance()
@@ -1241,6 +1291,7 @@ final class AppModel: ObservableObject {
 
     func erase(along points: [CGPoint], pageIndex: Int, operationID: String, alreadyDeleted: inout Set<String>) {
         guard let first = points.first, let last = points.last else { return }
+        noteLocalEdit()
         guard !journalBlocked, let documentID = lastAppliedDocumentID ?? pendingDocumentID else { return }
         guard !hasPendingEdits || pendingDocumentID == documentID else {
             lastError = "Pending edits belong to another notebook. Reopen that notebook to restore them."
@@ -1291,6 +1342,8 @@ final class AppModel: ObservableObject {
     }
 
     func finishEraseOperation(_ operationID: String) {
+        noteLocalEdit()
+        defer { scheduleDeferredStateFetch() }
         activeEraseOperations.remove(operationID)
         eraserPreviousPoints.removeValue(forKey: operationID)
         let workspaceStarted = ProcessInfo.processInfo.systemUptime
@@ -1437,12 +1490,10 @@ final class AppModel: ObservableObject {
                 ]
             )
             if hasPendingEdits || isReconcilingPendingStrokes || !liveStrokeIDs.isEmpty {
-                if !syncReadout.isActive { beginSyncReadout(stage: "Reconciling edits") }
-                else { syncReadout.stage = "Reconciling edits" }
                 DebugSessionLogger.shared.event("sync", "state_refresh_deferred", fields: ["reason": reason])
-                deferredStateRefreshReason = reason
+                requestCatchUp(reason: reason, requiresFullSnapshot: reason == "project_import")
+                syncReadout.stage = "Reconciling edits"
                 beginPendingStrokeReconciliationIfNeeded()
-                scheduleDeferredStateFetch()
             } else if reason == "initial",
                       let incomingDocumentID = message.documentId,
                       let incomingRevision = message.documentRevision,
@@ -1467,23 +1518,7 @@ final class AppModel: ObservableObject {
                     ]
                 )
             } else {
-                if reason == "initial",
-                   let incomingDocumentID = message.documentId,
-                   let incomingRevision = message.documentRevision,
-                   let incomingToken = message.stateToken,
-                   let appliedRevision = lastAppliedDocumentRevision,
-                   incomingDocumentID == lastAppliedDocumentID,
-                   incomingRevision > appliedRevision,
-                   RevisionDeltaSafety.sameServerInstance(incomingToken, lastAppliedStateToken),
-                   liveStrokeIDs.isEmpty {
-                    fetchRevisionChanges(
-                        documentID: incomingDocumentID,
-                        sinceRevision: appliedRevision,
-                        serverToken: incomingToken
-                    )
-                } else {
-                    fetchNotebookState(reason: reason)
-                }
+                requestCatchUp(reason: reason, requiresFullSnapshot: reason == "project_import")
             }
         case "history_state":
             canUndo = message.canUndo ?? false
@@ -1513,6 +1548,7 @@ final class AppModel: ObservableObject {
                     pendingPointBatches.removeAll()
                     isReconcilingPendingStrokes = false
                     deferredStateRefreshReason = nil
+                    deferredRequiresFullSnapshot = false
                 }
                 rebuildPageIndex()
                 rebuildAllWorkspaceStates()
@@ -1740,7 +1776,7 @@ final class AppModel: ObservableObject {
             documentID: documentID, baseRevision: sinceRevision, cursor: sinceRevision,
             serverToken: serverToken,
             generation: generation, mutationGeneration: mutationGeneration,
-            remainingPages: 8, delta: RevisionDeltaAccumulator<NoteStroke>()
+            remainingPages: 128, delta: RevisionDeltaAccumulator<NoteStroke>()
         )
     }
 
@@ -1789,12 +1825,14 @@ final class AppModel: ObservableObject {
                 guard let page, page.documentId == documentID,
                       page.fromRevision == cursor,
                       let nextRevision = page.nextRevision,
-                      nextRevision > cursor,
+                      nextRevision >= cursor,
                       nextRevision <= page.documentRevision,
                       let stateToken = page.stateToken,
                       RevisionDeltaSafety.sameServerInstance(stateToken, serverToken),
                       let pageUpserts = page.upserts,
                       let pageDeletes = page.deletes,
+                      (nextRevision > cursor || (page.status == "complete"
+                          && pageUpserts.isEmpty && pageDeletes.isEmpty)),
                       (page.status == "more" || page.status == "complete") else {
                     self.fallbackRevisionChanges(reason: "missing_or_invalid_delta")
                     return
@@ -1852,25 +1890,46 @@ final class AppModel: ObservableObject {
 
     private func fallbackRevisionChanges(reason: String) {
         DebugSessionLogger.shared.event("sync", "delta_fetch_fallback", fields: ["reason": reason])
-        fetchNotebookState(reason: "delta_fallback")
+        stateFetchTask = nil
+        if reason == "local_or_live_edit" {
+            lastLocalEditAt = ProcessInfo.processInfo.systemUptime
+            deferredStateRefreshReason = "delta_retry_after_edit"
+            syncReadout.stage = "Waiting for writing pause"
+            scheduleDeferredStateFetch()
+        } else {
+            requestCatchUp(reason: "delta_fallback", requiresFullSnapshot: true)
+        }
     }
 
     private func scheduleDeferredStateFetch() {
         guard deferredStateRefreshReason != nil else { return }
         deferredFetchWorkItem?.cancel()
+        let elapsed = ProcessInfo.processInfo.systemUptime - lastLocalEditAt
+        let delay = max(1.0, Self.syncIdleSeconds - elapsed)
         let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.deferredFetchWorkItem = nil
             guard let reason = self.deferredStateRefreshReason,
-                  self.connectedDocumentID != nil,
-                  !self.hasPendingEdits,
-                  !self.isReconcilingPendingStrokes,
-                  self.liveStrokeIDs.isEmpty else { return }
+                  self.connectedDocumentID != nil else { return }
+            if self.journalBlocked {
+                self.syncReadout.stage = "Waiting for saved edits"
+                return
+            }
+            let idleFor = ProcessInfo.processInfo.systemUptime - self.lastLocalEditAt
+            if self.hasPendingEdits || self.isReconcilingPendingStrokes
+                || !self.liveStrokeIDs.isEmpty || !self.activeEraseOperations.isEmpty
+                || self.stateFetchTask != nil || self.sourcePDFFetchTask != nil
+                || idleFor < Self.syncIdleSeconds {
+                self.scheduleDeferredStateFetch()
+                return
+            }
+            let requiresFullSnapshot = self.deferredRequiresFullSnapshot
             self.deferredStateRefreshReason = nil
-            self.fetchNotebookState(reason: reason)
+            self.deferredRequiresFullSnapshot = false
+            self.requestCatchUp(reason: reason, requiresFullSnapshot: requiresFullSnapshot)
         }
         deferredFetchWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
     }
 
     private func fetchNotebookState(reason: String) {
@@ -1925,6 +1984,7 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
                     self.stateHTTPTransfer = nil
+                    self.stateFetchTask = nil
                     self.finishSyncReadout(success: false, stage: "Failed")
                     DebugSessionLogger.shared.event(
                         "sync",
@@ -1941,6 +2001,7 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
                     self.stateHTTPTransfer = nil
+                    self.stateFetchTask = nil
                     self.finishSyncReadout(success: false, stage: "Failed")
                     DebugSessionLogger.shared.event("sync", "state_fetch_failed", fields: ["reason": reason, "generation": generation])
                     self.lastError = "The computer did not return the notebook state"
@@ -1961,10 +2022,12 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
                     self.stateHTTPTransfer = nil
+                    self.stateFetchTask = nil
                     guard self.syncMutationGeneration == mutationGeneration,
                           self.liveStrokeIDs.isEmpty,
                           !self.hasPendingEdits else {
                         self.syncReadout.stage = "Waiting for edits"
+                        self.lastLocalEditAt = ProcessInfo.processInfo.systemUptime
                         self.deferredStateRefreshReason = reason
                         self.scheduleDeferredStateFetch()
                         DebugSessionLogger.shared.event(
@@ -2033,6 +2096,7 @@ final class AppModel: ObservableObject {
                 Task { @MainActor in
                     guard generation == self.stateFetchGeneration else { return }
                     self.stateHTTPTransfer = nil
+                    self.stateFetchTask = nil
                     self.finishSyncReadout(success: false, stage: "Failed")
                     DebugSessionLogger.shared.event(
                         "sync",
