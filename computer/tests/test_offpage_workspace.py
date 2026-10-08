@@ -126,9 +126,9 @@ class OffPageWorkspaceServerTests(unittest.TestCase):
             try:
                 prepared, pages = server.prepare_pdf(source_bytes)
                 rendered = list((prepared / "pdf_pages").iterdir())
-                self.assertEqual([path.suffix for path in rendered], [".svg"])
+                self.assertEqual(sorted(path.suffix for path in rendered), [".pdf", ".svg"])
                 self.assertTrue(pages[0]["imageUrl"].split("?", 1)[0].endswith(".svg"))
-                svg = rendered[0].read_text(encoding="utf-8")
+                svg = next(path for path in rendered if path.suffix == ".svg").read_text(encoding="utf-8")
                 self.assertIn("<svg", svg)
                 self.assertNotIn("<canvas", svg)
             finally:

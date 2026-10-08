@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import Foundation
 import PDFKit
 import UIKit
@@ -9,6 +10,8 @@ final class AppModel: ObservableObject {
     @Published private(set) var document: DocumentInfo = .empty
     @Published private(set) var pdfDocument: PDFDocument?
     @Published private(set) var pdfFileURL: URL?
+    @Published private(set) var pdfPageURLs: [URL] = []
+    var hasPDFBackground: Bool { pdfDocument != nil || !pdfPageURLs.isEmpty }
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
     @Published private(set) var currentPageNumber = 0
@@ -23,6 +26,10 @@ final class AppModel: ObservableObject {
     @Published var exportedPDFURL: URL?
     @Published private(set) var displayFPS = 0.0
     @Published private(set) var syncReadout = SyncReadout()
+    @Published private(set) var pageTemplatePresets: [PageTemplateOption] = []
+    @Published private(set) var pageTemplateError: String?
+    @Published private(set) var pageTemplatesLoading = false
+    @Published private(set) var isUpdatingPages = false
 
     @Published var selectedTool: NoteTool {
         didSet { UserDefaults.standard.set(selectedTool.rawValue, forKey: "native.selectedTool") }
@@ -76,6 +83,12 @@ final class AppModel: ObservableObject {
     private var stateHTTPTransfer: HTTPProgressTransfer?
     private var sourcePDFTransfer: HTTPProgressTransfer?
     private var sourcePDFFetchTask: URLSessionDataTask?
+    private var pagePDFFetchTask: Task<Void, Never>?
+    private var isFetchingPDF: Bool { sourcePDFFetchTask != nil || pagePDFFetchTask != nil }
+    private lazy var pdfPageCache = PDFPageAssetCache(
+        root: FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("InfiniteNotesNative/PDFPages", isDirectory: true),
+        digest: { SHA256.hash(data: $0).map { String(format: "%02x", $0) }.joined() })
     private var stateBytesDelivered: Int64 = 0
     private var stateBytesExpected: Int64?
     private var sourcePDFBytesExpected: Int64?
@@ -83,7 +96,7 @@ final class AppModel: ObservableObject {
     private var stateFetchGeneration = 0
     private var syncMutationGeneration = 0
     private var deferredFetchWorkItem: DispatchWorkItem?
-    private var strokes: [String: NoteStroke] = [:]
+    private let strokes = PageLocalInkStore<NoteStroke>()
     private var pageStrokeIDs: [Int: Set<String>] = [:]
     private var eraserIndex = EraserSpatialIndex()
     private var eraserDirtyIDs: Set<String> = []
@@ -461,6 +474,7 @@ final class AppModel: ObservableObject {
     }
 
     func disconnect() {
+        isUpdatingPages = false
         shouldReconnect = false
         deferredStateRefreshReason = nil
         deferredRequiresFullSnapshot = false
@@ -482,7 +496,7 @@ final class AppModel: ObservableObject {
             lastError = "Connect to the computer before synchronizing"
             return
         }
-        guard stateFetchTask == nil, sourcePDFFetchTask == nil else {
+        guard stateFetchTask == nil, !isFetchingPDF else {
             notice = "Synchronization is already in progress"
             return
         }
@@ -491,7 +505,7 @@ final class AppModel: ObservableObject {
     }
 
     private func requestCatchUp(reason: String, requiresFullSnapshot: Bool = false) {
-        if stateFetchTask != nil || sourcePDFFetchTask != nil {
+        if stateFetchTask != nil || isFetchingPDF {
             deferredStateRefreshReason = reason
             deferredRequiresFullSnapshot = deferredRequiresFullSnapshot || requiresFullSnapshot
             scheduleDeferredStateFetch()
@@ -537,6 +551,7 @@ final class AppModel: ObservableObject {
     }
 
     private func finishSyncReadout(success: Bool, stage: String = "Complete") {
+        if !success, ["Failed", "Blocked", "Interrupted"].contains(stage) { isUpdatingPages = false }
         guard syncReadout.isActive else { return }
         syncReadoutGeneration &+= 1
         let generation = syncReadoutGeneration
@@ -575,6 +590,101 @@ final class AppModel: ObservableObject {
             path: "/api/pages/insert",
             queryItems: [URLQueryItem(name: "afterPageNumber", value: String(currentPageNumber))],
             pendingNotice: "Inserting a page…"
+        )
+    }
+
+    var currentPageSizeDescription: String {
+        guard document.pages.indices.contains(currentPageNumber - 1) else { return "Unknown size" }
+        let page = document.pages[currentPageNumber - 1]
+        return String(format: "%.2f × %.2f in", page.width / 72, page.height / 72)
+    }
+
+    func loadPageTemplates() {
+        guard let url = endpoint(path: "/api/page-templates") else {
+            pageTemplateError = "The computer server address is invalid"
+            return
+        }
+        pageTemplatesLoading = true
+        pageTemplateError = nil
+        URLSession.shared.dataTask(with: url) { [weak self] data, response, error in
+            guard let self else { return }
+            let list: PageTemplateList?
+            if error == nil, let http = response as? HTTPURLResponse,
+               (200..<300).contains(http.statusCode), let data {
+                list = try? JSONDecoder().decode(PageTemplateList.self, from: data)
+            } else {
+                list = nil
+            }
+            Task { @MainActor in
+                self.pageTemplatesLoading = false
+                if let list {
+                    self.pageTemplatePresets = list.presets
+                    self.pageTemplateError = nil
+                } else {
+                    self.pageTemplatePresets = []
+                    self.pageTemplateError = error?.localizedDescription ?? "Could not load page templates"
+                }
+            }
+        }.resume()
+    }
+
+    var currentPageDimensions: CGSize {
+        guard document.pages.indices.contains(currentPageNumber - 1) else { return CGSize(width: 612, height: 792) }
+        let page = document.pages[currentPageNumber - 1]
+        return CGSize(width: page.width, height: page.height)
+    }
+
+    func savePageTemplate(_ preset: PageTemplateOption) async -> Bool {
+        guard let url = endpoint(path: "/api/page-templates") else { return false }
+        do {
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONEncoder().encode(preset)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                let detail = (try? JSONSerialization.jsonObject(with: data) as? [String: Any])?["detail"] as? String
+                throw NSError(domain: "Template", code: 1, userInfo: [NSLocalizedDescriptionKey: detail ?? "Could not save template"])
+            }
+            loadPageTemplates()
+            notice = "Template saved"
+            return true
+        } catch {
+            pageTemplateError = error.localizedDescription
+            return false
+        }
+    }
+
+    func deleteCurrentPage() {
+        performPageMutation(path: "/api/pages/delete",
+                            queryItems: [URLQueryItem(name: "pageNumber", value: String(currentPageNumber))],
+                            pendingNotice: "Deleting page…")
+    }
+
+    func addPage(kind: String, belowCurrent: Bool, presetID: String?, options: PageInsertionOptions? = nil) {
+        guard currentPageNumber > 0 else {
+            lastError = "Open a page before adding another one"
+            return
+        }
+        var queryItems = [URLQueryItem(name: "kind", value: kind)]
+        if let presetID { queryItems.append(URLQueryItem(name: "presetId", value: presetID)) }
+        if belowCurrent {
+            queryItems.append(URLQueryItem(name: "afterPageNumber", value: String(currentPageNumber)))
+        } else {
+            queryItems.append(URLQueryItem(name: "referencePageNumber", value: String(currentPageNumber)))
+        }
+        let body: Data?
+        do {
+            body = try options.map { try JSONEncoder().encode($0) }
+        } catch {
+            lastError = "The page settings contain an invalid value"
+            return
+        }
+        performPageMutation(
+            path: belowCurrent ? "/api/pages/insert" : "/api/pages/append",
+            queryItems: queryItems,
+            pendingNotice: "Adding a page…",
+            body: body
         )
     }
 
@@ -623,12 +733,14 @@ final class AppModel: ObservableObject {
     }
 
     func undo() {
-        guard canUndo, isConnected, pendingErases.isEmpty else { return }
+        guard canUndo, isConnected, !isUpdatingPages, !isFetchingPDF, !hasPendingEdits,
+              liveStrokeIDs.isEmpty, pendingErases.isEmpty else { return }
         client.sendJSONObject(["type": "undo"])
     }
 
     func redo() {
-        guard canRedo, isConnected, pendingErases.isEmpty else { return }
+        guard canRedo, isConnected, !isUpdatingPages, !isFetchingPDF, !hasPendingEdits,
+              liveStrokeIDs.isEmpty, pendingErases.isEmpty else { return }
         client.sendJSONObject(["type": "redo"])
     }
 
@@ -645,7 +757,7 @@ final class AppModel: ObservableObject {
     }
 
     func setSelection(_ ids: Set<String>) {
-        selectedStrokeIDs = Set(ids.filter { strokes[$0] != nil })
+        selectedStrokeIDs = Set(ids.filter { strokes.contains($0) })
         snapGuide = nil
         invalidateAllPages(committedChange: false)
     }
@@ -859,7 +971,7 @@ final class AppModel: ObservableObject {
         }
         for stroke in newStrokes { insertOrReplace(stroke) }
         do {
-            let objects = try JSONHelpers.object(from: newStrokes)
+            let objects = try JSONHelpers.object(from: newStrokes.map { strokes.normalizedWorldStroke($0) })
             client.sendJSONObject(["type": "add_strokes", "strokes": objects])
             return true
         } catch {
@@ -881,7 +993,7 @@ final class AppModel: ObservableObject {
     func sendReplacementStrokes(_ replacements: [NoteStroke]) -> Bool {
         guard isConnected, !replacements.isEmpty else { return false }
         do {
-            let objects = try JSONHelpers.object(from: replacements)
+            let objects = try JSONHelpers.object(from: replacements.map { strokes.normalizedWorldStroke($0) })
             client.sendJSONObject(["type": "replace_strokes", "strokes": objects])
             for stroke in replacements { insertOrReplace(stroke) }
             return true
@@ -1144,10 +1256,22 @@ final class AppModel: ObservableObject {
 
     func pageDidMount(_ index: Int) {
         mountedPageIndices.insert(index)
+        refreshWorldViewCachePages()
     }
 
     func pageDidUnmount(_ index: Int) {
         mountedPageIndices.remove(index)
+        refreshWorldViewCachePages()
+    }
+
+    private func refreshWorldViewCachePages() {
+        strokes.cacheWorldViews(for: Set(mountedPageIndices.compactMap { index in
+            document.pages.indices.contains(index) ? document.pages[index].id : nil
+        }))
+    }
+
+    private func localInkPages(_ pages: [PageInfo]) -> [PageLocalInkStore<NoteStroke>.Page] {
+        pages.map { .init(id: $0.id, x: $0.x, y: $0.y, width: $0.width, height: $0.height) }
     }
 
     func updateDisplayFPS(_ fps: Double) {
@@ -1205,7 +1329,7 @@ final class AppModel: ObservableObject {
         insertOrReplace(stroke, committedChange: false)
 
         do {
-            let object = try JSONHelpers.object(from: stroke)
+            let object = try JSONHelpers.object(from: strokes.normalizedWorldStroke(stroke))
             if let documentID = pendingDocumentID, connectedDocumentID == documentID {
                 client.sendJSONObject(["type": "stroke_begin", "stroke": object, "documentId": documentID])
             }
@@ -1218,11 +1342,10 @@ final class AppModel: ObservableObject {
     }
 
     func appendPoints(strokeID: String, points: [NotePoint]) {
-        guard !points.isEmpty, var stroke = strokes[strokeID] else { return }
+        guard !points.isEmpty, strokes.appendWorldPoints(points, to: strokeID),
+              let stroke = strokes[strokeID] else { return }
         noteLocalEdit()
         syncMutationGeneration &+= 1
-        stroke.points.append(contentsOf: points)
-        strokes[strokeID] = stroke
         eraserIndex.remove(strokeID)
         eraserDirtyIDs.insert(strokeID)
         let pages = strokeMembership[strokeID] ?? []
@@ -1302,13 +1425,14 @@ final class AppModel: ObservableObject {
         eraserPreviousPoints[operationID] = last
         let radius = CGFloat(eraserSize / 2)
         // Live/preview strokes are rebuilt only when queried, never on every point frame.
-        for id in eraserDirtyIDs {
+        let dirtyOnPage = eraserDirtyIDs.filter { strokeMembership[$0]?.contains(pageIndex) == true }
+        for id in dirtyOnPage {
             if let stroke = strokes[id], !stroke.isLocked,
                let geometry = GeometryEngine.eraserGeometry(stroke) {
                 eraserIndex.update(id: id, geometry: geometry, pages: strokeMembership[id] ?? [])
             } else { eraserIndex.remove(id) }
         }
-        eraserDirtyIDs.removeAll(keepingCapacity: true)
+        eraserDirtyIDs.subtract(dirtyOnPage)
         let candidates = eraserIndex.candidates(sweep: sweep, radius: radius, page: pageIndex)
         var hitIDs: [String] = []
         for id in candidates where !alreadyDeleted.contains(id) {
@@ -1397,7 +1521,7 @@ final class AppModel: ObservableObject {
             guard let points = pendingPointBatches[id], !points.isEmpty else { continue }
             pendingPointBatches.removeValue(forKey: id)
             do {
-                let encoded = try JSONHelpers.object(from: points)
+                let encoded = try JSONHelpers.object(from: strokes.normalizedWorldPoints(points, for: id))
                 if let documentID = pendingDocumentID, connectedDocumentID == documentID {
                     client.sendJSONObject(["type": "stroke_points", "id": id, "points": encoded, "documentId": documentID])
                 }
@@ -1434,6 +1558,8 @@ final class AppModel: ObservableObject {
             if deferredStateRefreshReason != nil { scheduleDeferredStateFetch() }
         }
         switch message.type {
+        case "page_layout":
+            applyPageLayout(message)
         case "snapshot":
             // Compatibility with older computer servers. New servers only send
             // small state_refresh messages to native clients.
@@ -1528,6 +1654,7 @@ final class AppModel: ObservableObject {
                 connectedDocumentID = message.documentId
                 pendingDocumentID = message.documentId
                 document = changed
+                _ = strokes.setPages(localInkPages(changed.pages))
                 lastAppliedDocumentID = message.documentId
                 lastAppliedDocumentRevision = nil
                 lastAppliedStateToken = nil
@@ -1565,9 +1692,8 @@ final class AppModel: ObservableObject {
                 insertOrReplace(stroke, committedChange: false)
             }
         case "stroke_points":
-            if let id = message.id, let points = message.points, var stroke = strokes[id] {
-                stroke.points.append(contentsOf: points)
-                strokes[id] = stroke
+            if let id = message.id, let points = message.points,
+               strokes.appendWorldPoints(points, to: id), let stroke = strokes[id] {
                 eraserIndex.remove(id)
                 eraserDirtyIDs.insert(id)
                 let pages = strokeMembership[id] ?? []
@@ -1588,8 +1714,17 @@ final class AppModel: ObservableObject {
                 if liveStrokeIDs.isEmpty { scheduleDeferredStateFetch() }
             }
         case "restore_strokes", "replace_strokes":
+            var affected: Set<Int> = []
             for stroke in message.strokes ?? [] {
-                insertOrReplace(stroke)
+                affected.formUnion(strokeMembership[stroke.id] ?? [])
+                insertOrReplace(stroke, committedChange: false, deferRefresh: true)
+                affected.formUnion(strokeMembership[stroke.id] ?? [])
+            }
+            refreshWorkspaceStates(for: affected)
+            invalidatePages(affected)
+            if syncReadout.showCounts {
+                syncReadout.receivedInk = strokes.count
+                syncReadout.totalInk = strokes.count
             }
         case "delete_strokes":
             removeStrokes(ids: message.ids ?? [])
@@ -1875,7 +2010,14 @@ final class AppModel: ObservableObject {
                 self.syncReadout.receivedInk = self.strokes.count
                 self.syncReadout.totalInk = self.strokes.count
                 self.syncReadout.totalBytes = self.syncReadout.receivedBytes
-                self.finishSyncReadout(success: true)
+                if !self.document.pages.isEmpty && (!self.hasPDFBackground
+                    || self.loadedPDFDocumentID != documentID || self.loadedPDFDocument != self.document) {
+                    // Also retry a failed background transfer when ink itself
+                    // is already current; a zero-change delta is not enough.
+                    self.stateBytesDelivered = self.syncReadout.receivedBytes
+                    self.syncReadout.stage = "Receiving PDF"
+                    self.fetchSourcePDF()
+                } else { self.finishSyncReadout(success: true) }
                 DebugSessionLogger.shared.event(
                     "sync", "delta_fetch_completed",
                     fields: ["documentRevision": nextRevision,
@@ -1918,7 +2060,7 @@ final class AppModel: ObservableObject {
             let idleFor = ProcessInfo.processInfo.systemUptime - self.lastLocalEditAt
             if self.hasPendingEdits || self.isReconcilingPendingStrokes
                 || !self.liveStrokeIDs.isEmpty || !self.activeEraseOperations.isEmpty
-                || self.stateFetchTask != nil || self.sourcePDFFetchTask != nil
+                || self.stateFetchTask != nil || self.isFetchingPDF
                 || idleFor < Self.syncIdleSeconds {
                 self.scheduleDeferredStateFetch()
                 return
@@ -1969,7 +2111,7 @@ final class AppModel: ObservableObject {
                 self.stateBytesExpected = Self.positiveByteHeader("X-Infinite-Notes-State-Bytes", from: http)
                 self.sourcePDFBytesExpected = Self.positiveByteHeader("X-Infinite-Notes-Source-PDF-Bytes", from: http)
                 self.syncReadout.receivedBytes = received
-                let expectsPDF = self.pdfDocument == nil || self.pdfFileURL == nil
+                let expectsPDF = !self.hasPDFBackground
                     || self.loadedPDFDocumentID != self.lastAppliedDocumentID
                 if let stateTotal = self.stateBytesExpected {
                     self.syncReadout.totalBytes = stateTotal + (expectsPDF ? self.sourcePDFBytesExpected ?? 0 : 0)
@@ -2070,7 +2212,7 @@ final class AppModel: ObservableObject {
                     }
                     self.lastError = nil
                     if !snapshot.document.pages.isEmpty {
-                        if self.pdfDocument == nil || self.pdfFileURL == nil
+                        if !self.hasPDFBackground
                             || self.loadedPDFDocumentID != snapshot.documentId
                             || self.loadedPDFDocument != snapshot.document {
                             self.syncReadout.stage = "Receiving PDF"
@@ -2126,16 +2268,229 @@ final class AppModel: ObservableObject {
             mergedStrokes[id] = stroke
         }
         for id in pendingErases.erasedIDs { mergedStrokes.removeValue(forKey: id) }
-        strokes = mergedStrokes
+        _ = strokes.replaceAll(mergedStrokes, pages: localInkPages(document.pages))
+        refreshWorldViewCachePages()
         liveStrokes.reset(remoteIDs: liveIDs)
-        selectedStrokeIDs = Set(selectedStrokeIDs.filter { strokes[$0] != nil })
+        selectedStrokeIDs = Set(selectedStrokeIDs.filter { strokes.contains($0) })
         rebuildPageIndex()
         rebuildAllWorkspaceStates()
         invalidateAllPages()
         return true
     }
 
+    private func applyPageLayout(_ message: ServerEnvelope) {
+        guard let changed = message.document, let previous = message.previousPages,
+              message.documentId == lastAppliedDocumentID else {
+            recoverPageLayout(reason: "page_layout_missing_base")
+            return
+        }
+        // HTTP and WebSocket carry the same transaction. Apply it once, and
+        // never rewind a newer layout when a delayed HTTP response arrives.
+        if let revision = message.documentRevision, let applied = lastAppliedDocumentRevision,
+           applied >= revision, RevisionDeltaSafety.sameServerInstance(lastAppliedStateToken, message.stateToken) { return }
+        if document == changed { return }
+        guard document.pages == previous, !hasPendingEdits, liveStrokeIDs.isEmpty,
+              activeEraseOperations.isEmpty, !deferredRequiresFullSnapshot,
+              PageLayoutTransform(
+                oldPages: previous.map { .init(id: $0.id, x: $0.x, y: $0.y) },
+                newPages: changed.pages.map { .init(id: $0.id, x: $0.x, y: $0.y) },
+                idMap: message.pageIdMap ?? [:]) != nil else {
+            recoverPageLayout(reason: "page_layout_recovery")
+            return
+        }
+        let started = ProcessInfo.processInfo.systemUptime
+        isUpdatingPages = true
+        stateFetchTask?.cancel()
+        stateFetchTask = nil
+        stateHTTPTransfer = nil
+        stateFetchGeneration &+= 1
+        deferredFetchWorkItem?.cancel()
+        deferredFetchWorkItem = nil
+        deferredStateRefreshReason = nil
+        deferredRequiresFullSnapshot = false
+        syncMutationGeneration &+= 1
+        let localizedBefore = strokes.localizedPointCount
+        let projectedBefore = strokes.projectedPointCount
+        let oldWorkspaceStates = pageWorkspaceStates
+        let idMap = message.pageIdMap ?? [:]
+        // Canonical points stay fixed. This visits ownership metadata only.
+        strokes.setPages(localInkPages(changed.pages), idMap: idMap, removeMissing: true)
+        document = changed
+        refreshWorldViewCachePages()
+        lastAppliedDocumentRevision = message.documentRevision
+        lastAppliedStateToken = message.stateToken
+        selectedStrokeIDs = selectedStrokeIDs.intersection(strokes.ids)
+        selectionClipboard.removeAll()
+        rebuildPageIndex()
+        let newIndices = Dictionary(uniqueKeysWithValues: changed.pages.enumerated().map { ($0.element.id, $0.offset) })
+        pageWorkspaceStates = [:]
+        var resized: Set<Int> = []
+        for (oldIndex, oldPage) in previous.enumerated() {
+            guard let index = newIndices[idMap[oldPage.id] ?? oldPage.id] else { continue }
+            let newPage = changed.pages[index]
+            if oldPage.width == newPage.width, oldPage.height == newPage.height {
+                pageWorkspaceStates[index] = oldWorkspaceStates[oldIndex] ?? PageWorkspaceState()
+            } else { resized.insert(index) }
+        }
+        workspaceRevision &+= 1
+        if !resized.isEmpty { refreshWorkspaceStates(for: resized) }
+        invalidateAllPages()
+        if let focus = message.focusPageNumber { currentPageNumber = focus }
+        notice = message.notice ?? "Pages updated"
+        lastError = nil
+        DebugSessionLogger.shared.event("page", "layout_applied", fields: [
+            "strokeCount": strokes.count, "pageCount": changed.pages.count,
+            "localizedPoints": strokes.localizedPointCount - localizedBefore,
+            "projectedPoints": strokes.projectedPointCount - projectedBefore,
+            "durationMs": (ProcessInfo.processInfo.systemUptime - started) * 1000
+        ])
+        beginSyncReadout(stage: "Receiving PDF")
+        syncReadout.receivedPages = changed.pages.count
+        syncReadout.totalPages = changed.pages.count
+        syncReadout.receivedInk = strokes.count
+        syncReadout.totalInk = strokes.count
+        fetchSourcePDF()
+    }
+
+    private func recoverPageLayout(reason: String) {
+        // A snapshot started before this event must not overwrite the newer
+        // layout. Cancel it and request one authoritative recovery snapshot.
+        syncMutationGeneration &+= 1
+        stateFetchTask?.cancel()
+        stateFetchTask = nil
+        stateHTTPTransfer = nil
+        stateFetchGeneration &+= 1
+        cancelSourcePDFTransfer()
+        requestCatchUp(reason: reason, requiresFullSnapshot: true)
+    }
+
     private func fetchSourcePDF() {
+        cancelSourcePDFTransfer()
+        if !syncReadout.isActive { beginSyncReadout(stage: "Receiving PDF") }
+        syncReadout.stage = "Receiving PDF"
+        let generation = sourcePDFFetchGeneration
+        guard let requestedID = lastAppliedDocumentID, !document.pages.isEmpty else {
+            finishSyncReadout(success: false, stage: "Failed")
+            return
+        }
+        let requestedDocument = document
+        pagePDFFetchTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                var assets = requestedDocument.pages.compactMap(\.pdfAsset)
+                if assets.count != requestedDocument.pages.count {
+                    guard let url = endpoint(path: "/api/pdf/pages", queryItems: [URLQueryItem(name: "documentId", value: requestedID)]) else {
+                        throw URLError(.badURL)
+                    }
+                    let (data, response) = try await URLSession.shared.data(from: url)
+                    try Task.checkCancellation()
+                    guard generation == sourcePDFFetchGeneration else { return }
+                    guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                    // An older server has no page manifest endpoint.
+                    if http.statusCode == 404 || http.statusCode == 405 {
+                        pagePDFFetchTask = nil
+                        fetchCombinedSourcePDF()
+                        return
+                    }
+                    guard http.statusCode == 200 else { throw URLError(.badServerResponse) }
+                    let manifest = try JSONHelpers.decoder.decode(PDFPageManifest.self, from: data)
+                    guard manifest.documentId == requestedID else { throw URLError(.badServerResponse) }
+                    assets = manifest.pages
+                }
+                guard assets.count == requestedDocument.pages.count,
+                      zip(assets, requestedDocument.pages).allSatisfy({ asset, page in
+                          asset.isValid && asset.id == page.id && asset.width == page.width && asset.height == page.height
+                      }) else { throw URLError(.badServerResponse) }
+                var urls: [URL] = []
+                var downloadedBytes: Int64 = 0
+                var downloadedPages = 0
+                let missingBytes = assets.reduce(Int64(0)) { sum, asset in
+                    sum + (self.pdfPageCache.cachedURL(for: asset) == nil ? Int64(asset.pdfBytes) : 0)
+                }
+                syncReadout.totalBytes = stateBytesDelivered + missingBytes
+                syncReadout.receivedBytes = stateBytesDelivered
+                syncReadout.receivedPages = 0
+                syncReadout.totalPages = assets.count
+                for asset in assets {
+                    try Task.checkCancellation()
+                    guard generation == sourcePDFFetchGeneration else { return }
+                    let localURL: URL
+                    if let cached = pdfPageCache.cachedURL(for: asset) { localURL = cached }
+                    else {
+                        guard let url = endpoint(path: asset.pdfUrl) else { throw URLError(.badURL) }
+                        var request = URLRequest(url: url)
+                        request.timeoutInterval = 120
+                        request.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
+                        let completedBytes = downloadedBytes
+                        let data: Data = try await withCheckedThrowingContinuation { continuation in
+                            let transfer = HTTPProgressTransfer(onProgress: { [weak self] received, _ in
+                                Task { @MainActor in
+                                    guard let self, generation == self.sourcePDFFetchGeneration,
+                                          self.syncReadout.isActive, self.syncReadout.stage == "Receiving PDF" else { return }
+                                    self.syncReadout.receivedBytes = max(self.syncReadout.receivedBytes,
+                                        self.stateBytesDelivered + completedBytes + received)
+                                }
+                            }, onCompletion: { data, response, error in
+                                if let error { continuation.resume(throwing: error) }
+                                else if let http = response as? HTTPURLResponse, http.statusCode == 200, let data {
+                                    continuation.resume(returning: data)
+                                } else { continuation.resume(throwing: URLError(.badServerResponse)) }
+                            })
+                            self.sourcePDFTransfer = transfer
+                            self.sourcePDFFetchTask = transfer.start(request)
+                        }
+                        try Task.checkCancellation()
+                        guard generation == sourcePDFFetchGeneration else { return }
+                        sourcePDFTransfer = nil
+                        sourcePDFFetchTask = nil
+                        // Hash/byte verification precedes cache installation.
+                        localURL = try pdfPageCache.store(data, for: asset)
+                        downloadedBytes += Int64(data.count)
+                        downloadedPages += 1
+                    }
+                    guard let pdf = CGPDFDocument(localURL as CFURL), pdf.numberOfPages == 1 else {
+                        throw URLError(.cannotDecodeContentData)
+                    }
+                    urls.append(localURL)
+                    syncReadout.receivedPages = urls.count
+                    syncReadout.receivedBytes = stateBytesDelivered + downloadedBytes
+                }
+                try Task.checkCancellation()
+                guard generation == sourcePDFFetchGeneration, lastAppliedDocumentID == requestedID,
+                      document == requestedDocument else { return }
+                let previousURL = pdfFileURL
+                pdfDocument = nil
+                pdfFileURL = nil
+                pdfPageURLs = urls
+                loadedPDFDocumentID = requestedID
+                loadedPDFDocument = requestedDocument
+                pagePDFFetchTask = nil
+                isUpdatingPages = false
+                syncReadout.totalBytes = stateBytesDelivered + downloadedBytes
+                finishSyncReadout(success: true)
+                DebugSessionLogger.shared.event("sync", "pdf_pages_completed", fields: [
+                    "pageCount": assets.count, "downloadedPages": downloadedPages,
+                    "reusedPages": assets.count - downloadedPages, "downloadedBytes": downloadedBytes
+                ])
+                notice = "PDF pages ready"
+                pdfPageCache.prune(keeping: assets)
+                if let previousURL { try? FileManager.default.removeItem(at: previousURL) }
+            } catch {
+                guard generation == sourcePDFFetchGeneration, !Task.isCancelled else { return }
+                sourcePDFTransfer = nil
+                sourcePDFFetchTask = nil
+                pagePDFFetchTask = nil
+                isUpdatingPages = false
+                finishSyncReadout(success: false, stage: "Failed")
+                // Never enable ink against an old background after a layout
+                // update fails. The toolbar Sync action remains available.
+                isUpdatingPages = hasPDFBackground && (loadedPDFDocumentID != lastAppliedDocumentID || loadedPDFDocument != document)
+                lastError = "PDF page sync failed: \(error.localizedDescription). Tap Sync to retry."
+            }
+        }
+    }
+
+    private func fetchCombinedSourcePDF() {
         guard let sourceURL = endpoint(path: "/api/pdf/source") else {
             finishSyncReadout(success: false, stage: "Failed")
             return
@@ -2174,6 +2529,7 @@ final class AppModel: ObservableObject {
                     self.sourcePDFFetchTask = nil
                     self.finishSyncReadout(success: false, stage: "Failed")
                     self.lastError = "PDF download failed: \(error.localizedDescription)"
+                    self.isUpdatingPages = false
                 }
                 return
             }
@@ -2187,6 +2543,7 @@ final class AppModel: ObservableObject {
                     self.sourcePDFFetchTask = nil
                     self.finishSyncReadout(success: false, stage: "Failed")
                     self.lastError = "The laptop did not return the original PDF file"
+                    self.isUpdatingPages = false
                 }
                 return
             }
@@ -2217,13 +2574,16 @@ final class AppModel: ObservableObject {
                         try? FileManager.default.removeItem(at: localURL)
                         self.finishSyncReadout(success: false, stage: "Failed")
                         self.lastError = "PDFKit could not open the downloaded source PDF"
+                        self.isUpdatingPages = false
                         return
                     }
                     let previousURL = self.pdfFileURL
+                    self.pdfPageURLs = []
                     self.pdfFileURL = localURL
                     self.pdfDocument = pdf
                     self.loadedPDFDocumentID = requestedDocumentID
                     self.loadedPDFDocument = requestedDocument
+                    self.isUpdatingPages = false
                     self.syncReadout.receivedBytes = self.stateBytesDelivered + Int64(data.count)
                     self.syncReadout.totalBytes = self.syncReadout.receivedBytes
                     self.finishSyncReadout(success: true)
@@ -2243,6 +2603,7 @@ final class AppModel: ObservableObject {
                     self.sourcePDFFetchTask = nil
                     self.finishSyncReadout(success: false, stage: "Failed")
                     self.lastError = "Could not cache the source PDF: \(error.localizedDescription)"
+                    self.isUpdatingPages = false
                 }
             }
         })
@@ -2251,6 +2612,8 @@ final class AppModel: ObservableObject {
     }
 
     private func cancelSourcePDFTransfer() {
+        pagePDFFetchTask?.cancel()
+        pagePDFFetchTask = nil
         sourcePDFFetchTask?.cancel()
         sourcePDFFetchTask = nil
         sourcePDFTransfer = nil
@@ -2266,9 +2629,17 @@ final class AppModel: ObservableObject {
         return components.url
     }
 
-    private func performPageMutation(path: String, queryItems: [URLQueryItem], pendingNotice: String) {
+    private func performPageMutation(path: String, queryItems: [URLQueryItem], pendingNotice: String, body: Data? = nil) {
         guard isConnected else {
             lastError = "Connect to the computer before changing pages"
+            return
+        }
+        guard !hasPendingEdits, liveStrokeIDs.isEmpty, activeEraseOperations.isEmpty else {
+            lastError = "Finish drawing and let saved edits sync before changing pages"
+            return
+        }
+        guard !isUpdatingPages, stateFetchTask == nil, !isFetchingPDF else {
+            lastError = "Let the current page update or synchronization finish first"
             return
         }
         guard let url = endpoint(path: path, queryItems: queryItems) else {
@@ -2280,23 +2651,33 @@ final class AppModel: ObservableObject {
         DebugSessionLogger.shared.event("page", "mutation_started", fields: ["path": path])
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.httpBody = body
+        if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }
         request.timeoutInterval = 120
+        isUpdatingPages = true
         URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
             guard let self else { return }
             if let error {
                 Task { @MainActor in
+                    self.isUpdatingPages = false
                     DebugSessionLogger.shared.event("page", "mutation_failed", fields: ["path": path, "error": error.localizedDescription])
                     self.lastError = "Page update failed: \(error.localizedDescription)"
                 }
                 return
             }
             guard let http = response as? HTTPURLResponse else {
-                Task { @MainActor in self.lastError = "The computer did not return a page-update response" }
+                Task { @MainActor in
+                    self.isUpdatingPages = false
+                    self.lastError = "The computer did not return a page-update response"
+                }
                 return
             }
             if !(200..<300).contains(http.statusCode) {
                 let detail = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }?["detail"] as? String
-                Task { @MainActor in self.lastError = detail ?? "Page update failed (HTTP \(http.statusCode))" }
+                Task { @MainActor in
+                    self.isUpdatingPages = false
+                    self.lastError = detail ?? "Page update failed (HTTP \(http.statusCode))"
+                }
                 return
             }
 
@@ -2307,8 +2688,14 @@ final class AppModel: ObservableObject {
             // after every successful page mutation and preserve the returned page
             // as the navigation target.
             let payload = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+            let layout = data.flatMap { try? JSONHelpers.decoder.decode(ServerEnvelope.self, from: $0) }
             let pageNumber = (payload?["pageNumber"] as? NSNumber)?.intValue
             Task { @MainActor in
+                if let layout, layout.type == "page_layout" {
+                    self.applyPageLayout(layout)
+                    return
+                }
+                self.isUpdatingPages = false
                 if let pageNumber, pageNumber > 0 {
                     self.currentPageNumber = pageNumber
                 }
@@ -2346,13 +2733,20 @@ final class AppModel: ObservableObject {
         lastAppliedDocumentRevision = nil
     }
 
-    private func insertOrReplace(_ stroke: NoteStroke, committedChange: Bool = true) {
+    private func insertOrReplace(_ stroke: NoteStroke, committedChange: Bool = true, deferRefresh: Bool = false) {
+        var stroke = stroke
+        if stroke.pageId == nil, let index = stroke.pageIndex, document.pages.indices.contains(index) {
+            stroke.pageId = document.pages[index].id
+        }
         guard !pendingErases.erasedIDs.contains(stroke.id) else { return }
         syncMutationGeneration &+= 1
         let oldPages = strokeMembership[stroke.id] ?? []
         for page in oldPages { pageStrokeIDs[page]?.remove(stroke.id) }
         strokes[stroke.id] = stroke
-        let pages = membership(for: stroke)
+        let pages: Set<Int>
+        if let owner = strokes.owner(of: stroke.id), let index = document.pages.firstIndex(where: { $0.id == owner }) {
+            pages = [index]
+        } else { pages = membership(for: stroke) }
         strokeMembership[stroke.id] = pages
         for page in pages { pageStrokeIDs[page, default: []].insert(stroke.id) }
         if committedChange {
@@ -2362,6 +2756,7 @@ final class AppModel: ObservableObject {
             eraserDirtyIDs.insert(stroke.id)
         }
         let affectedPages = oldPages.union(pages)
+        if deferRefresh { return }
         if committedChange || !oldPages.subtracting(pages).isEmpty {
             refreshWorkspaceStates(for: affectedPages)
         } else {
@@ -2409,16 +2804,26 @@ final class AppModel: ObservableObject {
         strokeMembership.removeAll(keepingCapacity: true)
         eraserIndex = EraserSpatialIndex()
         eraserDirtyIDs.removeAll()
-        for stroke in strokes.values {
+        let indices = Dictionary(uniqueKeysWithValues: document.pages.enumerated().map { ($0.element.id, $0.offset) })
+        for (id, owner) in strokes.ownership {
+            guard let index = indices[owner] else { continue }
+            strokeMembership[id] = [index]
+            pageStrokeIDs[index, default: []].insert(id)
+            eraserDirtyIDs.insert(id)
+        }
+        for stroke in strokes.unowned {
             let pages = membership(for: stroke)
             strokeMembership[stroke.id] = pages
             for page in pages { pageStrokeIDs[page, default: []].insert(stroke.id) }
-            updateEraserIndex(stroke, pages: pages)
+            eraserDirtyIDs.insert(stroke.id)
         }
     }
 
     private func membership(for stroke: NoteStroke) -> Set<Int> {
         guard !document.pages.isEmpty, !stroke.points.isEmpty else { return [] }
+        if let id = stroke.pageId {
+            return document.pages.firstIndex(where: { $0.id == id }).map { [$0] } ?? []
+        }
         if let pageIndex = stroke.pageIndex, document.pages.indices.contains(pageIndex) {
             return [pageIndex]
         }

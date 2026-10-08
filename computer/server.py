@@ -15,6 +15,7 @@ import socket
 import tempfile
 import time
 import uuid
+import weakref
 import zipfile
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
@@ -25,8 +26,8 @@ from urllib.parse import quote, urlsplit
 
 import fitz  # PyMuPDF
 import uvicorn
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 from starlette.middleware.gzip import GZipMiddleware
@@ -34,6 +35,9 @@ from starlette.middleware.gzip import GZipMiddleware
 from asset_persistence import begin_transition, finish_transition, install_asset_set, recover_transition
 from debug_logging import DebugEventLogger
 from discovery import ServerAdvertisement
+from page_templates import load_presets, render_page, save_preset, validate_preset
+from page_layout import reflow_stroke, stable_pages, stored_stroke, world_stroke
+from page_pdf import asset_path, extract_page, reusable_asset, write_asset
 from persistence import NotebookStore
 import local_files
 
@@ -65,6 +69,9 @@ PROJECT_FORMAT = "infinite-notes-project"
 PROJECT_FORMAT_VERSION = 1
 APP_VERSION = 24
 PAGE_GAP = 0.0
+# Upgrade older notebook backgrounds lazily, without rewriting notebook state.
+# Keys include the server-generated SVG URL (a content generation identity).
+legacy_page_pdf_assets: dict[str, dict[str, Any]] = {}
 
 @asynccontextmanager
 async def app_lifespan(_app: FastAPI):
@@ -186,7 +193,8 @@ def reflow_strokes_between_page_layouts(
             continue
 
         center_y = (min(y_values) + max(y_values)) / 2.0
-        page_index = min(
+        owned_index = stroke_page_index(stroke, old_pages)
+        page_index = owned_index if owned_index is not None else min(
             range(len(layouts)),
             key=lambda index: (
                 0.0
@@ -195,6 +203,9 @@ def reflow_strokes_between_page_layouts(
             ),
         )
         delta = layouts[page_index][2]
+        if stroke.get("pageId"):
+            stroke["pageId"] = new_pages[page_index]["id"]
+            stroke["pageIndex"] = page_index
         if abs(delta) < 1e-9:
             continue
         for point in points:
@@ -293,6 +304,7 @@ notebook_store, state = load_authoritative_state()
 recover_transition(DATA_DIR, CURRENT_PDF, PDF_PAGES_DIR, int(state["documentRevision"]))
 state_lock = asyncio.Lock()
 clients: set[WebSocket] = set()
+page_layout_clients: weakref.WeakSet = weakref.WeakSet()
 completion_tasks: set[asyncio.Task[None]] = set()
 client_roles: dict[WebSocket, str] = {}
 client_kinds: dict[WebSocket, str] = {}
@@ -301,6 +313,7 @@ history: list[dict[str, Any]] = []
 redo_history: list[dict[str, Any]] = []
 pending_stroke_history: set[str] = set()
 MAX_HISTORY_ACTIONS = 250
+MAX_PAGE_HISTORY_BYTES = 128 * 1024 * 1024
 MAX_SELECTION_STROKES = 50_000
 # History deltas should remain comfortably below the native WebSocket frame
 # threshold. Large undo/redo operations are split into these smaller logical
@@ -324,6 +337,8 @@ persistence_failed = False
 
 
 def stroke_digest(stroke: dict[str, Any]) -> bytes:
+    if state.get("pageIdentityVersion") == 1:
+        stroke = stored_stroke(stroke, state.get("document", {}).get("pages", []))
     encoded = json.dumps(stroke, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).digest()
 
@@ -582,6 +597,7 @@ async def save_state_atomic(
 
 def discard_client(websocket: WebSocket) -> None:
     clients.discard(websocket)
+    page_layout_clients.discard(websocket)
     client_roles.pop(websocket, None)
     client_kinds.pop(websocket, None)
     client_ids.pop(websocket, None)
@@ -701,6 +717,15 @@ async def broadcast(
         if exclude_kinds and client_kinds.get(ws) in exclude_kinds:
             continue
         try:
+            if message.get("type") == "page_layout" and ws not in page_layout_clients:
+                # Older installed clients do not understand layout-only events.
+                # Give them one compatible authoritative refresh, never silently
+                # leave their page/ink view at the previous layout.
+                fallback = (state_refresh_message(reason="page_layout") if client_kinds.get(ws) == "native"
+                            else snapshot_message(reason="page_layout"))
+                await ws.send_text(json.dumps(fallback, separators=(",", ":")))
+                delivered += 1
+                continue
             if client_kinds.get(ws) == "native" and encoded_size > MAX_NATIVE_WS_MESSAGE_BYTES:
                 if native_delta_payloads is not None:
                     for payload in native_delta_payloads:
@@ -714,6 +739,7 @@ async def broadcast(
             dead.append(ws)
     for ws in dead:
         clients.discard(ws)
+        page_layout_clients.discard(ws)
         client_roles.pop(ws, None)
         client_kinds.pop(ws, None)
         client_ids.pop(ws, None)
@@ -835,15 +861,41 @@ def state_refresh_message(*, reason: str = "sync") -> dict[str, Any]:
 
 
 def push_history(action: dict[str, Any]) -> None:
+    action = local_history_action(action, state.get("document", {}).get("pages", []))
     history.append(action)
     if len(history) > MAX_HISTORY_ACTIONS:
         del history[: len(history) - MAX_HISTORY_ACTIONS]
     redo_history.clear()
+    # Retain at least the latest operation, but never accumulate hundreds of
+    # large deleted-page backgrounds. Ordinary ink entries retain the old cap.
+    while len(history) > 1 and sum(item.get("historyBytes", 0) for item in history) > MAX_PAGE_HISTORY_BYTES:
+        del history[0]
+
+
+def local_history_action(action, pages, id_map=None):
+    if action.get("type") == "page":
+        return action
+    records = [stroke for field in ("strokes", "before", "after") for stroke in action.get(field, [])]
+    if all(stroke.get("coordinateSpace") == "page-local"
+           and (id_map or {}).get(stroke.get("pageId"), stroke.get("pageId")) == stroke.get("pageId")
+           for stroke in records):
+        return action
+    result = copy.deepcopy(action)
+    for field in ("strokes", "before", "after"):
+        if field not in result:
+            continue
+        for index, stroke in enumerate(result[field]):
+            local = stroke if stroke.get("coordinateSpace") == "page-local" else stored_stroke(stroke, pages)
+            if local.get("pageId") in (id_map or {}):
+                local["pageId"] = id_map[local["pageId"]]
+            result[field][index] = local
+    return result
 
 
 def apply_history_action(action: dict[str, Any], *, undo: bool) -> dict[str, Any]:
     action_type = action.get("type")
-    strokes = copy.deepcopy(action.get("strokes", []))
+    pages = state.get("document", {}).get("pages", [])
+    strokes = [world_stroke(copy.deepcopy(stroke), pages) for stroke in action.get("strokes", [])]
     ids = [str(stroke.get("id", "")) for stroke in strokes if stroke.get("id")]
 
     if action_type == "add":
@@ -865,7 +917,7 @@ def apply_history_action(action: dict[str, Any], *, undo: bool) -> dict[str, Any
         return {"type": "delete_strokes", "ids": ids}
 
     if action_type == "replace":
-        replacements = copy.deepcopy(action.get("before" if undo else "after", []))
+        replacements = [world_stroke(copy.deepcopy(stroke), pages) for stroke in action.get("before" if undo else "after", [])]
         for stroke in replacements:
             state["strokes"][stroke["id"]] = stroke
         return {"type": "replace_strokes", "strokes": replacements}
@@ -987,6 +1039,11 @@ def sanitize_stroke(raw: Any) -> dict[str, Any]:
         if not (0 <= page_index <= MAX_PDF_PAGES):
             raise ValueError("invalid page index")
         stroke["pageIndex"] = page_index
+    if raw.get("pageId") is not None:
+        identifier = raw["pageId"]
+        if not isinstance(identifier, str) or not 1 <= len(identifier) <= 128:
+            raise ValueError("invalid page id")
+        stroke["pageId"] = identifier
     pipeline = sanitize_pipeline(raw.get("pipeline"))
     if pipeline is not None:
         stroke["pipeline"] = pipeline
@@ -1036,6 +1093,30 @@ def sanitize_authoritative_strokes(raw: Any) -> dict[str, dict[str, Any]]:
     return result
 
 
+def sanitize_live_stroke(raw: Any) -> dict[str, Any]:
+    stroke = sanitize_stroke(raw)
+    if stroke.get("pageId") in state.get("legacyPageIds", {}):
+        stroke["pageId"] = state["legacyPageIds"][stroke["pageId"]]
+    pages = state.get("document", {}).get("pages", [])
+    index = stroke_page_index(stroke, pages)
+    if stroke.get("pageId") and index is None:
+        raise ValueError("The stroke belongs to a page that no longer exists")
+    if index is not None:
+        page = pages[index]
+        # Local coordinates survive a page move while an offline client still
+        # holds an older world layout. Legacy clients keep their world fallback.
+        if stroke.get("pageId"):
+            for point in stroke["points"]:
+                for axis in ("x", "y"):
+                    if axis + "_local" in point:
+                        point[axis] = point[axis + "_local"] + page.get(axis, 0)
+                    if axis + "_raw_local" in point:
+                        point[axis + "_raw"] = point[axis + "_raw_local"] + page.get(axis, 0)
+        stroke["pageId"] = page["id"]
+        stroke["pageIndex"] = index
+    return stroke
+
+
 
 def safe_filename(value: Any, fallback: str, *, extension: str | None = None) -> str:
     name = Path(str(value or fallback)).name.strip() or fallback
@@ -1045,7 +1126,7 @@ def safe_filename(value: Any, fallback: str, *, extension: str | None = None) ->
     return name
 
 
-def prepare_pdf(content: bytes) -> tuple[Path, list[dict[str, Any]]]:
+def prepare_pdf(content: bytes, retained_pages: list[dict[str, Any] | None] | None = None) -> tuple[Path, list[dict[str, Any]]]:
     if len(content) > MAX_PDF_BYTES:
         raise HTTPException(status_code=413, detail="PDF is larger than 100 MB")
 
@@ -1080,14 +1161,31 @@ def prepare_pdf(content: bytes) -> tuple[Path, list[dict[str, Any]]]:
             # composite the SVG into its canvas, but the server no longer
             # creates full-page PNG bitmaps for each PDF page. Text is emitted
             # as paths so appearance does not depend on browser font matching.
-            svg = page.get_svg_image(text_as_path=True)
-            output_name = f"page-{index + 1:04d}.svg"
-            (temp_pages / output_name).write_text(svg, encoding="utf-8")
+            retained = retained_pages[index] if retained_pages is not None and index < len(retained_pages) else None
+            identifier = retained["id"] if retained else str(uuid.uuid4())
+            cached_name = Path(urlsplit(retained.get("imageUrl", "")).path).name if retained else ""
+            cached_path = PDF_PAGES_DIR / cached_name
+            output_name = cached_name if cached_name and cached_path.is_file() else f"page-{identifier}.svg"
+            if retained and cached_name and cached_path.is_file():
+                shutil.copy2(cached_path, temp_pages / output_name)
+                image_url = retained["imageUrl"]
+            else:
+                svg = page.get_svg_image(text_as_path=True)
+                (temp_pages / output_name).write_text(svg, encoding="utf-8")
+                image_url = f"/pdf-pages/{output_name}?v={cache_token}"
+            pdf_metadata = retained or {}
+            pdf_content = reusable_asset(PDF_PAGES_DIR, pdf_metadata)
+            if pdf_content is None and retained:
+                pdf_content = reusable_asset(PDF_PAGES_DIR, legacy_page_pdf_assets.get(retained.get("imageUrl", ""), {}))
+            if pdf_content is None:
+                pdf_content = extract_page(document, index)
+            pdf_asset = write_asset(temp_pages, pdf_content)
             pages.append(
                 {
-                    "id": f"page-{index + 1}",
+                    **pdf_asset,
+                    "id": identifier,
                     "pageNumber": index + 1,
-                    "imageUrl": f"/pdf-pages/{output_name}?v={cache_token}",
+                    "imageUrl": image_url,
                     "x": 0.0,
                     "y": y,
                     "width": float(rect.width),
@@ -1147,9 +1245,14 @@ def sanitize_project_pages(raw_pages: Any) -> list[dict[str, Any]]:
             raise HTTPException(status_code=400, detail="Project page layout is invalid") from exc
         if not (-1e7 < x < 1e7 and -1e7 < y < 1e9 and 0.0 < width < 1e7 and 0.0 < height < 1e7):
             raise HTTPException(status_code=400, detail="Project page layout is invalid")
+        identifier = raw_page.get("id") or f"page-{index + 1}"
+        if not isinstance(identifier, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", identifier):
+            raise HTTPException(status_code=400, detail="Project page ID is invalid")
+        if any(page["id"] == identifier for page in pages):
+            raise HTTPException(status_code=400, detail="Project contains duplicate page IDs")
         pages.append(
             {
-                "id": f"page-{index + 1}",
+                "id": identifier,
                 "pageNumber": index + 1,
                 "x": x,
                 "y": y,
@@ -1205,6 +1308,14 @@ def sanitize_project_state(raw: Any, *, has_pdf: bool) -> dict[str, Any]:
         "document": {"filename": filename, "pages": source_pages},
         "strokes": sanitized_strokes,
     }
+    if raw.get("pageIdentityVersion") == 1:
+        sanitized["pageIdentityVersion"] = 1
+        aliases = raw.get("legacyPageIds", {})
+        if not isinstance(aliases, dict) or len(aliases) > MAX_PDF_PAGES or not all(
+                isinstance(key, str) and isinstance(value, str) and 1 <= len(key) <= 128 and 1 <= len(value) <= 128
+                for key, value in aliases.items()):
+            raise HTTPException(status_code=400, detail="Project legacy page IDs are invalid")
+        sanitized["legacyPageIds"] = aliases
     normalize_document_id(sanitized)
     return sanitized
 
@@ -1287,6 +1398,8 @@ def stroke_page_index(
 ) -> int | None:
     if not pages:
         return None
+    if stroke.get("pageId"):
+        return next((index for index, page in enumerate(pages) if page["id"] == stroke["pageId"]), None)
     raw_index = stroke.get("pageIndex")
     if isinstance(raw_index, int) and 0 <= raw_index < len(pages):
         return raw_index
@@ -1886,6 +1999,60 @@ async def get_source_pdf() -> FileResponse:
     )
 
 
+@app.get("/api/pdf/pages")
+async def get_pdf_pages(documentId: str) -> JSONResponse:
+    """Manifest for older notebooks; new layouts already include PDF assets."""
+    async with state_lock:
+        if documentId != current_document_id():
+            raise HTTPException(status_code=409, detail="The notebook changed")
+        pages = copy.deepcopy(state.get("document", {}).get("pages", []))
+        if not CURRENT_PDF.exists() or not pages:
+            raise HTTPException(status_code=404, detail="No PDF is currently open")
+
+        def prepare_manifest():
+            result = []
+            with fitz.open(CURRENT_PDF) as pdf:
+                if pdf.page_count != len(pages):
+                    raise ValueError("PDF and page layout do not match")
+                for index, page in enumerate(pages):
+                    metadata = page if page.get("pdfSha256") else legacy_page_pdf_assets.get(page.get("imageUrl", ""), {})
+                    content = reusable_asset(PDF_PAGES_DIR, metadata)
+                    if content is None:
+                        content = extract_page(pdf, index)
+                    asset = write_asset(PDF_PAGES_DIR, content)
+                    if page.get("imageUrl"):
+                        legacy_page_pdf_assets[page["imageUrl"]] = asset
+                    result.append({**page, **asset})
+            return result
+
+        try:
+            manifest = await asyncio.to_thread(prepare_manifest)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise HTTPException(status_code=500, detail=f"Could not prepare PDF pages: {exc}") from exc
+        # Keep only the current generation's legacy aliases.
+        active = {page.get("imageUrl") for page in pages}
+        for key in list(legacy_page_pdf_assets):
+            if key not in active:
+                del legacy_page_pdf_assets[key]
+        return JSONResponse({"documentId": documentId, "pages": manifest}, headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/pdf/page/{digest}")
+async def get_pdf_page(digest: str) -> Response:
+    try:
+        path = asset_path(PDF_PAGES_DIR, digest)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    async with state_lock:
+        try:
+            content = await asyncio.to_thread(path.read_bytes)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail="PDF page is not available; refresh the notebook") from exc
+    return Response(content, media_type="application/pdf", headers={
+        "Cache-Control": "public, max-age=31536000, immutable", "ETag": f'"{digest}"',
+    })
+
+
 @app.post("/api/pdf")
 async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
     ensure_storage_healthy()
@@ -1901,6 +2068,7 @@ async def upload_pdf(file: UploadFile = File(...)) -> JSONResponse:
             await drain_completion_tasks()
             async with staged_document_assets(temp_root):
                 state["documentId"] = str(uuid.uuid4())
+                state.pop("legacyPageIds", None)
                 state["document"] = {"filename": filename, "pages": pages}
                 state["strokes"] = {}
                 history.clear()
@@ -1958,13 +2126,265 @@ def remap_strokes_after_page_insert(
     return shifted
 
 
+def remap_ink_history_for_insert(actions, old_pages, new_pages, after_index):
+    result = copy.deepcopy(actions)
+    for action in result:
+        for field in ("strokes", "before", "after"):
+            records = action.get(field, [])
+            remap_strokes_after_page_insert({record["id"]: record for record in records},
+                                           old_pages, new_pages, after_index)
+    return result
+
+
+def remap_strokes_after_page_delete(strokes, old_pages, new_pages, deleted_index):
+    removed, shifted = [], []
+    for identifier, stroke in list(strokes.items()):
+        index = stroke_page_index(stroke, old_pages)
+        if index == deleted_index:
+            removed.append(identifier)
+            del strokes[identifier]
+        elif index is not None and index > deleted_index:
+            delta = float(new_pages[index - 1]["y"]) - float(old_pages[index]["y"])
+            for point in stroke.get("points", []):
+                point["y"] += delta
+                if "y_raw" in point:
+                    point["y_raw"] += delta
+            stroke["pageIndex"] = index - 1
+            shifted.append(copy.deepcopy(stroke))
+    return removed, shifted
+
+
+def remap_ink_history_for_delete(actions, old_pages, new_pages, deleted_index, excluded_ids=()):
+    # Drop both halves of moves involving the deleted page, including earlier
+    # history for those IDs. Otherwise undo could resurrect ink on another page.
+    excluded_ids = set(excluded_ids) | {
+        record["id"] for action in actions for field in ("strokes", "before", "after")
+        for record in action.get(field, [])
+        if stroke_page_index(record, old_pages) == deleted_index
+    }
+    result = []
+    for original in actions:
+        action = copy.deepcopy(original)
+        for field in ("strokes", "before", "after"):
+            if field in action:
+                records = {record["id"]: record for record in action[field]
+                           if record["id"] not in excluded_ids}
+                remap_strokes_after_page_delete(records, old_pages, new_pages, deleted_index)
+                action[field] = list(records.values())
+        if any(action.get(field) for field in ("strokes", "before", "after")):
+            result.append(action)
+    return result
+
+
+def capture_page_history(old_pages, pages, id_map, prepared_root, focus):
+    """Keep one affected vector background, local ink and two small layouts."""
+    before = copy.deepcopy(old_pages)
+    for page in before:
+        page["id"] = id_map.get(page["id"], page["id"])
+    after = copy.deepcopy(pages)
+    before_ids, after_ids = {p["id"] for p in before}, {p["id"] for p in after}
+    added, deleted = after_ids - before_ids, before_ids - after_ids
+    if (len(added), len(deleted)) not in {(1, 0), (0, 1)}:
+        raise ValueError("Page history requires a single insertion or deletion")
+    inserting = bool(added)
+    identifier = next(iter(added or deleted))
+    layout = after if inserting else before
+    index = next(i for i, page in enumerate(layout) if page["id"] == identifier)
+    page = layout[index]
+    root = prepared_root / "pdf_pages" if inserting else PDF_PAGES_DIR
+    pdf_bytes = reusable_asset(root, page)
+    if pdf_bytes is None:
+        with fitz.open(prepared_root / "current.pdf" if inserting else CURRENT_PDF) as pdf:
+            pdf_bytes = extract_page(pdf, index)
+    digest = hashlib.sha256(pdf_bytes).hexdigest()
+    page.update({"pdfUrl": f"/api/pdf/page/{digest}", "pdfSha256": digest, "pdfBytes": len(pdf_bytes)})
+    svg_name = Path(urlsplit(page.get("imageUrl", "")).path).name
+    if not svg_name or not (root / svg_name).is_file():
+        svg_name = f"page-{identifier}.svg"
+        with fitz.open(stream=pdf_bytes, filetype="pdf") as single:
+            svg_bytes = single[0].get_svg_image(text_as_path=True).encode("utf-8")
+        page["imageUrl"] = f"/pdf-pages/{svg_name}?v={digest[:8]}"
+    else:
+        svg_bytes = (root / svg_name).read_bytes()
+    # Fill upgraded background identities in the pre-migration layout too.
+    new_by_id = {p["id"]: p for p in after}
+    for old in before:
+        if old["id"] in new_by_id:
+            for key in ("imageUrl", "pdfUrl", "pdfSha256", "pdfBytes"):
+                if key in new_by_id[old["id"]]:
+                    old[key] = new_by_id[old["id"]][key]
+    deleted_ink = []
+    if not inserting:
+        for stroke in state["strokes"].values():
+            if stroke_page_index(stroke, old_pages) == index:
+                local = stored_stroke(stroke, old_pages)
+                local["pageId"] = identifier
+                deleted_ink.append(local)
+    return {"type": "page", "pageId": identifier, "beforePages": before, "afterPages": after,
+            "pdf": pdf_bytes, "svg": svg_bytes, "svgName": svg_name, "deletedInk": deleted_ink,
+            "focusBefore": min(max(1, index if inserting else index + 1), len(before)), "focusAfter": focus,
+            "historyBytes": len(pdf_bytes) + len(svg_bytes) + sum(len(json.dumps(s)) for s in deleted_ink)}
+
+
+async def replay_page_history(action, *, undo):
+    old_pages = copy.deepcopy(state["document"]["pages"])
+    expected = action["afterPages" if undo else "beforePages"]
+    target = copy.deepcopy(action["beforePages" if undo else "afterPages"])
+    if [p["id"] for p in old_pages] != [p["id"] for p in expected]:
+        raise ValueError("Page history does not match the current notebook")
+    identifier = action["pageId"]
+    restoring = any(p["id"] == identifier for p in target)
+    with fitz.open(CURRENT_PDF) as pdf:
+        if restoring:
+            index = next(i for i, page in enumerate(target) if page["id"] == identifier)
+            with fitz.open(stream=action["pdf"], filetype="pdf") as single:
+                pdf.insert_pdf(single, start_at=index)
+        else:
+            index = next(i for i, page in enumerate(old_pages) if page["id"] == identifier)
+            pdf.delete_page(index)
+        content = pdf.tobytes(garbage=4, deflate=True)
+    prepared, pages = prepare_pdf(content, target)
+    try:
+        # Restore exact asset bytes/URLs, rather than assigning new identities
+        # to regenerated equivalents. Clients reuse the unaffected backgrounds.
+        if restoring:
+            saved = target[index]
+            write_asset(prepared / "pdf_pages", action["pdf"])
+            (prepared / "pdf_pages" / action["svgName"]).write_bytes(action["svg"])
+            for key in ("imageUrl", "pdfUrl", "pdfSha256", "pdfBytes"):
+                pages[index][key] = saved[key]
+        restored = action["deletedInk"] if restoring else []
+        message = await commit_page_layout(old_pages, pages, {}, state["document"].get("filename"), prepared,
+            action["focusBefore" if undo else "focusAfter"], "Page change undone" if undo else "Page change redone",
+            record_history=False, restored_ink=restored)
+        ink_message = {"type": "restore_strokes", "strokes": [world_stroke(s, pages) for s in restored]} if restored else None
+        return message, ink_message
+    finally:
+        shutil.rmtree(prepared, ignore_errors=True)
+
+
+async def commit_page_layout(old_pages, pages, id_map, filename, prepared_root, focus, notice,
+                             *, record_history=True, restored_ink=()):
+    """One durable layout transaction and one small client event; no ink delta."""
+    migrate = state.get("pageIdentityVersion") != 1
+    new_ids = {page["id"] for page in pages}
+    deleted_indices = {index for index, page in enumerate(old_pages)
+                       if id_map.get(page["id"], page["id"]) not in new_ids}
+    removed = {identifier for identifier, stroke in state["strokes"].items()
+               if stroke_page_index(stroke, old_pages) in deleted_indices}
+    page_action = capture_page_history(old_pages, pages, id_map, prepared_root, focus) if record_history else None
+    updated_strokes = {identifier: updated for identifier, stroke in state["strokes"].items()
+                       if (updated := reflow_stroke(stroke, old_pages, pages, id_map)) is not None}
+    updated_history = [local_history_action(a, old_pages, id_map) for a in history]
+    updated_redo = [local_history_action(a, old_pages, id_map) for a in redo_history]
+    for local in restored_ink:
+        stroke = world_stroke(local, pages)
+        updated_strokes[stroke["id"]] = stroke
+    updated_deletes = copy.deepcopy(pending_delete_operations)
+    for transaction in updated_deletes.values():
+        transaction["strokes"] = {identifier: updated for identifier, stroke in transaction["strokes"].items()
+                                  if (updated := reflow_stroke(stroke, old_pages, pages, id_map)) is not None}
+    previous_revision = current_document_revision()
+    async with staged_document_assets(prepared_root):
+        state["document"] = {"filename": filename, "pages": pages}
+        state["pageIdentityVersion"] = 1
+        if migrate:
+            state["legacyPageIds"] = id_map
+        state["strokes"] = updated_strokes
+        # Conversion happens once. Thereafter page moves change only metadata;
+        # deleting a page deletes its ink rows, without touching surviving rows.
+        await save_state_atomic(upsert_ids=set(updated_strokes) if migrate else {s["id"] for s in restored_ink}, delete_ids=removed)
+        history[:] = updated_history
+        redo_history[:] = updated_redo
+        pending_delete_operations.clear()
+        pending_delete_operations.update(updated_deletes)
+        if page_action is not None:
+            push_history(page_action)
+    return {"type": "page_layout", "document": copy.deepcopy(state["document"]),
+            "documentId": current_document_id(), "documentRevision": current_document_revision(),
+            "previousDocumentRevision": previous_revision, "stateToken": current_state_token(),
+            "previousPages": old_pages, "pageIdMap": id_map,
+            "focusPageNumber": focus, "notice": notice, "ok": True, "pageNumber": focus}
+
+
+@app.get("/api/page-templates")
+async def get_page_templates() -> JSONResponse:
+    try:
+        presets = load_presets(DATA_DIR)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read page template presets: {exc}") from exc
+    return JSONResponse({"presets": presets})
+
+
+@app.post("/api/page-templates")
+async def save_page_template(options: dict[str, Any] = Body(...)) -> JSONResponse:
+    try:
+        preset = validate_preset(options)
+        await asyncio.to_thread(save_preset, preset, DATA_DIR)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not save page template: {exc}") from exc
+    return JSONResponse({"preset": preset})
+
+
+def add_pdf_page(document: fitz.Document, *, position: int, reference_index: int,
+                 kind: str, preset_id: str | None, options: dict[str, Any] | None = None) -> None:
+    options = options or {}
+    rect = document.load_page(reference_index).rect
+    width, height = float(rect.width), float(rect.height)
+    if options.get("useCurrentSize", True) is not True:
+        try:
+            dimensions = validate_preset({"id": "size", "name": "Size",
+                                         "pageWidthPt": options.get("pageWidthPt"),
+                                         "pageHeightPt": options.get("pageHeightPt")})
+            if dimensions.get("pageWidthPt") is None:
+                raise ValueError("Width and height are required for a custom page size")
+            width, height = dimensions["pageWidthPt"], dimensions["pageHeightPt"]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if kind == "blank":
+        document.new_page(pno=position, width=width, height=height)
+    elif kind == "copy":
+        if options.get("useCurrentSize", True) is not True:
+            raise HTTPException(status_code=422, detail="A copied PDF page retains its original dimensions")
+        document.fullcopy_page(reference_index, to=-1 if position == document.page_count else position)
+    elif kind == "template":
+        if "template" in options:
+            try:
+                preset = validate_preset(options["template"])
+            except ValueError as exc:
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+        else:
+            try:
+                preset = next(item for item in load_presets(DATA_DIR) if item["id"] == preset_id)
+            except StopIteration as exc:
+                raise HTTPException(status_code=404, detail="Page template preset not found") from exc
+            except (OSError, ValueError, json.JSONDecodeError) as exc:
+                raise HTTPException(status_code=500, detail=f"Could not read page template presets: {exc}") from exc
+        try:
+            pdf_bytes = render_page(preset, width, height)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"Could not generate page template: {exc}") from exc
+        source = fitz.open(stream=pdf_bytes, filetype="pdf")
+        try:
+            document.insert_pdf(source, start_at=position)
+        finally:
+            source.close()
+    else:
+        raise HTTPException(status_code=422, detail="Page kind must be blank, copy, or template")
+
+
 @app.post("/api/pages/insert")
-async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
+async def insert_blank_page(afterPageNumber: int, kind: str = "blank", presetId: str | None = None,
+                            options: dict[str, Any] | None = Body(default=None)) -> JSONResponse:
     ensure_storage_healthy()
     started = time.perf_counter()
     debug_event("page", "insert_started", afterPageNumber=afterPageNumber)
     async with state_lock:
         old_pages = copy.deepcopy(state.get("document", {}).get("pages", []))
+        if pending_stroke_history:
+            raise HTTPException(status_code=409, detail="Finish drawing before changing pages")
         if not CURRENT_PDF.exists() or not old_pages:
             raise HTTPException(status_code=400, detail="Open a PDF before inserting a page")
         if not (1 <= afterPageNumber <= len(old_pages)):
@@ -1981,53 +2401,31 @@ async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
         if document.page_count >= MAX_PDF_PAGES:
             raise HTTPException(status_code=400, detail=f"Prototype limit is {MAX_PDF_PAGES} pages")
         reference_index = afterPageNumber - 1
-        reference_rect = document.load_page(reference_index).rect
-        # PyMuPDF inserts before pno. A one-based page N therefore inserts
-        # directly below it at zero-based index N.
-        document.new_page(
-            pno=afterPageNumber,
-            width=float(reference_rect.width),
-            height=float(reference_rect.height),
-        )
+        # A one-based page N inserts below it at zero-based index N.
+        add_pdf_page(document, position=afterPageNumber, reference_index=reference_index,
+                     kind=kind, preset_id=presetId, options=options)
         updated_pdf = document.tobytes(garbage=4, deflate=True)
     finally:
         document.close()
 
-    temp_root, pages = prepare_pdf(updated_pdf)
+    retained, id_map = stable_pages(old_pages, migrate=state.get("pageIdentityVersion") != 1)
+    retained.insert(afterPageNumber, None)
+    temp_root, pages = prepare_pdf(updated_pdf, retained)
     try:
         async with state_lock:
             await notebook_writer().drain()
             await drain_completion_tasks()
             if state.get("document", {}).get("pages", []) != old_pages:
                 raise HTTPException(status_code=409, detail="The document changed while the page was being inserted")
-            updated_strokes = copy.deepcopy(state.get("strokes", {}))
-            shifted_strokes = remap_strokes_after_page_insert(
-                updated_strokes, old_pages, pages, afterPageNumber - 1
-            )
-            async with staged_document_assets(temp_root):
-                state["document"] = {"filename": filename, "pages": pages}
-                state["strokes"] = updated_strokes
-                history.clear()
-                redo_history.clear()
-                pending_stroke_history.clear()
-                await save_state_atomic(replace_all=True)
-            snapshot = copy.deepcopy(state["document"])
-            document_id = current_document_id()
+            if pending_stroke_history:
+                raise HTTPException(status_code=409, detail="Finish drawing before changing pages")
+            message = await commit_page_layout(old_pages, pages, id_map, filename, temp_root,
+                                               afterPageNumber + 1, f"Page {afterPageNumber + 1} inserted")
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
     inserted_page_number = afterPageNumber + 1
-    message = {
-        "type": "document_changed",
-        "document": snapshot,
-        "documentId": document_id,
-        "clearStrokes": False,
-        "focusPageNumber": inserted_page_number,
-        "notice": f"Blank page {inserted_page_number} inserted",
-    }
     await broadcast(message)
-    if shifted_strokes:
-        await broadcast({"type": "replace_strokes", "strokes": shifted_strokes})
     await broadcast(history_status_message())
     debug_event(
         "page",
@@ -2035,24 +2433,23 @@ async def insert_blank_page(afterPageNumber: int) -> JSONResponse:
         durationMs=round((time.perf_counter() - started) * 1000, 3),
         pageNumber=inserted_page_number,
         pageCount=len(pages),
-        shiftedStrokeCount=len(shifted_strokes),
         stateToken=current_state_token(),
     )
-    return JSONResponse({
-        "ok": True,
-        "document": snapshot,
-        "pageNumber": inserted_page_number,
-        "shiftedStrokeCount": len(shifted_strokes),
-    })
+    return JSONResponse(message)
 
 
 @app.post("/api/pages/append")
-async def append_blank_page() -> JSONResponse:
+async def append_blank_page(kind: str = "blank", presetId: str | None = None,
+                            referencePageNumber: int | None = None,
+                            options: dict[str, Any] | None = Body(default=None)) -> JSONResponse:
     ensure_storage_healthy()
     started = time.perf_counter()
     debug_event("page", "append_started")
     async with state_lock:
-        if not CURRENT_PDF.exists() or not state.get("document", {}).get("pages"):
+        old_pages = copy.deepcopy(state.get("document", {}).get("pages", []))
+        if pending_stroke_history:
+            raise HTTPException(status_code=409, detail="Finish drawing before changing pages")
+        if not CURRENT_PDF.exists() or not old_pages:
             raise HTTPException(status_code=400, detail="Open a PDF before adding a matching page")
         pdf_content = CURRENT_PDF.read_bytes()
         filename = state["document"].get("filename") or "document.pdf"
@@ -2065,35 +2462,34 @@ async def append_blank_page() -> JSONResponse:
     try:
         if document.page_count >= MAX_PDF_PAGES:
             raise HTTPException(status_code=400, detail=f"Prototype limit is {MAX_PDF_PAGES} pages")
-        reference_rect = document.load_page(document.page_count - 1).rect
-        document.new_page(width=float(reference_rect.width), height=float(reference_rect.height))
+        reference_index = (referencePageNumber or document.page_count) - 1
+        if not 0 <= reference_index < document.page_count:
+            raise HTTPException(status_code=422, detail="referencePageNumber must refer to an existing page")
+        add_pdf_page(document, position=document.page_count, reference_index=reference_index,
+                     kind=kind, preset_id=presetId, options=options)
         updated_pdf = document.tobytes(garbage=4, deflate=True)
     finally:
         document.close()
 
-    temp_root, pages = prepare_pdf(updated_pdf)
+    retained, id_map = stable_pages(old_pages, migrate=state.get("pageIdentityVersion") != 1)
+    retained.append(None)
+    temp_root, pages = prepare_pdf(updated_pdf, retained)
     try:
         async with state_lock:
             await notebook_writer().drain()
             await drain_completion_tasks()
-            async with staged_document_assets(temp_root):
-                state["document"] = {"filename": filename, "pages": pages}
-                await save_state_atomic()
-            snapshot = copy.deepcopy(state["document"])
-            document_id = current_document_id()
+            if state.get("document", {}).get("pages", []) != old_pages:
+                raise HTTPException(status_code=409, detail="The document changed while the page was being added")
+            if pending_stroke_history:
+                raise HTTPException(status_code=409, detail="Finish drawing before changing pages")
+            message = await commit_page_layout(old_pages, pages, id_map, filename, temp_root,
+                                               len(pages), f"Page {len(pages)} added")
     finally:
         shutil.rmtree(temp_root, ignore_errors=True)
 
     page_number = len(pages)
-    message = {
-        "type": "document_changed",
-        "document": snapshot,
-        "documentId": document_id,
-        "clearStrokes": False,
-        "focusPageNumber": page_number,
-        "notice": f"Blank page {page_number} added",
-    }
     await broadcast(message)
+    await broadcast(history_status_message())
     debug_event(
         "page",
         "append_completed",
@@ -2102,7 +2498,39 @@ async def append_blank_page() -> JSONResponse:
         pageCount=len(pages),
         stateToken=current_state_token(),
     )
-    return JSONResponse({"ok": True, "document": snapshot, "pageNumber": page_number})
+    return JSONResponse(message)
+
+
+@app.post("/api/pages/delete")
+async def delete_page(pageNumber: int) -> JSONResponse:
+    ensure_storage_healthy()
+    async with state_lock:
+        await notebook_writer().drain()
+        await drain_completion_tasks()
+        old_pages = copy.deepcopy(state.get("document", {}).get("pages", []))
+        if not CURRENT_PDF.exists() or len(old_pages) < 2:
+            raise HTTPException(status_code=400, detail="Keep at least one page in the notebook")
+        if not 1 <= pageNumber <= len(old_pages):
+            raise HTTPException(status_code=422, detail="pageNumber must refer to an existing page")
+        if pending_stroke_history:
+            raise HTTPException(status_code=409, detail="Finish drawing before changing pages")
+        document = fitz.open(CURRENT_PDF)
+        try:
+            document.delete_page(pageNumber - 1)
+            content = document.tobytes(garbage=4, deflate=True)
+        finally:
+            document.close()
+        retained, id_map = stable_pages(old_pages, migrate=state.get("pageIdentityVersion") != 1)
+        del retained[pageNumber - 1]
+        temp_root, pages = prepare_pdf(content, retained)
+        try:
+            message = await commit_page_layout(old_pages, pages, id_map, state["document"].get("filename"),
+                                               temp_root, min(pageNumber, len(pages)), "Page deleted")
+        finally:
+            shutil.rmtree(temp_root, ignore_errors=True)
+    await broadcast(message)
+    await broadcast(history_status_message())
+    return JSONResponse(message)
 
 
 @app.get("/api/pdf/export-info")
@@ -2236,7 +2664,9 @@ async def import_project(file: UploadFile = File(...)) -> JSONResponse:
     pages: list[dict[str, Any]] = []
     if pdf_content is not None:
         source_pages = imported_state["document"].get("pages", [])
-        temp_root, pages = prepare_pdf(pdf_content)
+        # Imported page identities are content identities, not positional IDs.
+        # Sanitized source pages have no imageUrl, so assets are rendered fresh.
+        temp_root, pages = prepare_pdf(pdf_content, source_pages)
         reflow_strokes_between_page_layouts(imported_state["strokes"], source_pages, pages)
         imported_state["document"]["pages"] = pages
 
@@ -2371,6 +2801,8 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
     client_id = str(websocket.query_params.get("clientId", ""))[:256]
     client_kind = "native" if role == "ipad" and client_id.startswith("native-") else "browser"
     clients.add(websocket)
+    if websocket.query_params.get("pageLayoutVersion") == "1":
+        page_layout_clients.add(websocket)
     client_roles[websocket] = role
     client_kinds[websocket] = client_kind
     client_ids[websocket] = client_id
@@ -2421,7 +2853,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 )
 
                 if message_type == "stroke_begin":
-                    stroke = sanitize_stroke(message.get("stroke"))
+                    stroke = sanitize_live_stroke(message.get("stroke"))
                     async with state_lock:
                         if "documentId" in message and message["documentId"] != current_document_id():
                             raise ValueError("stroke belongs to a different document")
@@ -2455,7 +2887,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     final_raw = message.get("stroke")
                     final_stroke: dict[str, Any] | None = None
                     if final_raw is not None:
-                        final_stroke = sanitize_stroke(final_raw)
+                        final_stroke = sanitize_live_stroke(final_raw)
                         if final_stroke["id"] != stroke_id:
                             raise ValueError("final stroke id does not match")
                     history_changed = False
@@ -2545,7 +2977,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     strokes_raw = message.get("strokes", [])
                     if not isinstance(strokes_raw, list) or len(strokes_raw) > MAX_SELECTION_STROKES:
                         raise ValueError("invalid reconnect stroke collection")
-                    reconciled = [sanitize_stroke(raw_stroke) for raw_stroke in strokes_raw]
+                    reconciled = [sanitize_live_stroke(raw_stroke) for raw_stroke in strokes_raw]
                     ids = [stroke["id"] for stroke in reconciled]
                     if len(ids) != len(set(ids)):
                         debug_event(
@@ -2638,7 +3070,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     strokes_raw = message.get("strokes", [])
                     if not isinstance(strokes_raw, list) or len(strokes_raw) > MAX_SELECTION_STROKES:
                         raise ValueError("invalid stroke collection")
-                    strokes = [sanitize_stroke(raw_stroke) for raw_stroke in strokes_raw]
+                    strokes = [sanitize_live_stroke(raw_stroke) for raw_stroke in strokes_raw]
                     ids = [stroke["id"] for stroke in strokes]
                     if len(ids) != len(set(ids)):
                         debug_event("conflict", "duplicate_add_ids_rejected", clientId=client_id, strokeCount=len(ids))
@@ -2660,7 +3092,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     strokes_raw = message.get("strokes", [])
                     if not isinstance(strokes_raw, list) or len(strokes_raw) > MAX_SELECTION_STROKES:
                         raise ValueError("invalid stroke collection")
-                    replacements = [sanitize_stroke(raw_stroke) for raw_stroke in strokes_raw]
+                    replacements = [sanitize_live_stroke(raw_stroke) for raw_stroke in strokes_raw]
                     ids = [stroke["id"] for stroke in replacements]
                     if len(ids) != len(set(ids)):
                         debug_event("conflict", "duplicate_replace_ids_rejected", clientId=client_id, strokeCount=len(ids))
@@ -2832,19 +3264,31 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                     source = history if message_type == "undo" else redo_history
                     destination = redo_history if message_type == "undo" else history
                     change: dict[str, Any] | None = None
+                    restored_ink_message = None
                     async with state_lock:
                         await notebook_writer().drain()
                         await drain_completion_tasks()
                         if source:
-                            action = source.pop()
-                            change = apply_history_action(action, undo=message_type == "undo")
+                            action = source[-1]
+                            if action.get("type") == "page":
+                                if pending_stroke_history or pending_delete_operations:
+                                    raise ValueError("Finish drawing or erasing before undoing a page change")
+                                try:
+                                    change, restored_ink_message = await replay_page_history(action, undo=message_type == "undo")
+                                except (OSError, RuntimeError, HTTPException) as exc:
+                                    raise ValueError("Page undo/redo failed; sync or restart the server before retrying") from exc
+                            else:
+                                change = apply_history_action(action, undo=message_type == "undo")
+                                if change["type"] in {"restore_strokes", "replace_strokes"}:
+                                    await save_state_atomic(upsert_ids={stroke["id"] for stroke in change["strokes"]})
+                                elif change["type"] == "delete_strokes":
+                                    await save_state_atomic(delete_ids=set(change["ids"]))
+                            source.pop()
                             destination.append(action)
-                            if change["type"] in {"restore_strokes", "replace_strokes"}:
-                                await save_state_atomic(upsert_ids={stroke["id"] for stroke in change["strokes"]})
-                            elif change["type"] == "delete_strokes":
-                                await save_state_atomic(delete_ids=set(change["ids"]))
                     if change is not None:
                         await broadcast(change)
+                    if restored_ink_message is not None:
+                        await broadcast(restored_ink_message)
                     await broadcast(history_status_message())
 
                 elif message_type == "ping":

@@ -6,6 +6,7 @@ def make_assets(root, label):
     (root / "pdf_pages").mkdir()
     (root / "current.pdf").write_bytes(label.encode())
     (root / "pdf_pages" / "page-0001.svg").write_text(f"<svg>{label}</svg>")
+    (root / "pdf_pages" / "page-0001.pdf").write_bytes(f"%PDF-{label}".encode())
 
 
 def test_interrupted_asset_install_restores_old_generation_if_database_did_not_commit(tmp_path):
@@ -20,6 +21,7 @@ def test_interrupted_asset_install_restores_old_generation_if_database_did_not_c
     assert recover_transition(live, live / "current.pdf", live / "pdf_pages", 7)
     assert (live / "current.pdf").read_bytes() == b"old"
     assert (live / "pdf_pages" / "page-0001.svg").read_text() == "<svg>old</svg>"
+    assert (live / "pdf_pages" / "page-0001.pdf").read_bytes() == b"%PDF-old"
     assert not transition.exists()
 
 
@@ -34,4 +36,5 @@ def test_interrupted_asset_install_finishes_new_generation_after_commit(tmp_path
     assert recover_transition(live, live / "current.pdf", live / "pdf_pages", 8)
     assert (live / "current.pdf").read_bytes() == b"new"
     assert (live / "pdf_pages" / "page-0001.svg").read_text() == "<svg>new</svg>"
+    assert (live / "pdf_pages" / "page-0001.pdf").read_bytes() == b"%PDF-new"
     assert not transition.exists()

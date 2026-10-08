@@ -10,6 +10,7 @@ import json
 import sqlite3
 from pathlib import Path
 from typing import Any
+from page_layout import stored_stroke, world_stroke
 
 
 class NotebookStore:
@@ -64,7 +65,9 @@ class NotebookStore:
             for stroke_id, stroke in state["strokes"].items():
                 self.connection.execute(
                     "INSERT INTO strokes(id,value) VALUES (?,?)",
-                    (stroke_id, json.dumps(stroke, ensure_ascii=False, separators=(",", ":"))),
+                    (stroke_id, json.dumps(stored_stroke(stroke, metadata["document"]["pages"])
+                                           if metadata.get("pageIdentityVersion") == 1 else stroke,
+                                           ensure_ascii=False, separators=(",", ":"))),
                 )
             self.connection.execute(
                 "INSERT INTO metadata(key,value) VALUES ('state',?)",
@@ -82,7 +85,7 @@ class NotebookStore:
             raise ValueError("Notebook database is not initialized")
         state = json.loads(row[0])
         state["strokes"] = {
-            stroke_id: json.loads(value)
+            stroke_id: world_stroke(json.loads(value), state.get("document", {}).get("pages", []))
             for stroke_id, value in self.connection.execute("SELECT id,value FROM strokes")
         }
         return state
@@ -107,6 +110,16 @@ class NotebookStore:
                 "SELECT value FROM metadata WHERE key='state'"
             ).fetchone()[0])
             for operation in operations:
+                metadata = operation["metadata"]
+                local_layout = metadata.get("pageIdentityVersion") == 1
+                if local_layout and previous_metadata.get("pageIdentityVersion") != 1:
+                    # One-time recoverable migration source, committed with the
+                    # new representation. Existing legacy files are untouched.
+                    self.connection.execute("CREATE TABLE IF NOT EXISTS page_identity_backup (document_id TEXT, kind TEXT, id TEXT, value TEXT, PRIMARY KEY(document_id,kind,id))")
+                    document_id = previous_metadata.get("documentId", "")
+                    self.connection.execute("INSERT OR IGNORE INTO page_identity_backup VALUES (?, 'metadata', 'state', ?)",
+                                            (document_id, json.dumps(previous_metadata)))
+                    self.connection.execute("INSERT OR IGNORE INTO page_identity_backup SELECT ?, 'stroke', id, value FROM strokes", (document_id,))
                 if operation["replace_all"]:
                     self.connection.execute("DELETE FROM strokes")
                 for stroke_id in operation["deletes"]:
@@ -115,7 +128,8 @@ class NotebookStore:
                     self.connection.execute(
                         "INSERT INTO strokes(id,value) VALUES (?,?) "
                         "ON CONFLICT(id) DO UPDATE SET value=excluded.value",
-                        (stroke_id, json.dumps(stroke, ensure_ascii=False, separators=(",", ":"))),
+                        (stroke_id, json.dumps(stored_stroke(stroke, metadata["document"]["pages"]) if local_layout else stroke,
+                                               ensure_ascii=False, separators=(",", ":"))),
                     )
                 metadata = operation["metadata"]
                 before = {key: value for key, value in previous_metadata.items() if key != "documentRevision"}
@@ -207,7 +221,7 @@ class NotebookStore:
             if value is None:
                 deletes.append(stroke_id)
             else:
-                upserts[stroke_id] = json.loads(value)
+                upserts[stroke_id] = world_stroke(json.loads(value), metadata.get("document", {}).get("pages", []))
         next_revision = expected_revision - 1
         return {
             **result, "status": "complete" if next_revision == current else "more",

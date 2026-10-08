@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -euo pipefail
+launcher_path="$(readlink -f -- "${BASH_SOURCE[0]}")"
+ROOT="$(cd -- "$(dirname -- "$launcher_path")/.." && pwd)"
+exec "$ROOT/computer/.venv/bin/python" "$ROOT/computer/page_templates.py" "$@"

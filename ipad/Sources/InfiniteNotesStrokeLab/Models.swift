@@ -450,6 +450,7 @@ struct NoteStroke: Codable, Identifiable, Equatable {
 
     /// Zero-based originating page. Optional for legacy v24 strokes.
     var pageIndex: Int?
+    var pageId: String? = nil
     var pipeline: StrokePipelineSnapshot?
 
     var shapeType: String?
@@ -466,6 +467,9 @@ struct NoteStroke: Codable, Identifiable, Equatable {
     var isInk: Bool { tool == "pen" || tool == "fixed-pen" || tool == "highlighter" }
 }
 
+extension NotePoint: PageLocalInkPoint {}
+extension NoteStroke: PageLocalInkStroke {}
+
 struct PageInfo: Codable, Equatable, Identifiable {
     var id: String
     var pageNumber: Int
@@ -474,6 +478,14 @@ struct PageInfo: Codable, Equatable, Identifiable {
     var y: Double
     var width: Double
     var height: Double
+    var pdfUrl: String? = nil
+    var pdfSha256: String? = nil
+    var pdfBytes: Int? = nil
+
+    var pdfAsset: PDFPageAsset? {
+        guard let pdfUrl, let pdfSha256, let pdfBytes else { return nil }
+        return PDFPageAsset(id: id, width: width, height: height, pdfUrl: pdfUrl, pdfSha256: pdfSha256, pdfBytes: pdfBytes)
+    }
 
     var worldRect: CGRect {
         CGRect(x: x, y: y, width: width, height: height)
@@ -485,6 +497,42 @@ struct DocumentInfo: Codable, Equatable {
     var pages: [PageInfo]
 
     static let empty = DocumentInfo(filename: nil, pages: [])
+}
+
+struct PageTemplateOption: Codable, Identifiable, Equatable {
+    var id = "new-template"
+    var name = "New Template"
+    var style = "eng"
+    var title = ""
+    var background = "#ffffff"
+    var minorLinesEnabled = true
+    var majorLinesEnabled = true
+    var dotsEnabled = false
+    var minorSpacingCm = 0.25
+    var majorSpacingCm = 1.0
+    var minorColor = "#dddddd"
+    var majorColor = "#999999"
+    var minorWidthMm = 0.05
+    var majorWidthMm = 0.1
+    var dotSpacingCm = 0.5
+    var dotColor = "#cccccc"
+    var dotRadiusMm = 0.4
+    var marginCm = 0.0
+    var headerCm = 0.0
+    var date = false
+    var pageWidthPt: Double?
+    var pageHeightPt: Double?
+}
+
+struct PageInsertionOptions: Encodable {
+    var useCurrentSize: Bool
+    var pageWidthPt: Double
+    var pageHeightPt: Double
+    var template: PageTemplateOption?
+}
+
+struct PageTemplateList: Decodable {
+    let presets: [PageTemplateOption]
 }
 
 struct NotebookState: Codable {
@@ -533,6 +581,9 @@ struct ServerEnvelope: Decodable {
     var document: DocumentInfo?
     var clearStrokes: Bool?
     var focusPageNumber: Int?
+    var previousPages: [PageInfo]?
+    var pageIdMap: [String: String]?
+    var previousDocumentRevision: Int?
     var notice: String?
 
     var stroke: NoteStroke?

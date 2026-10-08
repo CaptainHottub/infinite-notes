@@ -37,7 +37,7 @@ def _copy_asset_set(current_pdf: Path, pages_dir: Path, destination: Path) -> No
     if current_pdf.exists():
         _copy_file(current_pdf, destination / "current.pdf")
     if pages_dir.exists():
-        for pattern in ("page-*.png", "page-*.svg"):
+        for pattern in ("page-*.png", "page-*.svg", "page-*.pdf"):
             for page in pages_dir.glob(pattern):
                 _copy_file(page, destination / "pdf_pages" / page.name)
     if (destination / "pdf_pages").exists():
@@ -93,12 +93,12 @@ def install_asset_set(source: Path, current_pdf: Path, pages_dir: Path) -> None:
         os.replace(temporary_pdf, current_pdf)
     else:
         current_pdf.unlink(missing_ok=True)
-    for pattern in ("page-*.png", "page-*.svg"):
+    for pattern in ("page-*.png", "page-*.svg", "page-*.pdf"):
         for old in pages_dir.glob(pattern):
             old.unlink()
     source_pages = source / "pdf_pages"
     if source_pages.exists():
-        for pattern in ("page-*.png", "page-*.svg"):
+        for pattern in ("page-*.png", "page-*.svg", "page-*.pdf"):
             for page in source_pages.glob(pattern):
                 _copy_file(page, pages_dir / page.name)
     _sync_directory(pages_dir)

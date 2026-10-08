@@ -51,6 +51,7 @@ final class ServerClient: NSObject, URLSessionWebSocketDelegate, @unchecked Send
         components.queryItems = [
             URLQueryItem(name: "role", value: "ipad"),
             URLQueryItem(name: "clientId", value: clientID),
+            URLQueryItem(name: "pageLayoutVersion", value: "1"),
         ]
         guard let socketURL = components.url else {
             notifyStatus(.failed("Invalid WebSocket address"))

@@ -15,14 +15,17 @@ struct ContentView: View {
     @State private var didAutoConnect = false
     @State private var editingColorIndex: Int?
     @State private var showingToolSettings = false
+    @State private var showingAddPage = false
+    @State private var showingDeletePage = false
 
     var body: some View {
         VStack(spacing: 0) {
             toolbar
             Divider()
             ZStack(alignment: .trailing) {
-                if model.pdfDocument != nil {
+                if model.hasPDFBackground {
                     PDFKitNotebookView(model: model, navigator: navigator)
+                        .allowsHitTesting(!model.isUpdatingPages)
                 } else {
                     emptyState
                 }
@@ -36,6 +39,12 @@ struct ContentView: View {
                     .zIndex(20)
                 }
             }
+            .overlay {
+                if model.isUpdatingPages {
+                    ProgressView("Updating pages…")
+                        .padding().background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+                }
+            }
             .animation(.easeInOut(duration: 0.18), value: model.appSettings.configuration.resolvedShowPipelineDiagnosticsSidebar)
             if model.appSettings.configuration.showStatusBar { statusBar }
         }
@@ -47,6 +56,14 @@ struct ContentView: View {
                 appSettings: model.appSettings,
                 serverAddress: $serverAddress
             )
+        }
+        .sheet(isPresented: $showingAddPage) {
+            AddPageSheet(model: model)
+        }
+        .confirmationDialog("Delete current page?", isPresented: $showingDeletePage, titleVisibility: .visible) {
+            Button("Delete page and its ink", role: .destructive) { model.deleteCurrentPage() }
+        } message: {
+            Text("The page and its ink will be removed. Undo can restore them.")
         }
         .sheet(isPresented: Binding(
             get: { model.exportedPDFURL != nil },
@@ -142,15 +159,19 @@ struct ContentView: View {
                     .accessibilityLabel("Fit page")
 
                     Menu {
-                        Button(action: model.addPageBelowCurrent) {
-                            Label("Add page below current", systemImage: "rectangle.badge.plus")
-                        }
-                        .disabled(!model.isConnected || model.currentPageNumber == 0)
-
-                        Button(action: model.addPageAtEnd) {
-                            Label("Add page at end", systemImage: "doc.badge.plus")
+                        Button {
+                            showingAddPage = true
+                        } label: {
+                            Label("Add page…", systemImage: "rectangle.badge.plus")
                         }
                         .disabled(!model.isConnected || model.pageCount == 0)
+
+                        Button(role: .destructive) {
+                            showingDeletePage = true
+                        } label: {
+                            Label("Delete current page", systemImage: "trash")
+                        }
+                        .disabled(!model.isConnected || model.pageCount < 2)
 
                         Divider()
 

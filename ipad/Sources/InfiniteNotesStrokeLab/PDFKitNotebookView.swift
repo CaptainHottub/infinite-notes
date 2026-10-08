@@ -45,7 +45,8 @@ struct PDFKitNotebookView: UIViewRepresentable {
 
     func updateUIView(_ viewer: VectorPDFScrollView, context: Context) {
         viewer.model = model
-        if viewer.sourceURL != model.pdfFileURL || viewer.pdfDocument !== model.pdfDocument {
+        if viewer.sourceURL != model.pdfFileURL || viewer.pdfDocument !== model.pdfDocument
+            || viewer.pagePDFURLs != model.pdfPageURLs {
             viewer.setDocument(model.pdfDocument, sourceURL: model.pdfFileURL)
         }
         viewer.applySettings(settingsRevision: model.settingsRevision, workspaceRevision: model.workspaceRevision)
@@ -69,9 +70,25 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
     var model: AppModel
     private(set) var pdfDocument: PDFDocument?
     private(set) var sourceURL: URL?
+    private(set) var pagePDFURLs: [URL] = []
 
     private let documentView = UIView(frame: .zero)
     private var coreDocument: CGPDFDocument?
+    private var pageDocuments: [URL: CGPDFDocument] = [:]
+    private var renderPageCount: Int {
+        if !pagePDFURLs.isEmpty { return pagePDFURLs.count }
+        return min(pdfDocument?.pageCount ?? 0, coreDocument?.numberOfPages ?? 0)
+    }
+
+    private func corePage(at index: Int) -> CGPDFPage? {
+        if !pagePDFURLs.isEmpty {
+            guard pagePDFURLs.indices.contains(index) else { return nil }
+            let url = pagePDFURLs[index]
+            if pageDocuments[url] == nil { pageDocuments[url] = CGPDFDocument(url as CFURL) }
+            return pageDocuments[url]?.page(at: 1)
+        }
+        return coreDocument?.page(at: index + 1)
+    }
     private var workspaceFrames: [CGRect] = []
     private var pdfFrames: [CGRect] = []
     private var mountedPages: [Int: VectorPDFPageContainer] = [:]
@@ -161,9 +178,7 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         appliedPageGap = pageGap
         for page in mountedPages.values { page.applyAppearance() }
 
-        guard (gapChanged || workspaceChanged),
-              let document = pdfDocument, let coreDocument,
-              document.pageCount > 0, coreDocument.numberOfPages > 0 else {
+        guard (gapChanged || workspaceChanged), renderPageCount > 0 else {
             mountWorkingSet(around: max(0, currentPageIndex))
             return
         }
@@ -187,7 +202,7 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         isRebuildingPageLayout = true
         unmountAllPages()
         setZoomScale(1, animated: false)
-        buildPageLayout(pageCount: min(document.pageCount, coreDocument.numberOfPages))
+        buildPageLayout(pageCount: renderPageCount)
         currentPageIndex = min(target, max(0, workspaceFrames.count - 1))
         model.setCurrentPage(index: currentPageIndex)
         let restoredZoomScale = min(maximumZoomScale, max(minimumZoomScale, preservedZoomScale))
@@ -228,11 +243,13 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         pdfDocument = document
         self.sourceURL = sourceURL
         coreDocument = sourceURL.flatMap { CGPDFDocument($0 as CFURL) }
+        pagePDFURLs = model.pdfPageURLs
+        pageDocuments.removeAll()
         workspaceFrames.removeAll(keepingCapacity: false)
         pdfFrames.removeAll(keepingCapacity: false)
         currentPageIndex = -1
 
-        guard let document, let coreDocument, document.pageCount > 0, coreDocument.numberOfPages > 0 else {
+        guard renderPageCount > 0 else {
             documentView.frame = .zero
             contentSize = .zero
             model.setCurrentPage(index: -1)
@@ -240,7 +257,7 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
             return
         }
 
-        buildPageLayout(pageCount: min(document.pageCount, coreDocument.numberOfPages))
+        buildPageLayout(pageCount: renderPageCount)
         let requestedPage = min(
             max(0, model.currentPageNumber - 1),
             max(0, workspaceFrames.count - 1)
@@ -366,6 +383,10 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         pageSizes.reserveCapacity(pageCount)
 
         for index in 0..<pageCount {
+            if !pagePDFURLs.isEmpty, let source = model.sourcePageInfo(at: index) {
+                pageSizes.append(CGSize(width: source.width, height: source.height))
+                continue
+            }
             guard let page = coreDocument?.page(at: index + 1) else {
                 pageSizes.append(CGSize(width: 612, height: 792))
                 continue
@@ -505,7 +526,7 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
         }
 
         for index in desired.sorted() where mountedPages[index] == nil {
-            guard let corePage = coreDocument?.page(at: index + 1), model.pageInfo(at: index) != nil else { continue }
+            guard let corePage = corePage(at: index), model.pageInfo(at: index) != nil else { continue }
             let page = VectorPDFPageContainer(
                 pageIndex: index,
                 pdfPage: corePage,
@@ -519,6 +540,8 @@ final class VectorPDFScrollView: UIScrollView, UIScrollViewDelegate {
             mountedPages[index] = page
             model.pageDidMount(index)
         }
+        let retainedURLs = Set(desired.compactMap { pagePDFURLs.indices.contains($0) ? pagePDFURLs[$0] : nil })
+        pageDocuments = pageDocuments.filter { retainedURLs.contains($0.key) }
     }
 
     private func updateMountedInkScales(settle: Bool) {

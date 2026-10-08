@@ -768,6 +768,7 @@
     const websocketUrl = new URL(`${protocol}//${location.host}/ws`);
     websocketUrl.searchParams.set("role", mode === "ipad" ? "ipad" : "desktop");
     websocketUrl.searchParams.set("clientId", clientId);
+    websocketUrl.searchParams.set("pageLayoutVersion", "1");
     socket = new WebSocket(websocketUrl);
     socket.binaryType = "arraybuffer";
     setStatus("Connecting…");
@@ -887,6 +888,23 @@
         }
         break;
       }
+      case "page_layout": {
+        if (JSON.stringify(state.document) === JSON.stringify(message.document)) break;
+        if (JSON.stringify(state.document.pages) !== JSON.stringify(message.previousPages)) {
+          send({ type: "sync_request" });
+          break;
+        }
+        if (state.textEdit) cancelTextEdit();
+        state.strokes = InfiniteNotesPageLayout.reflow(state.strokes, message.previousPages,
+          message.document.pages, message.pageIdMap);
+        clearSelection(false);
+        setDocument(message.document, { preserveView: true });
+        if (message.focusPageNumber) fitPageNumber(message.focusPageNumber);
+        markIpadStateDirty();
+        markAllDirty();
+        showToast(message.notice || "Pages updated");
+        break;
+      }
       case "document_changed":
         if (state.textEdit) cancelTextEdit();
         setDocument(message.document);
@@ -1003,8 +1021,14 @@
     nameEl.textContent = state.document.filename || "No PDF loaded";
     if (addPageButton) addPageButton.disabled = !(state.document.pages?.length);
     if (pdfExportButton) pdfExportButton.disabled = !(state.document.pages?.length);
-    state.images.clear();
+    const previousImages = state.images;
+    state.images = new Map();
     for (const page of state.document.pages || []) {
+      const existing = previousImages.get(page.id);
+      if (existing?.getAttribute("src") === page.imageUrl) {
+        state.images.set(page.id, existing);
+        continue;
+      }
       const image = new Image();
       image.decoding = "async";
       image.addEventListener("load", markAllDirty);
@@ -2223,6 +2247,7 @@
     }
     const page = state.document.pages[pageIndex];
     stroke.pageIndex = pageIndex;
+    stroke.pageId = page.id;
     stroke.points = stroke.points.map(point => ({
       ...point,
       x_local: point.x - page.x,
@@ -5053,7 +5078,8 @@
       const response = await fetch("/api/pages/append", { method: "POST" });
       const data = await response.json();
       if (!response.ok) throw new Error(data.detail || "Could not add page");
-      setDocument(data.document);
+      if (data.type === "page_layout") handleServerMessage(data);
+      else setDocument(data.document);
       markIpadStateDirty();
       fitPageNumber(data.pageNumber);
       showToast(`Blank page ${data.pageNumber} added`);

@@ -1,5 +1,6 @@
 import copy
 import asyncio
+import json
 import sys
 import threading
 import time
@@ -617,11 +618,12 @@ def test_project_import_renders_embedded_pdf(monkeypatch, tmp_path):
     assert restored["document"]["filename"] == "restored.pdf"
     assert len(restored["document"]["pages"]) == 1
     assert server.CURRENT_PDF.read_bytes() == pdf_content
-    preview = server.PDF_PAGES_DIR / "page-0001.svg"
+    from urllib.parse import urlsplit
+    preview = server.PDF_PAGES_DIR / Path(urlsplit(restored["document"]["pages"][0]["imageUrl"]).path).name
     assert preview.exists()
     assert "<svg" in preview.read_text(encoding="utf-8")[:1000]
     assert not (server.PDF_PAGES_DIR / "page-0001.png").exists()
-    assert restored["document"]["pages"][0]["imageUrl"].split("?", 1)[0].endswith("/page-0001.svg")
+    assert restored["document"]["pages"][0]["imageUrl"].split("?", 1)[0].endswith("/" + preview.name)
 
 
 def test_project_import_rejects_wrong_format(monkeypatch, tmp_path):
@@ -740,6 +742,469 @@ def test_append_page_requires_pdf(monkeypatch, tmp_path):
     response = client.post("/api/pages/append")
     assert response.status_code == 400
     assert "Open a PDF" in response.json()["detail"]
+
+
+def test_insert_copy_duplicates_pdf_page_but_not_ink(monkeypatch, tmp_path):
+    import fitz
+
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    document = fitz.open()
+    first = document.new_page(width=320, height=480)
+    first.insert_text((30, 40), "Printed PDF content")
+    document.new_page(width=400, height=500)
+    server.CURRENT_PDF.write_bytes(document.tobytes())
+    document.close()
+    state["document"] = {"filename": "notes.pdf", "pages": [
+        {"id": "page-1", "pageNumber": 1, "x": 0, "y": 0, "width": 320, "height": 480},
+        {"id": "page-2", "pageNumber": 2, "x": 0, "y": 480, "width": 400, "height": 500},
+    ]}
+    state["strokes"] = {"ink": {"id": "ink", "points": [{"x": 40, "y": 50}]}}
+
+    response = TestClient(app).post("/api/pages/insert?afterPageNumber=1&kind=copy")
+    assert response.status_code == 200, response.text
+    assert response.json()["pageNumber"] == 2
+    assert len(state["strokes"]) == 1
+    assert state["strokes"]["ink"]["points"][0]["y"] == 50
+    result = fitz.open(server.CURRENT_PDF)
+    try:
+        assert result.page_count == 3
+        assert "Printed PDF content" in result[0].get_text()
+        assert "Printed PDF content" in result[1].get_text()
+        assert result[1].rect == result[0].rect
+    finally:
+        result.close()
+
+
+def test_insert_template_uses_current_page_size_and_vector_lines(monkeypatch, tmp_path):
+    import fitz
+    from page_templates import save_preset
+
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    document = fitz.open()
+    document.new_page(width=317, height=499)
+    server.CURRENT_PDF.write_bytes(document.tobytes())
+    document.close()
+    state["document"] = {"filename": "notes.pdf", "pages": [
+        {"id": "page-1", "pageNumber": 1, "x": 0, "y": 0, "width": 317, "height": 499},
+    ]}
+    save_preset({"id": "science", "name": "Science grid", "style": "eng"}, server.DATA_DIR)
+    client = TestClient(app)
+    listed = client.get("/api/page-templates")
+    assert listed.status_code == 200
+    assert any(item["id"] == "science" for item in listed.json()["presets"])
+    response = client.post("/api/pages/insert?afterPageNumber=1&kind=template&presetId=science")
+    assert response.status_code == 200, response.text
+    result = fitz.open(server.CURRENT_PDF)
+    try:
+        page = result[1]
+        assert page.rect.width == 317
+        assert page.rect.height == 499
+        assert page.get_images(full=True) == []
+        assert page.get_drawings()
+    finally:
+        result.close()
+
+
+def test_append_copy_uses_selected_reference_page_not_last(monkeypatch, tmp_path):
+    import fitz
+
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    document = fitz.open()
+    document.new_page(width=317, height=499).insert_text((30, 40), "Selected page")
+    document.new_page(width=400, height=600)
+    server.CURRENT_PDF.write_bytes(document.tobytes())
+    document.close()
+    state["document"] = {"filename": "notes.pdf", "pages": [
+        {"id": "page-1", "pageNumber": 1, "x": 0, "y": 0, "width": 317, "height": 499},
+        {"id": "page-2", "pageNumber": 2, "x": 0, "y": 499, "width": 400, "height": 600},
+    ]}
+    response = TestClient(app).post("/api/pages/append?kind=copy&referencePageNumber=1")
+    assert response.status_code == 200, response.text
+    result = fitz.open(server.CURRENT_PDF)
+    try:
+        assert result.page_count == 3
+        assert result[2].rect.width == 317
+        assert "Selected page" in result[2].get_text()
+    finally:
+        result.close()
+
+
+def test_missing_template_does_not_change_document(monkeypatch, tmp_path):
+    import fitz
+
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    document = fitz.open()
+    document.new_page(width=317, height=499)
+    original_bytes = document.tobytes()
+    server.CURRENT_PDF.write_bytes(original_bytes)
+    document.close()
+    state["document"] = {"filename": "notes.pdf", "pages": [
+        {"id": "page-1", "pageNumber": 1, "x": 0, "y": 0, "width": 317, "height": 499},
+    ]}
+    response = TestClient(app).post("/api/pages/insert?afterPageNumber=1&kind=template&presetId=missing")
+    assert response.status_code == 404
+    assert server.CURRENT_PDF.read_bytes() == original_bytes
+    assert len(state["document"]["pages"]) == 1
+
+
+def prepare_page_management_test(monkeypatch, tmp_path):
+    import fitz
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    document = fitz.open()
+    for height in (150, 200, 300):
+        document.new_page(width=200, height=height)
+    server.CURRENT_PDF.write_bytes(document.tobytes())
+    document.close()
+    state["document"] = {"filename": "pages.pdf", "pages": [
+        {"id": "page-1", "pageNumber": 1, "x": 0, "y": 0, "width": 200, "height": 150},
+        {"id": "page-2", "pageNumber": 2, "x": 0, "y": 150, "width": 200, "height": 200},
+        {"id": "page-3", "pageNumber": 3, "x": 0, "y": 350, "width": 200, "height": 300},
+    ]}
+    state["strokes"] = {
+        name: {"id": name, "pageIndex": index, "points": [{"x": 20, "y": y, "y_raw": y}]}
+        for name, index, y in (("first", 0, 20), ("middle", 1, 170), ("last", 2, 370))
+    }
+    history[:] = [{"type": "add", "strokes": [copy.deepcopy(stroke)]} for stroke in state["strokes"].values()]
+    redo_history[:] = [{"type": "delete", "strokes": [copy.deepcopy(state["strokes"]["last"])]}]
+
+
+def test_inserting_custom_size_keeps_and_remaps_ink_history(monkeypatch, tmp_path):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    response = TestClient(app).post("/api/pages/insert?afterPageNumber=1", json={
+        "useCurrentSize": False, "pageWidthPt": 400, "pageHeightPt": 180,
+    })
+    assert response.status_code == 200, response.text
+    assert len(history) == 4 and history[-1]["type"] == "page"
+    assert state["document"]["pages"][1]["width"] == 400
+    assert state["document"]["pages"][1]["height"] == 180
+    assert history[-2]["strokes"][0]["coordinateSpace"] == "page-local"
+    assert history[-2]["strokes"][0]["points"][0]["y"] == 20
+    assert redo_history == []  # a new page operation starts a new history branch
+    action = history[-2]
+    server.apply_history_action(action, undo=True)
+    assert "last" not in state["strokes"]
+    server.apply_history_action(action, undo=False)
+    assert state["strokes"]["last"]["points"][0]["y"] == 550
+
+
+def test_delete_page_removes_its_ink_and_remaps_remaining_history(monkeypatch, tmp_path):
+    import fitz
+    prepare_page_management_test(monkeypatch, tmp_path)
+    response = TestClient(app).post("/api/pages/delete?pageNumber=2")
+    assert response.status_code == 200, response.text
+    assert "middle" not in state["strokes"]
+    assert state["strokes"]["last"]["points"][0]["y"] == 170
+    assert state["strokes"]["last"]["pageIndex"] == 1
+    assert len(history) == 4 and history[-1]["type"] == "page"
+    assert history[-2]["strokes"][0]["points"][0]["y"] == 20
+    assert history[-1]["deletedInk"][0]["id"] == "middle"
+    assert redo_history == []
+    document = fitz.open(server.CURRENT_PDF)
+    try:
+        assert document.page_count == 2
+        assert document[1].rect.height == 300
+    finally:
+        document.close()
+
+
+def test_delete_last_page_is_rejected(monkeypatch, tmp_path):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    client = TestClient(app)
+    assert client.post("/api/pages/delete?pageNumber=3").status_code == 200
+    assert client.post("/api/pages/delete?pageNumber=2").status_code == 200
+    assert client.post("/api/pages/delete?pageNumber=1").status_code == 400
+    assert len(state["document"]["pages"]) == 1
+
+
+def test_delete_page_preserves_both_halves_and_earlier_history_of_cross_page_moves(monkeypatch, tmp_path):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    before = copy.deepcopy(state["strokes"]["middle"])
+    after = copy.deepcopy(before)
+    after["pageIndex"] = 2
+    after["points"][0]["y"] = after["points"][0]["y_raw"] = 390
+    state["strokes"]["middle"] = after
+    history.append({"type": "replace", "before": [before], "after": [after]})
+    redo_history.append({"type": "add", "strokes": [copy.deepcopy(after)]})
+    response = TestClient(app).post("/api/pages/delete?pageNumber=2")
+    assert response.status_code == 200, response.text
+    assert state["strokes"]["middle"]["points"][0]["y"] == 190
+    replace = history[-2]
+    assert replace["type"] == "replace"
+    assert replace["before"][0]["pageId"] != replace["after"][0]["pageId"]
+    assert replace["before"][0]["points"][0]["y"] == 20
+    assert replace["after"][0]["points"][0]["y"] == 40
+    assert history[1]["strokes"][0]["id"] == "middle"
+    assert redo_history == []
+
+
+def test_invalid_custom_template_leaves_pdf_and_history_unchanged(monkeypatch, tmp_path):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    original_pdf = server.CURRENT_PDF.read_bytes()
+    original_history = copy.deepcopy(history)
+    response = TestClient(app).post("/api/pages/insert?afterPageNumber=1&kind=template", json={
+        "template": {"id": "bad", "name": "Bad", "minorWidthMm": -1},
+    })
+    assert response.status_code == 422, response.text
+    assert server.CURRENT_PDF.read_bytes() == original_pdf
+    assert history == original_history
+
+
+@pytest.mark.parametrize("operation, expected_y", [("insert", 520), ("delete", 170)])
+def test_page_changes_remap_unfinished_eraser_history(monkeypatch, tmp_path, operation, expected_y):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    pending_delete_operations["erase"] = {
+        "updatedAt": time.monotonic(), "strokes": copy.deepcopy(state["strokes"]),
+    }
+    path = "/api/pages/insert?afterPageNumber=1" if operation == "insert" else "/api/pages/delete?pageNumber=2"
+    response = TestClient(app).post(path)
+    assert response.status_code == 200, response.text
+    grouped = pending_delete_operations["erase"]["strokes"]
+    assert grouped["last"]["points"][0]["y"] == expected_y
+    if operation == "delete":
+        assert "middle" not in grouped
+
+
+def test_custom_template_can_be_saved_and_inserted_with_combined_vector_patterns(monkeypatch, tmp_path):
+    import fitz
+    prepare_page_management_test(monkeypatch, tmp_path)
+    preset = {"id": "custom", "name": "Custom", "style": "eng", "title": "Study",
+              "headerCm": 1.2, "background": "#eeeedd", "minorLinesEnabled": False,
+              "majorLinesEnabled": True, "dotsEnabled": True, "dotSpacingCm": 0.5}
+    client = TestClient(app)
+    assert client.post("/api/page-templates", json=preset).status_code == 200
+    listed = client.get("/api/page-templates").json()["presets"]
+    assert next(item for item in listed if item["id"] == "custom")["minorLinesEnabled"] is False
+    response = client.post("/api/pages/append?kind=template&referencePageNumber=1", json={
+        "useCurrentSize": False, "pageWidthPt": 612, "pageHeightPt": 792, "template": preset,
+    })
+    assert response.status_code == 200, response.text
+    document = fitz.open(server.CURRENT_PDF)
+    try:
+        page = document[-1]
+        assert page.rect.width == 612
+        assert page.rect.height == 792
+        assert "Study" in page.get_text()
+        assert len(page.get_drawings()) == 3  # background, major grid, dots
+        assert page.get_images(full=True) == []
+    finally:
+        document.close()
+
+
+def test_page_layout_keeps_surviving_database_rows_and_assets_unchanged(monkeypatch, tmp_path):
+    import fitz
+    rendered = []
+    render_svg = fitz.Page.get_svg_image
+    def count_render(page, *args, **kwargs):
+        rendered.append(page.number)
+        return render_svg(page, *args, **kwargs)
+    monkeypatch.setattr(fitz.Page, "get_svg_image", count_render)
+    prepare_page_management_test(monkeypatch, tmp_path)
+    original = copy.deepcopy(state)
+    server.notebook_store.commit(upserts=state["strokes"], deletes=set(),
+                                metadata={key: value for key, value in state.items() if key != "strokes"})
+    original_rows = dict(server.notebook_store.connection.execute("SELECT id,value FROM strokes"))
+    client = TestClient(app)
+    first = client.post("/api/pages/insert?afterPageNumber=1")
+    assert first.status_code == 200, first.text
+    migrated = dict(server.notebook_store.connection.execute("SELECT id,value FROM strokes"))
+    local_last = json.loads(migrated["last"])
+    assert local_last["coordinateSpace"] == "page-local"
+    assert local_last["points"][0]["y"] == 20
+    assert "pageIndex" not in local_last
+    identities = [page["id"] for page in state["document"]["pages"]]
+    assets = {page["id"]: page["imageUrl"] for page in state["document"]["pages"]}
+    rendered.clear()
+    statements = []
+    server.notebook_store.connection.set_trace_callback(statements.append)
+    second = client.post("/api/pages/insert?afterPageNumber=1")
+    assert second.status_code == 200, second.text
+    assert len(rendered) == 1  # only the new page, not the existing PDF pages
+    assert dict(server.notebook_store.connection.execute("SELECT id,value FROM strokes")) == migrated
+    assert not any("INSERT INTO strokes" in sql or "DELETE FROM strokes" in sql for sql in statements)
+    assert [p["id"] for p in state["document"]["pages"] if p["id"] in identities] == identities
+    for page in state["document"]["pages"]:
+        if page["id"] in assets:
+            assert page["imageUrl"] == assets[page["id"]]
+    server.notebook_store.connection.set_trace_callback(None)
+    rendered.clear()
+    deleted = client.post("/api/pages/delete?pageNumber=4")  # original middle page
+    assert deleted.status_code == 200, deleted.text
+    assert rendered == []
+    final_rows = dict(server.notebook_store.connection.execute("SELECT id,value FROM strokes"))
+    assert final_rows == {key: value for key, value in migrated.items() if key != "middle"}
+    restored = server.notebook_store.load()
+    assert restored["strokes"] == state["strokes"]
+    backup = dict(server.notebook_store.connection.execute(
+        "SELECT id,value FROM page_identity_backup WHERE kind='stroke' AND document_id=?", (original["documentId"],)))
+    assert backup == original_rows
+
+
+def test_page_pdf_upgrade_reuses_survivors_and_transfers_only_inserted_page(monkeypatch, tmp_path):
+    import hashlib
+    import fitz
+    prepare_page_management_test(monkeypatch, tmp_path)
+    # Real imported notebooks already have generation-specific preview URLs;
+    # the page-management fixture starts with bare geometry metadata instead.
+    for page in state["document"]["pages"]:
+        page["imageUrl"] = f'/pdf-pages/page-{page["id"]}.svg?v=legacy-test'
+    original = copy.deepcopy(state)
+    extracted = []
+    extract = server.extract_page
+    def track(document, index):
+        extracted.append(index)
+        return extract(document, index)
+    monkeypatch.setattr(server, "extract_page", track)
+    client = TestClient(app)
+    assert client.get("/api/pdf/pages?documentId=another-notebook").status_code == 409
+    response = client.get("/api/pdf/pages", params={"documentId": state["documentId"]})
+    assert response.status_code == 200, response.text
+    manifest = response.json()["pages"]
+    assert len(manifest) == 3 and len(extracted) == 3
+    assert state == original  # lazy background upgrade never mutates ink/revisions
+    cache = set()
+    original_mtimes = {}
+    for page in manifest:
+        resource = client.get(page["pdfUrl"])
+        assert resource.status_code == 200
+        assert resource.headers["content-type"] == "application/pdf"
+        assert resource.headers["cache-control"].endswith("immutable")
+        assert len(resource.content) == page["pdfBytes"]
+        assert hashlib.sha256(resource.content).hexdigest() == page["pdfSha256"]
+        with fitz.open(stream=resource.content, filetype="pdf") as single:
+            assert single.page_count == 1
+            assert single[0].rect.width == page["width"] and single[0].rect.height == page["height"]
+        cache.add(page["pdfSha256"])
+        path = server.asset_path(server.PDF_PAGES_DIR, page["pdfSha256"])
+        original_mtimes[path] = path.stat().st_mtime_ns
+    extracted.clear()
+    assert client.get("/api/pdf/pages", params={"documentId": state["documentId"]}).json()["pages"] == manifest
+    assert extracted == []
+    assert all(path.stat().st_mtime_ns == before for path, before in original_mtimes.items())
+    inserted = client.post("/api/pages/insert?afterPageNumber=1&kind=template&presetId=square-grid")
+    assert inserted.status_code == 200, inserted.text
+    assert len(extracted) == 1
+    inserted_pages = inserted.json()["document"]["pages"]
+    missing = [page for page in inserted_pages if page["pdfSha256"] not in cache]
+    assert len(missing) == 1
+    assert sum(page["pdfBytes"] for page in missing) < server.CURRENT_PDF.stat().st_size
+    assert {page["pdfSha256"] for page in inserted_pages} >= cache
+    cache.update(page["pdfSha256"] for page in missing)
+    extracted.clear()
+    deleted = client.post("/api/pages/delete?pageNumber=2")
+    assert deleted.status_code == 200, deleted.text
+    assert extracted == []
+    assert all(page["pdfSha256"] in cache for page in deleted.json()["document"]["pages"])
+    # Combined-PDF compatibility/export source remains available.
+    assert client.get("/api/pdf/source").status_code == 200
+    assert client.get("/api/pdf/page/not-a-hash").status_code == 400
+    assert client.get("/api/pdf/page/" + "0" * 64).status_code == 404
+
+
+def test_large_page_layout_broadcast_contains_no_ink(monkeypatch, tmp_path):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    state["strokes"] = {
+        f"ink-{i}": {"id": f"ink-{i}", "pageIndex": 2, "points": [
+            {"x": j * 0.1, "y": 370 + j * 0.1, "p": 0.5, "t": j} for j in range(80)
+        ]} for i in range(2400)
+    }
+    history.clear(); redo_history.clear()
+    messages = []
+    async def capture(message, **kwargs):
+        messages.append(copy.deepcopy(message))
+    monkeypatch.setattr(server, "broadcast", capture)
+    with TestClient(app) as client:
+        assert client.post("/api/pages/insert?afterPageNumber=1").status_code == 200
+        messages.clear()
+        started = time.perf_counter()
+        response = client.post("/api/pages/insert?afterPageNumber=1")
+        elapsed = time.perf_counter() - started
+    assert response.status_code == 200, response.text
+    assert [message["type"] for message in messages] == ["page_layout", "history_state"]
+    assert "strokes" not in response.json()
+    assert len(response.content) < 10_000
+    assert len(state["strokes"]) == 2400
+    assert server.notebook_store.load()["strokes"]["ink-0"]["points"][0]["y"] == 670
+    print(f"2400 strokes / 192000 points: layout event {len(response.content)} bytes, server operation {elapsed:.3f}s")
+
+
+def test_migrated_project_export_import_retains_page_ownership(monkeypatch, tmp_path):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    client = TestClient(app)
+    assert client.post("/api/pages/insert?afterPageNumber=1").status_code == 200
+    # Fill normal wire defaults so the test exercises the real project sanitizer.
+    original_y = state["strokes"]["last"]["points"][0]["y"]
+    archive = client.get("/api/project/export")
+    assert archive.status_code == 200
+    response = client.post("/api/project/import", files={"file": ("roundtrip.inotes", archive.content, "application/zip")})
+    assert response.status_code == 200, response.text
+    stroke = state["strokes"]["last"]
+    assert stroke["points"][0]["y"] == original_y
+    assert stroke["pageId"] == state["document"]["pages"][stroke["pageIndex"]]["id"]
+    assert client.post("/api/pages/delete?pageNumber=2").status_code == 200
+    assert state["strokes"]["last"]["points"][0]["y"] == 370
+
+
+def test_page_layout_is_one_identical_event_for_native_browser_and_http(monkeypatch, tmp_path):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws?role=ipad&clientId=native-layout-test&pageLayoutVersion=1") as ipad:
+            assert ipad.receive_json()["type"] == "state_refresh"
+            assert ipad.receive_json()["type"] == "history_state"
+            with client.websocket_connect("/ws?role=desktop&pageLayoutVersion=1") as desktop:
+                assert desktop.receive_json()["type"] == "snapshot"
+                assert desktop.receive_json()["type"] == "history_state"
+                for path in ("/api/pages/insert?afterPageNumber=1", "/api/pages/delete?pageNumber=2"):
+                    response = client.post(path)
+                    assert response.status_code == 200, response.text
+                    for socket in (ipad, desktop):
+                        message = socket.receive_json()
+                        assert message == response.json()
+                        assert message["type"] == "page_layout"
+                        assert "strokes" not in message
+                        assert socket.receive_json()["type"] == "history_state"
+                        socket.send_json({"type": "ping", "clientTime": 123})
+                        assert socket.receive_json()["type"] == "pong"  # no queued replacement ink or refresh
+
+
+def test_legacy_offline_page_id_reconciles_locally_and_deleted_page_is_rejected(monkeypatch, tmp_path):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    raw = {**copy.deepcopy(state["strokes"]["last"]), "pageId": "page-3"}
+    raw["points"][0]["x_local"] = 20
+    raw["points"][0]["y_local"] = 20
+    client = TestClient(app)
+    assert client.post("/api/pages/insert?afterPageNumber=1").status_code == 200
+    recovered = server.sanitize_live_stroke(raw)
+    assert recovered["pageIndex"] == 3
+    assert recovered["pageId"] == state["document"]["pages"][3]["id"]
+    assert recovered["points"][0]["y"] == 520
+    assert client.post("/api/pages/delete?pageNumber=4").status_code == 200
+    with pytest.raises(ValueError, match="no longer exists"):
+        server.sanitize_live_stroke(raw)
+
+
+@pytest.mark.parametrize("query, expected", [("role=ipad&clientId=native-old-layout", "state_refresh"), ("role=desktop", "snapshot")])
+def test_older_clients_receive_compatible_layout_recovery(monkeypatch, tmp_path, query, expected):
+    prepare_page_management_test(monkeypatch, tmp_path)
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws?" + query) as socket:
+            socket.receive_json(); socket.receive_json()
+            response = client.post("/api/pages/insert?afterPageNumber=1")
+            assert response.status_code == 200
+            message = socket.receive_json()
+            assert message["type"] == expected
+            assert message["reason"] == "page_layout"
+            assert socket.receive_json()["type"] == "history_state"
+            socket.send_json({"type": "ping", "clientTime": 123})
+            assert socket.receive_json()["type"] == "pong"
+
+
+@pytest.mark.parametrize("identifiers", [("../../unsafe",), ("duplicate", "duplicate")])
+def test_project_page_ids_cannot_traverse_asset_paths_or_duplicate(identifiers):
+    from fastapi import HTTPException
+    pages = [{"id": identifier, "width": 200, "height": 150} for identifier in identifiers]
+    with pytest.raises(HTTPException) as error:
+        server.sanitize_project_pages(pages)
+    assert error.value.status_code == 400
 
 
 
