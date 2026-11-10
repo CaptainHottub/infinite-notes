@@ -73,6 +73,12 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     private var activeStrokeID: String?
     private var contactTool: NoteTool?
     private var pipelineState = StrokePipelineState()
+    private var contactPipeline: StrokePipelineConfiguration?
+    private var googleInkStream: GoogleInkModel.Stream?
+    private var usesGoogleInk: Bool {
+        contactPipeline?.resolvedPenPipeline == .googleInk &&
+            (contactTool == .pressurePen || contactTool == .fixedPen)
+    }
     private var predictedPoints: [NotePoint] = []
     private var eraseOperationID: String?
     private var erasedIDs: Set<String> = []
@@ -80,6 +86,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     private var shapeGesture: ShapeGesture?
     private var selectionGesture: SelectionTransformGesture?
     private var recognitionWorkItem: DispatchWorkItem?
+    private var geometryHold = GeometryHoldTracker()
 
     private struct CommittedVectorEntry {
         var stroke: NoteStroke
@@ -598,11 +605,14 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
             if stroke.id == activeStrokeID, !predictedPoints.isEmpty {
                 renderedStroke.points.append(contentsOf: predictedPoints)
             }
+            let isGoogleContact = stroke.id == activeStrokeID && usesGoogleInk
             descriptors.append(contentsOf: StrokeRenderer.liveLayerDescriptors(
                 stroke: renderedStroke,
                 page: page,
                 viewBounds: bounds,
-                configuration: strokeConfiguration
+                configuration: strokeConfiguration,
+                useAdmittedCenterline: isGoogleContact,
+                previewSamples: isGoogleContact ? googleInkPreview(on: page) : nil
             ))
         }
 
@@ -845,7 +855,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
             updateShape(at: touch.location(in: self), page: page)
             finishShape(cancelled: false)
         case .pressurePen, .fixedPen, .highlighter:
-            finishInk(with: touch, model: model, page: page)
+            finishInk(with: touch, event: event, model: model, page: page)
         case .none:
             break
         }
@@ -985,6 +995,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     private func beginInk(with pencil: UITouch, page: PageInfo) {
         guard let model else { return }
         let configuration = model.strokeSettings.configuration
+        contactPipeline = configuration
         let sample = makeInputSample(from: pencil, page: page)
         guard sample.pressure >= configuration.pressureThreshold,
               let point = pipelineState.process(
@@ -992,14 +1003,15 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
                 page: page,
                 viewBounds: bounds,
                 configuration: configuration,
-                forceAccept: true
+                forceAccept: true,
+                useAdmittedCenterline: usesGoogleInk
               ) else { return }
-        activeStrokeID = model.beginStroke(pageIndex: pageIndex, firstPoint: point, tool: contactTool)
-        scheduleGeometryRecognitionIfNeeded()
+        activeStrokeID = model.beginStroke(pageIndex: pageIndex, firstPoint: point, tool: contactTool, configuration: configuration)
+        beginGoogleInkIfNeeded(at: point)
     }
 
     private func updateInk(with touch: UITouch, event: UIEvent?, model: AppModel, page: PageInfo) {
-        let configuration = model.strokeSettings.configuration
+        guard let configuration = contactPipeline else { return }
         if let id = activeStrokeID, let stroke = model.stroke(withID: id),
            stroke.tool == "shape", stroke.recognitionSource != nil {
             recognitionWorkItem?.cancel()
@@ -1031,23 +1043,29 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
                     page: page,
                     viewBounds: bounds,
                     configuration: configuration,
-                    forceAccept: true
+                    forceAccept: true,
+                    useAdmittedCenterline: usesGoogleInk
                 ) else { continue }
-                activeStrokeID = model.beginStroke(pageIndex: pageIndex, firstPoint: firstPoint, tool: contactTool)
+                activeStrokeID = model.beginStroke(pageIndex: pageIndex, firstPoint: firstPoint, tool: contactTool, configuration: configuration)
+                beginGoogleInkIfNeeded(at: firstPoint)
                 continue
             }
-            if let point = pipelineState.process(input, page: page, viewBounds: bounds, configuration: configuration) {
+            if let point = pipelineState.process(
+                input, page: page, viewBounds: bounds, configuration: configuration,
+                useAdmittedCenterline: usesGoogleInk
+            ) {
                 accepted.append(point)
             }
         }
         if let id = activeStrokeID, !accepted.isEmpty {
+            appendGoogleInkSamples(accepted)
             model.appendPoints(strokeID: id, points: accepted)
-            scheduleGeometryRecognitionIfNeeded()
+            scheduleGeometryRecognitionIfNeeded(after: accepted, page: page)
         }
         updatePredictedPreview(for: touch, event: event, page: page, configuration: configuration)
     }
 
-    private func finishInk(with touch: UITouch, model: AppModel, page: PageInfo) {
+    private func finishInk(with touch: UITouch, event: UIEvent?, model: AppModel, page: PageInfo) {
         recognitionWorkItem?.cancel()
         recognitionWorkItem = nil
         predictedPoints.removeAll(keepingCapacity: true)
@@ -1058,18 +1076,69 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
             model.endStroke(strokeID: id)
             return
         }
-        let configuration = model.strokeSettings.configuration
-        let input = makeInputSample(from: touch, page: page)
-        if let point = pipelineState.process(
-            input,
-            page: page,
-            viewBounds: bounds,
-            configuration: configuration,
-            forceAccept: true
-        ) {
-            model.appendPoints(strokeID: id, points: [point])
+        guard let configuration = contactPipeline else { return }
+        let coalesced = usesGoogleInk && configuration.useCoalescedTouches
+            ? event?.coalescedTouches(for: touch) ?? []
+            : []
+        let finalTouches = (coalesced + [touch]).sorted { $0.timestamp < $1.timestamp }
+        let finalPoints = finalTouches.compactMap {
+            pipelineState.process(
+                makeInputSample(from: $0, page: page),
+                page: page,
+                viewBounds: bounds,
+                configuration: configuration,
+                forceAccept: true,
+                useAdmittedCenterline: usesGoogleInk
+            )
         }
-        model.endStroke(strokeID: id)
+        appendGoogleInkSamples(finalPoints)
+        model.appendPoints(strokeID: id, points: finalPoints)
+        model.endStroke(strokeID: id, googleInkSamples: googleInkStream?.finishedSamples())
+    }
+
+    private var googleInkCoordinates: GoogleInkCoordinates? {
+        guard let sourcePage = model?.sourcePageInfo(at: pageIndex) else { return nil }
+        return GoogleInkCoordinates(sourceOrigin: sourcePage.worldRect.origin)
+    }
+
+    private func beginGoogleInkIfNeeded(at point: NotePoint) {
+        guard usesGoogleInk, activeStrokeID != nil, let coordinates = googleInkCoordinates else { return }
+        let sample = point.googleInkSample(sequence: 0, coordinates: coordinates)
+        googleInkStream = GoogleInkModel.Stream(first: sample)
+    }
+
+    private func appendGoogleInkSamples(_ points: [NotePoint]) {
+        guard googleInkStream != nil else { return }
+        guard let coordinates = googleInkCoordinates else {
+            googleInkStream = nil
+            return
+        }
+        for point in points {
+            guard let sequence = googleInkStream?.inputCount else { return }
+            let sample = point.googleInkSample(sequence: sequence, coordinates: coordinates)
+            if googleInkStream?.append(sample) != true {
+                googleInkStream = nil
+                return
+            }
+        }
+    }
+
+    private func googleInkPreview(on page: PageInfo) -> [StrokeGeometrySample]? {
+        guard let stream = googleInkStream, let coordinates = googleInkCoordinates else { return nil }
+        let tail = stream.previewTail(settle: contactPipeline?.usePredictedTouches == true)
+        guard stream.stableSamples.count + tail.count <= GoogleInkModel.maximumStrokePoints else { return nil }
+
+        let workspace = page.worldRect
+        let viewSize = bounds.size
+        var samples: [StrokeGeometrySample] = []
+        samples.reserveCapacity(stream.stableSamples.count + tail.count)
+        for sample in [stream.stableSamples, tail].joined() {
+            samples.append(StrokeGeometrySample(
+                point: coordinates.viewPoint(fromPage: sample.point, workspace: workspace, viewSize: viewSize),
+                pressure: sample.pressure
+            ))
+        }
+        return samples
     }
 
     private func beginShape(at viewPoint: CGPoint, page: PageInfo) {
@@ -1315,9 +1384,12 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
     private func finishContact() {
         recognitionWorkItem?.cancel()
         recognitionWorkItem = nil
+        geometryHold = GeometryHoldTracker()
         activeTouch = nil
         activeStrokeID = nil
         contactTool = nil
+        contactPipeline = nil
+        googleInkStream = nil
         pipelineState.reset()
         predictedPoints.removeAll(keepingCapacity: true)
         eraseOperationID = nil
@@ -1329,18 +1401,31 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         refreshLiveContent()
     }
 
-    private func scheduleGeometryRecognitionIfNeeded() {
-        recognitionWorkItem?.cancel()
-        recognitionWorkItem = nil
+    private func scheduleGeometryRecognitionIfNeeded(after points: [NotePoint], page: PageInfo) {
         guard let model, let id = activeStrokeID,
               let stroke = model.stroke(withID: id),
               stroke.points.count >= 4,
               stroke.tool == NoteTool.pressurePen.rawValue || stroke.tool == NoteTool.fixedPen.rawValue,
               model.appSettings.configuration.holdRecognitionEnabled else { return }
+
+        // Pencil continues to report samples while held still, especially
+        // with Google's unfiltered capture. Only movement resets the timer.
+        let tolerance = screenPointsToWorld(3, page: page)
+        var restart = false
+        for point in points {
+            let raw = CGPoint(x: point.xRaw, y: point.yRaw)
+            if geometryHold.shouldRestart(at: raw, movementTolerance: tolerance) {
+                restart = true
+            }
+        }
+        guard restart else { return }
+        recognitionWorkItem?.cancel()
         let delay = max(0.15, model.appSettings.configuration.recognitionHoldMS / 1000)
         let work = DispatchWorkItem { [weak self, weak model] in
             guard let self, let model, self.activeStrokeID == id else { return }
+            self.recognitionWorkItem = nil
             if model.recognizeActiveInk(strokeID: id, pageIndex: self.pageIndex) {
+                self.googleInkStream = nil
                 self.predictedPoints.removeAll(keepingCapacity: true)
                 self.performHaptic()
                 self.scheduleLiveRefresh()
@@ -1356,7 +1441,7 @@ final class InkPageView: UIView, UIGestureRecognizerDelegate {
         page: PageInfo,
         configuration: StrokePipelineConfiguration
     ) {
-        guard activeStrokeID != nil, configuration.usePredictedTouches else {
+        guard activeStrokeID != nil, !usesGoogleInk, configuration.usePredictedTouches else {
             predictedPoints.removeAll(keepingCapacity: true)
             scheduleLiveRefresh()
             return

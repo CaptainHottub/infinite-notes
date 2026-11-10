@@ -1261,11 +1261,13 @@
 
   function smoothedScreenSamples(stroke) {
     const points = stroke.points || [];
-    if (!points.length) return [];
-    if (points.length === 1) {
-      const p = worldToScreen(points[0].x, points[0].y);
-      return [{ ...p, pressure: points[0].p }];
+    if (points.length === 1 || stroke.pipeline?.centerlineModel === "google-ink-v1") {
+      return points.map(point => ({
+        ...worldToScreen(point.x, point.y),
+        pressure: point.p,
+      }));
     }
+    if (!points.length) return [];
 
     const samples = [];
     for (let i = 0; i < points.length - 1; i++) {

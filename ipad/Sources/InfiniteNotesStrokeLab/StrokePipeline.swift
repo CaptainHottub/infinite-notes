@@ -113,9 +113,27 @@ struct StrokePipelineState {
         page: PageInfo,
         viewBounds: CGRect,
         configuration: StrokePipelineConfiguration,
-        forceAccept: Bool = false
+        forceAccept: Bool = false,
+        useAdmittedCenterline: Bool = false
     ) -> NotePoint? {
         guard viewBounds.width > 0, viewBounds.height > 0 else { return nil }
+        if useAdmittedCenterline {
+            guard sample.timestampMS.isFinite,
+                  previousTimestampMS.map({ sample.timestampMS > $0 }) ?? true else { return nil }
+            previousTimestampMS = sample.timestampMS
+            return NotePoint(
+                x: Double(sample.rawWorldPoint.x),
+                y: Double(sample.rawWorldPoint.y),
+                p: sample.pressure,
+                t: sample.timestampMS,
+                xLocal: Double(sample.rawPagePoint.x),
+                yLocal: Double(sample.rawPagePoint.y),
+                xRawLocal: Double(sample.rawPagePoint.x),
+                yRawLocal: Double(sample.rawPagePoint.y),
+                altitude: sample.altitude,
+                azimuth: sample.azimuth
+            )
+        }
 
         let filteredViewPoint = filterPosition(sample, configuration: configuration)
         let filteredPressure = filterPressure(sample.pressure, configuration: configuration)
@@ -266,15 +284,12 @@ enum StrokeGeometryBuilder {
         stroke: NoteStroke,
         page: PageInfo,
         bounds: CGRect,
-        fallback: StrokePipelineConfiguration
+        fallback: StrokePipelineConfiguration,
+        useAdmittedCenterline: Bool = false
     ) -> [StrokeGeometrySample] {
-        let source = stroke.points.map {
-            StrokeGeometrySample(
-                point: StrokeCoordinates.filteredViewPoint($0, stroke: stroke, page: page, bounds: bounds),
-                pressure: $0.p
-            )
-        }
-        guard source.count > 1 else { return source }
+        let source = filteredSamples(stroke: stroke, page: page, bounds: bounds)
+        guard source.count > 1, !useAdmittedCenterline,
+              stroke.pipeline?.hasGoogleInkCenterline != true else { return source }
         let settings = stroke.pipeline ?? .legacy(smoothing: stroke.smoothing)
 
         let resampled = settings.resamplingEnabled

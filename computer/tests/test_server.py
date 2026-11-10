@@ -2158,3 +2158,98 @@ def test_desktop_picker_cancel_preserves_notebook_and_destination(monkeypatch, t
         assert response.json() == {'cancelled': True}
     assert state == before
     assert local_files.get_origin(server.DATA_DIR, server.current_document_id()) == tmp_path
+
+
+@pytest.mark.parametrize("delivery", ["streamed", "final-only", "reconcile"])
+def test_google_ink_final_centerline_survives_sync_save_and_pdf(monkeypatch, tmp_path, delivery):
+    import pymupdf
+
+    configure_temp_document_paths(monkeypatch, tmp_path)
+    with pymupdf.open() as pdf:
+        pdf.new_page(width=300, height=300)
+        pdf.save(server.CURRENT_PDF)
+    state["document"] = {"filename": "google-ink.pdf", "pages": [{
+        "id": "page-1", "pageNumber": 1, "x": 0, "y": 100,
+        "width": 300, "height": 300, "imageUrl": "/pdf-pages/page-1.png",
+    }]}
+    final = {
+        "id": "google-ink", "owner": "ipad", "tool": "fixed-pen",
+        "pageId": "page-1", "color": "#111111", "width": 3, "opacity": 1,
+        "pipeline": {"centerlineModel": "google-ink-v1"},
+        "points": [
+            {"x": 20, "y": 20, "x_local": 20, "y_local": 20, "p": 0.2, "t": 1},
+            {"x": 60, "y": 90, "x_local": 60, "y_local": 90, "p": 0.8, "t": 5},
+            {"x": 90, "y": 50, "x_local": 90, "y_local": 50, "p": 0.4, "t": 9},
+        ],
+    }
+    for point in final["points"]:
+        point.update(
+            x_raw=point["x"] - 4, y_raw=point["y"],
+            x_raw_local=point["x_local"] - 4, y_raw_local=point["y_local"],
+        )
+    live = {**final, "pipeline": None, "points": final["points"][:1]}
+    # Start from a partial live trace, then send the final replacement. The
+    # final-only case covers the server missing the live frames entirely.
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws") as browser, \
+             client.websocket_connect("/ws?role=ipad&clientId=native-google-reader") as ipad, \
+             client.websocket_connect("/ws?role=ipad&clientId=native-google-writer") as writer:
+            for socket, first_message in [(browser, "snapshot"), (ipad, "state_refresh"), (writer, "state_refresh")]:
+                assert socket.receive_json()["type"] == first_message
+                assert socket.receive_json()["type"] == "history_state"
+            if delivery in {"streamed", "reconcile"}:
+                writer.send_json({"type": "stroke_begin", "stroke": live})
+                for reader in (browser, ipad):
+                    assert reader.receive_json()["type"] == "stroke_begin"
+                writer.send_json({"type": "stroke_points", "id": final["id"], "points": [
+                    {"x": 80, "y": 110, "p": 1, "t": 3},
+                ]})
+                for reader in (browser, ipad):
+                    assert reader.receive_json()["type"] == "stroke_points"
+            if delivery == "reconcile":
+                writer.send_json({"type": "reconcile_strokes", "strokes": [final]})
+                assert writer.receive_json()["type"] == "reconcile_ack"
+            else:
+                writer.send_json({"type": "stroke_end", "id": final["id"], "stroke": final})
+
+            for reader in (browser, ipad):
+                replacement = reader.receive_json()
+                assert replacement["type"] == ("restore_strokes" if delivery == "final-only" else "replace_strokes")
+                stroke, = replacement["strokes"]
+                assert stroke["pipeline"]["centerlineModel"] == "google-ink-v1"
+                assert stroke["pageId"] == "page-1"
+                assert [(p["x"], p["y"], p["p"], p["t"]) for p in stroke["points"]] == [
+                    (20, 120, 0.2, 1), (60, 190, 0.8, 5), (90, 150, 0.4, 9),
+                ]
+                if delivery != "reconcile":
+                    assert reader.receive_json() == {"type": "stroke_end", "id": final["id"]}
+
+            assert writer.receive_json()["type"] == "history_state"
+            if delivery != "reconcile":
+                ack = writer.receive_json()
+                assert ack["type"] == "stroke_ack"
+                assert ack["pointCount"] == 3
+
+            writer.send_json({"type": "undo"})
+            assert writer.receive_json() == {"type": "delete_strokes", "ids": [final["id"]]}
+            assert writer.receive_json()["type"] == "history_state"
+            writer.send_json({"type": "redo"})
+            restored = writer.receive_json()
+            assert restored["type"] == "restore_strokes"
+            assert restored["strokes"][0]["pipeline"] == stroke["pipeline"]
+            assert restored["strokes"][0]["points"] == stroke["points"]
+            assert writer.receive_json()["type"] == "history_state"
+
+        saved = server.notebook_store.load()["strokes"]
+        assert saved == {final["id"]: stroke}
+        assert client.get("/api/state").json()["strokes"] == saved
+        response = client.get("/api/pdf/export")
+        assert response.status_code == 200
+        with pymupdf.open(stream=response.content, filetype="pdf") as exported:
+            segments = [
+                (tuple(start), tuple(end))
+                for drawing in exported[0].get_drawings()
+                for kind, start, end in drawing["items"]
+                if kind == "l"
+            ]
+            assert segments == [((20, 20), (60, 90)), ((60, 90), (90, 50))]

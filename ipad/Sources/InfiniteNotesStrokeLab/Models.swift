@@ -229,7 +229,16 @@ enum SplineAlgorithm: String, CaseIterable, Identifiable, Codable {
     }
 }
 
+enum PenPipeline: String, Codable {
+    case infiniteNotes
+    case googleInk
+}
+
 struct StrokePipelineConfiguration: Codable, Equatable {
+    var penPipeline: PenPipeline?
+
+    var resolvedPenPipeline: PenPipeline { penPipeline ?? .infiniteNotes }
+
     // Capture
     var useCoalescedTouches = true
     var usePredictedTouches = true
@@ -303,6 +312,11 @@ struct StrokePipelineConfiguration: Codable, Equatable {
 /// Appearance-affecting settings stored with each new stroke. This keeps old
 /// strokes visually stable when the global pipeline settings are changed later.
 struct StrokePipelineSnapshot: Codable, Equatable {
+    static let googleInkCenterline = "google-ink-v1"
+    var centerlineModel: String?
+
+    var hasGoogleInkCenterline: Bool { centerlineModel == Self.googleInkCenterline }
+
     var resamplingEnabled: Bool
     var resampleSpacing: Double
     var splineAlgorithm: SplineAlgorithm
@@ -433,6 +447,11 @@ struct NotePoint: Codable, Hashable {
     }
 
     var cgPoint: CGPoint { CGPoint(x: x, y: y) }
+
+    func googleInkSample(sequence: Int, coordinates: GoogleInkCoordinates) -> GoogleInkSample {
+        GoogleInkSample(point: coordinates.pagePoint(fromWorld: cgPoint),
+                        pressure: p, t: t / 1_000, seq: sequence)
+    }
 }
 
 struct NoteStroke: Codable, Identifiable, Equatable {

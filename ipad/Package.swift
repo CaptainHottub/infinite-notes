@@ -16,7 +16,8 @@ let package = Package(
     targets: [
         .target(
             name: "InfiniteNotesStrokeLab",
-            path: "Sources/InfiniteNotesStrokeLab"
+            path: "Sources/InfiniteNotesStrokeLab",
+            resources: [.copy("Licenses")]
         )
     ],
     swiftLanguageVersions: [.v5]

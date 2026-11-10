@@ -137,6 +137,19 @@ struct SettingsView: View {
 
     private var strokeTab: some View {
         settingsNavigation(title: "Stroke Pipeline", reset: strokeSettings.resetToDefaults) {
+            Section("Pen pipeline") {
+                Picker("Pen pipeline", selection: Binding(
+                    get: { strokeSettings.configuration.resolvedPenPipeline },
+                    set: { strokeSettings.configuration.penPipeline = $0 }
+                )) {
+                    Text("Infinite Notes (Default)").tag(PenPipeline.infiniteNotes)
+                    Text("Google Ink Stroke Modeler").tag(PenPipeline.googleInk)
+                }
+                Text("Applies to new pen strokes. Google Ink runs on this iPad and works offline.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("Pen appearance") {
                 Toggle("Pressure-sensitive pen width", isOn: $model.penPressureEnabled)
                 Picker("Line style", selection: Binding(

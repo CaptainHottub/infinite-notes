@@ -1285,7 +1285,10 @@ final class AppModel: ObservableObject {
         currentPageNumber = document.pages.indices.contains(index) ? index + 1 : 0
     }
 
-    func beginStroke(pageIndex: Int, firstPoint: NotePoint, tool contactTool: NoteTool? = nil) -> String? {
+    func beginStroke(
+        pageIndex: Int, firstPoint: NotePoint, tool contactTool: NoteTool?,
+        configuration pipelineConfiguration: StrokePipelineConfiguration
+    ) -> String? {
         if !isConnected {
             notice = "Drawing offline — Pencil strokes will upload after reconnecting"
         }
@@ -1294,7 +1297,6 @@ final class AppModel: ObservableObject {
         guard drawingTool != .eraser else { return nil }
         noteLocalEdit()
 
-        let pipelineConfiguration = strokeSettings.configuration
         let storedTool: String
         switch drawingTool {
         case .pressurePen, .fixedPen:
@@ -1360,14 +1362,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func endStroke(strokeID: String) {
+    func endStroke(strokeID: String, googleInkSamples: [GoogleInkSample]? = nil) {
         noteLocalEdit()
         defer { scheduleDeferredStateFetch() }
         flushPendingPoints(strokeID: strokeID)
         let pages = strokeMembership[strokeID] ?? []
         beginCommitTransition(strokeID: strokeID, pages: pages)
         liveStrokes.end(strokeID)
-        guard let finalStroke = strokes[strokeID] else { return }
+        guard let admittedStroke = strokes[strokeID] else { return }
+        let finalStroke = googleInkSamples.flatMap { modeledGoogleStroke(admittedStroke, samples: $0) }
+            ?? admittedStroke
         insertOrReplace(finalStroke)
         pendingCommitStrokes[strokeID] = finalStroke
         if let documentID = pendingDocumentID ?? lastAppliedDocumentID {
@@ -1385,12 +1389,13 @@ final class AppModel: ObservableObject {
         // alive, so ordinary ink does not need to repeat every sample again in
         // stroke_end. If the connection dies before acknowledgement, the final
         // local stroke remains in pendingCommitStrokes and is replayed in bounded
-        // batches after reconnecting. Recognized geometry must still replace the
-        // streamed freehand stroke, but its final payload contains only 2–3 points.
+        // batches after reconnecting. Recognized geometry and modeled ink send
+        // their complete replacement for the streamed freehand stroke.
         var message: [String: Any] = ["type": "stroke_end", "id": strokeID]
         guard let documentID = pendingDocumentID, connectedDocumentID == documentID else { return }
         message["documentId"] = documentID
-        if finalStroke.tool == "shape" || finalStroke.tool == "text" {
+        if finalStroke.tool == "shape" || finalStroke.tool == "text" ||
+            finalStroke.pipeline?.hasGoogleInkCenterline == true {
             guard let encoded = try? JSONHelpers.object(from: finalStroke) else {
                 lastError = "Could not encode the completed stroke"
                 return
@@ -1398,6 +1403,30 @@ final class AppModel: ObservableObject {
             message["stroke"] = encoded
         }
         client.sendJSONObject(message)
+    }
+
+    private func modeledGoogleStroke(_ stroke: NoteStroke, samples: [GoogleInkSample]) -> NoteStroke? {
+        guard stroke.tool == NoteTool.pressurePen.rawValue || stroke.tool == NoteTool.fixedPen.rawValue,
+              stroke.pipeline?.hasGoogleInkCenterline != true,
+              let first = stroke.points.first, !samples.isEmpty,
+              let pageIndex = stroke.pageIndex, let sourcePage = sourcePageInfo(at: pageIndex),
+              sourcePage.id == stroke.pageId else { return nil }
+
+        let coordinates = GoogleInkCoordinates(sourceOrigin: sourcePage.worldRect.origin)
+        var result = stroke
+        result.points = [first] + samples.dropFirst().map { sample in
+            let world = coordinates.worldPoint(fromPage: sample.point)
+            return NotePoint(x: Double(world.x), y: Double(world.y), p: sample.pressure, t: sample.t * 1_000)
+        }
+        result.pipeline?.centerlineModel = StrokePipelineSnapshot.googleInkCenterline
+        result = strokes.normalizedWorldStroke(result)
+        // Leave space below the server's 2 MiB message limit for either
+        // stroke_end or a one-stroke reconcile_strokes envelope.
+        let strokeByteBudget = 2 * 1024 * 1024 - 4 * 1024
+        guard let object = try? JSONHelpers.object(from: result),
+              let data = try? JSONHelpers.data(from: object),
+              data.count <= strokeByteBudget else { return nil }
+        return result
     }
 
     func beginEraseOperation() -> String {
@@ -1717,11 +1746,17 @@ final class AppModel: ObservableObject {
             var affected: Set<Int> = []
             for stroke in message.strokes ?? [] {
                 affected.formUnion(strokeMembership[stroke.id] ?? [])
-                insertOrReplace(stroke, committedChange: false, deferRefresh: true)
+                let isModeled = stroke.pipeline?.hasGoogleInkCenterline == true
+                if isModeled {
+                    // Reconciliation can replace a live trace without a separate stroke_end.
+                    liveStrokes.end(stroke.id)
+                }
+                insertOrReplace(stroke, committedChange: isModeled, deferRefresh: true)
                 affected.formUnion(strokeMembership[stroke.id] ?? [])
             }
             refreshWorkspaceStates(for: affected)
             invalidatePages(affected)
+            if liveStrokeIDs.isEmpty { scheduleDeferredStateFetch() }
             if syncReadout.showCounts {
                 syncReadout.receivedInk = strokes.count
                 syncReadout.totalInk = strokes.count

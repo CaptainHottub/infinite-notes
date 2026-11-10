@@ -20,8 +20,8 @@ cd "$ROOT/ipad"
 if command -v swiftc >/dev/null 2>&1; then
   printf '\n== Native sync and journal tests ==\n'
   native_test_dir="$(mktemp -d -t infinite-notes-native-tests.XXXXXX)"
-  trap 'rm -f -- "$native_test_dir/PendingStrokeJournal" "$native_test_dir/RevisionDeltaAccumulator" "$native_test_dir/LiveStrokeTracker" "$native_test_dir/PendingEraseQueue" "$native_test_dir/EraserSpatialIndex" "$native_test_dir/PageLayoutTransform" "$native_test_dir/PageLocalInkStore" "$native_test_dir/PDFPageAssetCache"; rmdir -- "$native_test_dir"' EXIT
-  for native_test in PendingStrokeJournal RevisionDeltaAccumulator LiveStrokeTracker PendingEraseQueue EraserSpatialIndex PageLayoutTransform PageLocalInkStore PDFPageAssetCache; do
+  trap 'rm -f -- "$native_test_dir/GeometryHoldTracker" "$native_test_dir/GoogleInkStreamTests" "$native_test_dir/PendingStrokeJournal" "$native_test_dir/RevisionDeltaAccumulator" "$native_test_dir/LiveStrokeTracker" "$native_test_dir/PendingEraseQueue" "$native_test_dir/EraserSpatialIndex" "$native_test_dir/PageLayoutTransform" "$native_test_dir/PageLocalInkStore" "$native_test_dir/PDFPageAssetCache"; rmdir -- "$native_test_dir"' EXIT
+  for native_test in GeometryHoldTracker PendingStrokeJournal RevisionDeltaAccumulator LiveStrokeTracker PendingEraseQueue EraserSpatialIndex PageLayoutTransform PageLocalInkStore PDFPageAssetCache; do
     native_sources=("Sources/InfiniteNotesStrokeLab/$native_test.swift")
     if [[ "$native_test" == PendingEraseQueue ]]; then
       native_sources+=("Sources/InfiniteNotesStrokeLab/PendingStrokeJournal.swift")
@@ -30,6 +30,10 @@ if command -v swiftc >/dev/null 2>&1; then
       "Tests/${native_test}Tests.swift" -o "$native_test_dir/$native_test"
     "$native_test_dir/$native_test"
   done
+  swiftc Sources/InfiniteNotesStrokeLab/GoogleInkModel.swift \
+    Sources/InfiniteNotesStrokeLab/GoogleInkSample.swift Tests/GoogleInkStreamTests.swift \
+    -o "$native_test_dir/GoogleInkStreamTests"
+  "$native_test_dir/GoogleInkStreamTests"
 else
   printf '\nNative Swift tests skipped: swiftc is not installed.\n'
 fi

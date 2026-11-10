@@ -3,7 +3,7 @@ import hashlib
 import re
 from pathlib import Path
 
-import fitz
+import pymupdf as fitz
 
 
 def asset_path(directory: Path, digest: str) -> Path:

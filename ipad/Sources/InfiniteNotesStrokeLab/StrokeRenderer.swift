@@ -140,14 +140,18 @@ enum StrokeRenderer {
         stroke: NoteStroke,
         page: PageInfo,
         viewBounds: CGRect,
-        configuration: StrokePipelineConfiguration
+        configuration: StrokePipelineConfiguration,
+        useAdmittedCenterline: Bool = false,
+        previewSamples: [StrokeGeometrySample]? = nil
     ) -> [LiveStrokeLayerDescriptor] {
         vectorLayerDescriptors(
             stroke: stroke,
             page: page,
             viewBounds: viewBounds,
             configuration: configuration,
-            includeDiagnostics: true
+            includeDiagnostics: true,
+            useAdmittedCenterline: useAdmittedCenterline,
+            previewSamples: previewSamples
         )
     }
 
@@ -159,15 +163,18 @@ enum StrokeRenderer {
         page: PageInfo,
         viewBounds: CGRect,
         configuration: StrokePipelineConfiguration,
-        includeDiagnostics: Bool
+        includeDiagnostics: Bool,
+        useAdmittedCenterline: Bool = false,
+        previewSamples: [StrokeGeometrySample]? = nil
     ) -> [LiveStrokeLayerDescriptor] {
         guard stroke.tool != "text", stroke.tool != "shape", !stroke.points.isEmpty else { return [] }
 
-        let samples = StrokeGeometryBuilder.computedSamples(
+        let samples = previewSamples ?? StrokeGeometryBuilder.computedSamples(
             stroke: stroke,
             page: page,
             bounds: viewBounds,
-            fallback: configuration
+            fallback: configuration,
+            useAdmittedCenterline: useAdmittedCenterline
         )
         guard let first = samples.first else { return [] }
         let settings = stroke.pipeline ?? .legacy(smoothing: stroke.smoothing)

@@ -13,7 +13,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-import fitz
+import pymupdf as fitz
 
 
 POINTS_PER_CM = 72.0 / 2.54
@@ -31,7 +31,7 @@ DEFAULTS: dict[str, Any] = {
     "majorSpacingCm": 1.0, "background": "#ffffff",
     "lineColor": "#cccccc", "minorColor": "#dddddd",
     "majorColor": "#999999", "lineWidthMm": 0.1,
-    "minorWidthMm": 0.05, "majorWidthMm": 0.1,
+    "minorWidthMm": 0.05, "majorWidthMm": 0.05,
     "marginCm": 0.0, "headerCm": 0.0, "title": "", "date": False,
 }
 BUILTIN_PRESETS: list[dict[str, Any]] = [

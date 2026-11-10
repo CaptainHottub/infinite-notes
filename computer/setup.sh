@@ -83,6 +83,9 @@ fi
 if [[ ! -d .venv ]]; then
   echo "Creating the Python virtual environment..."
   python3 -m venv .venv
+elif [[ ! -x .venv/bin/python ]] || ! .venv/bin/python -m pip --version >/dev/null 2>&1; then
+  echo "Repairing the Python virtual environment (pip is missing)..."
+  python3 -m venv --clear .venv
 fi
 
 # shellcheck disable=SC1091

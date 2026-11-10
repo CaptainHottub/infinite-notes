@@ -1,0 +1,18 @@
+
+
+When the server disconencted, *this was tested with the hotspot
+I was able to draw/ write on the ipad side, do te geo line, I was able to select things with the lasso tool.
+I was not able to move the selected items, When I tried moving them item would move and snap back to its original place when I released it.
+also I was not able to erase items. 
+
+Upon reconnection, the ink from the ipad was sent over to the computer.
+
+I was able to erase it all after establishing the connection, and it stayed when I maually synced.
+
+I then disconnected again and drew, the reconect. same thing happened.
+
+but when I manually synced, the old ink I erased before disconnecting came back. 
+so we still have issues with sync.
+
+
+the ipad still disconnects, no error message shows up on the computer side tho, it also happens a lot less than before.

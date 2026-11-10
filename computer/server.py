@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-import fitz  # PyMuPDF
+import pymupdf as fitz
 import uvicorn
 from fastapi import Body, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, Response
@@ -971,7 +971,7 @@ def sanitize_pipeline(raw: Any) -> dict[str, Any] | None:
     def bounded(name: str, default: float, low: float, high: float) -> float:
         return max(low, min(high, float(raw.get(name, default))))
 
-    return {
+    pipeline = {
         "resamplingEnabled": bool(raw.get("resamplingEnabled", True)),
         "resampleSpacing": bounded("resampleSpacing", 1.05, 0.05, 100.0),
         "splineAlgorithm": spline,
@@ -986,6 +986,9 @@ def sanitize_pipeline(raw: Any) -> dict[str, Any] | None:
         "endTaperLength": bounded("endTaperLength", 2.0, 0.0, 1000.0),
         "taperMinimumScale": bounded("taperMinimumScale", 0.18, 0.0, 1.0),
     }
+    if raw.get("centerlineModel") == "google-ink-v1":
+        pipeline["centerlineModel"] = "google-ink-v1"
+    return pipeline
 
 
 def sanitize_stroke(raw: Any) -> dict[str, Any]:
